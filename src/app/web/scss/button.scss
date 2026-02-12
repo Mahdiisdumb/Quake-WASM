@@ -1,0 +1,21 @@
+
+.btn {
+  background: $bg-color-dark;
+  border: $border-width solid darken($bg-color-dark, 5%);
+  &:hover {
+    background: lighten($bg-color-dark, 5%);
+  }
+  &:focus {
+    background: darken($bg-color-dark, 5%);
+  }
+  &.btn-large {
+    border:none;
+    height: 3rem;
+    font-size: 1.7rem;
+    line-height: 1.4;
+  }
+  &.full-width {
+    width: 100%;
+  }
+
+}
