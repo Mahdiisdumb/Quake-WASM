@@ -1,28 +1,16 @@
 :{$PORT}
 
-# Root folder is current directory (where your Unity WebGL build is)
 root * .
-
-# Serve static files
 file_server
-
-# Compression for faster load
 encode gzip zstd
 
-# Correct MIME types for Unity WebGL files
-@wasm_files {
-    path *.wasm
-}
+@wasm_files { path *.wasm }
 header @wasm_files Content-Type application/wasm
 
-@data_files {
-    path *.data *.mem *.symbols.json
-}
+@data_files { path *.data *.mem *.symbols.json }
 header @data_files Content-Type application/octet-stream
 
-# Security headers including full CSP
 header {
-    # Content Security Policy for Unity WebGL
     Content-Security-Policy "default-src 'self'; \
 img-src 'self' data: https: *; \
 style-src 'self' 'unsafe-inline' https: *; \
@@ -32,12 +20,8 @@ media-src 'self' https: * blob:; \
 font-src 'self' data: https: *; \
 object-src 'none'; \
 frame-src 'self' https: * blob:;"
-
-    # Optional for SharedArrayBuffer / threads
     Cross-Origin-Opener-Policy "same-origin"
     Cross-Origin-Embedder-Policy "require-corp"
-
-    # Basic security headers
     Referrer-Policy "no-referrer"
     X-Content-Type-Options "nosniff"
 }
