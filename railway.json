@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "npm",
+    "command": "npm run build"
+  },
+  "deploy": {
+    "outputDirectory": "dist/app"
+  }
+}
