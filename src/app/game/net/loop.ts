@@ -1,6 +1,7 @@
 import * as sys from '../sys'
 import * as def from '../../../engine/def'
 import * as net from '../../../engine/net'
+import * as sz from '../../../engine/sz'
 import ISocket from '../../../engine/interfaces/net/ISocket'
 import IDatagram from '../../../engine/interfaces/net/IDatagram'
 import { QConnectStatus } from '../../../engine/interfaces/net/INetworkDriver'
@@ -78,23 +79,26 @@ export const checkNewConnections = function()
 	return state.server;
 };
 
+// Queue entry framing: [type][len0][len1][len2] + payload. The length is 3 bytes —
+// vanilla's 2-byte header silently wraps any message over 64KB (large-map signons
+// with hundreds of statics exceed that), truncating the stream mid-svc.
 export const getMessage = function(sock: ISocket)
 {
 	if (sock.receiveMessageLength === 0)
 		return 0;
 	var ret = sock.receiveMessage[0];
-	var length = sock.receiveMessage[1] + (sock.receiveMessage[2] << 8);
+	var length = sock.receiveMessage[1] + (sock.receiveMessage[2] << 8) + (sock.receiveMessage[3] << 16);
 	if (length > net.state.message.data.byteLength)
 		sys.error('Loop.GetMessage: overflow');
 	net.state.message.cursize = length;
-	(new Uint8Array(net.state.message.data)).set(sock.receiveMessage.subarray(3, length + 3));
+	sz.u8(net.state.message).set(sock.receiveMessage.subarray(4, length + 4));
 	sock.receiveMessageLength -= length;
-	if (sock.receiveMessageLength >= 4)
+	if (sock.receiveMessageLength >= 5)
 	{
 		for (var i = 0; i < sock.receiveMessageLength; ++i)
-			sock.receiveMessage[i] = sock.receiveMessage[length + 3 + i];
+			sock.receiveMessage[i] = sock.receiveMessage[length + 4 + i];
 	}
-	sock.receiveMessageLength -= 3;
+	sock.receiveMessageLength -= 4;
 	if ((sock.driverdata != null) && (ret === 1))
 		sock.driverdata.canSend = true;
 	return ret;
@@ -105,14 +109,15 @@ export const sendMessage = function(sock: ISocket, data: IDatagram)
 	if (sock.driverdata == null)
 		return -1;
 	var bufferLength = sock.driverdata.receiveMessageLength;
-	sock.driverdata.receiveMessageLength += data.cursize + 3;
+	sock.driverdata.receiveMessageLength += data.cursize + 4;
 	if (sock.driverdata.receiveMessageLength > def.max_message)
 		sys.error('Loop.SendMessage: overflow');
 	var buffer = sock.driverdata.receiveMessage;
 	buffer[bufferLength] = 1;
 	buffer[bufferLength + 1] = data.cursize & 0xff;
-	buffer[bufferLength + 2] = data.cursize >> 8;
-	buffer.set(new Uint8Array(data.data, 0, data.cursize), bufferLength + 3);
+	buffer[bufferLength + 2] = (data.cursize >> 8) & 0xff;
+	buffer[bufferLength + 3] = (data.cursize >> 16) & 0xff;
+	buffer.set(sz.u8(data).subarray(0, data.cursize), bufferLength + 4);
 	sock.canSend = false;
 	return 1;
 };
@@ -122,14 +127,15 @@ export const sendUnreliableMessage = function(sock: ISocket, data: IDatagram)
 	if (sock.driverdata == null)
 		return -1;
 	var bufferLength = sock.driverdata.receiveMessageLength;
-	sock.driverdata.receiveMessageLength += data.cursize + 3;
+	sock.driverdata.receiveMessageLength += data.cursize + 4;
 	if (sock.driverdata.receiveMessageLength > def.max_message)
 		sys.error('Loop.SendMessage: overflow');
 	var buffer = sock.driverdata.receiveMessage;
 	buffer[bufferLength] = 2;
 	buffer[bufferLength + 1] = data.cursize & 0xff;
-	buffer[bufferLength + 2] = data.cursize >> 8;
-	buffer.set(new Uint8Array(data.data, 0, data.cursize), bufferLength + 3);
+	buffer[bufferLength + 2] = (data.cursize >> 8) & 0xff;
+	buffer[bufferLength + 3] = (data.cursize >> 16) & 0xff;
+	buffer.set(sz.u8(data).subarray(0, data.cursize), bufferLength + 4);
 	return 1;
 };
 

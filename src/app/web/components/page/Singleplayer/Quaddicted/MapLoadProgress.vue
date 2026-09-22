@@ -1,75 +1,99 @@
 <template lang="pug">
 .map-load-progress
-  div {{mapsStore.getMapLoadProgress.message}}
-  .bar.light-dark(ref="bar")
-    .bar-text-dark {{loadedKb}}
-    .bar-item(role="progressbar" :style="'width:' + progressPercent+ '%;'" :aria-valuenow="progressPercent" aria-valuemin="0" aria-valuemax="100")
-      .bar-text-light(ref="barHack") {{loadedKb}}
+  .progress-header
+    span.progress-label {{ isUnzipping ? 'Unzipping' : 'Downloading' }}
+    span.progress-size(v-if="total") {{ isUnzipping ? unzipLabel : sizeLabel }}
+  .progress-track
+    .progress-fill(
+      :class="{indeterminate: !total}"
+      :style="total ? { width: percent + '%' } : {}"
+    )
+  button.cancel-btn(@click="mapsStore.cancelLoad()") Cancel
 </template>
 
-<script lang="ts" setup>
-import {reactive, onMounted, computed, watch, ref} from 'vue'
-import { useMapsStore } from '../../../../stores/maps';
-import type { QuaddictedMap } from '../../../../types/QuaddictedMap';
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useMapsStore } from '../../../../stores/maps'
+import type { QuaddictedMap } from '../../../../types/QuaddictedMap'
 
 const mapsStore = useMapsStore()
+defineProps<{ map: QuaddictedMap }>()
 
-const props = defineProps<{map: QuaddictedMap}>()
-const addCommas = (x: number) => x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-const bar = ref<HTMLElement | null>(null)
-const barHack = ref<HTMLElement | null>(null)
+const total   = computed(() => mapsStore.getMapLoadProgress.total)
+const loaded  = computed(() => mapsStore.getMapLoadProgress.loaded)
+const percent = computed(() => !total.value ? 0 : Math.min(100, Math.floor((loaded.value / total.value) * 100)))
+const isUnzipping = computed(() => mapsStore.getMapLoadProgress.phase === 'unzip')
 
-const onResize = () => {
-  if (barHack.value && bar.value) {
-    barHack.value.style.width = bar.value.clientWidth + "px"
+const toMb    = (b: number) => (b / 1048576).toFixed(1)
+// While downloading, loaded/total are bytes; while unzipping they are files
+// (fractional while a file is mid-decompress).
+const sizeLabel  = computed(() => `${toMb(loaded.value)} / ${toMb(total.value)} MB`)
+const unzipLabel = computed(() => `${Math.floor(loaded.value)} / ${total.value} files (${percent.value}%)`)
+</script>
+
+<style scoped lang="scss">
+@import '../../../../scss/tokens';
+
+.map-load-progress {
+  width: 100%;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+
+.progress-label {
+  font-size: $font-2xs;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-caps;
+  color: $palette-muted;
+}
+
+.progress-size {
+  font-size: $font-2xs;
+  color: $palette-muted;
+}
+
+.progress-track {
+  width: 100%;
+  height: 2px;
+  background: $palette-border;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: $palette-red;
+  transition: width 0.2s ease;
+
+  &.indeterminate {
+    width: 40%;
+    animation: slide 1.2s ease-in-out infinite;
   }
 }
-const loadedKb = computed(() => {
-  if (!mapsStore.getMapLoadProgress.total) {
-    return ''
-  }
-  const total = addCommas(Math.floor(mapsStore.getMapLoadProgress.total / 1024))
-  const loaded = addCommas(Math.floor(mapsStore.getMapLoadProgress.loaded / 1024))
 
-  return `${loaded} / ${total} KB`
-})
+@keyframes slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
 
-const progressPercent = computed(() => {
-  if (!mapsStore.getMapLoadProgress.total) {
-    return 0
-  }
-  const total = Math.floor(mapsStore.getMapLoadProgress.total)
-  const loaded = Math.floor(mapsStore.getMapLoadProgress.loaded)
-  return Math.ceil((loaded / total) * 100)
-})
-
-onMounted(() => {
-  window.addEventListener('resize', onResize)
-  onResize()
-})
-</script>
-<style scoped lang="scss">
-// I spent more time on this than I'd like to admit.
-.bar.light-dark {
-  position: relative;
-  .bar-item {
-    overflow: hidden;
-    position: absolute;
-    .bar-text-light {
-      position: absolute;
-      text-align: right;
-      color: white;
-      font-size: .6rem;
-    }
-  }
-  .bar-text-dark {
-    line-height: 0.8rem;
-    height: 0.8rem;
-    position: absolute;
-    width: 100%;
-    text-align: right;
-    color: black;
-    font-size: .6rem;
-  }
+.cancel-btn {
+  margin-top: 8px;
+  font-size: $font-2xs;
+  font-weight: $fw-semibold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-links;
+  color: $palette-muted;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  padding: 0;
+  transition: $transition-color;
+  &:hover { color: $palette-bright; }
 }
 </style>

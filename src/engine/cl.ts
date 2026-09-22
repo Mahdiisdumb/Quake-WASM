@@ -3,6 +3,7 @@ import * as host from './host'
 import * as con from './console'
 import * as mod from './mod'
 import * as msg from './msg'
+import * as sz from './sz'
 import * as com from './com'
 import * as def from './def'
 import * as sv from './sv'
@@ -17,14 +18,19 @@ import * as s from './s'
 import * as cdAudio from './cdAudio'
 import * as input from './input'
 import * as protocol from './protocol'
+import * as tx from './texture'
 import * as q from './q'
 import * as vec from './vec'
+import * as crc from './crc'
+import * as pscript from './pscript'
+import * as pr from './pr'
+import * as csqc from './csqc'
 import IDatagram from './interfaces/net/IDatagram'
 import ISocket from './interfaces/net/ISocket'
 import { CVars } from './cvar'
 import { Entity } from './types/Entity'
 import { V3, V4 } from './types/Vector'
-import { Leaf, Model } from './types/Model'
+import { Model } from './types/Model'
 import { KnownAsset } from './types/KnownAsset'
 import { Sound } from './types/Sound'
 
@@ -38,20 +44,92 @@ export type Score = {
   entertime: number
   frags: number
   colors: number
+  ping: number
+  isBot: boolean
+  pinged: boolean
 }
+
+export const requestPingUpdate = () => {
+  clState.expectingPingTimes = sys.floatTime() + 2
+  cmd.forwardToServer_string('ping')
+}
+
+let pingReceivedSet: Set<number> = new Set()
+
+const parseSpecialPrint = (text: string): boolean => {
+  if (clState.parsingPings) {
+    const trimmed = text.trimStart()
+    const spaceIdx = trimmed.indexOf(' ')
+    if (spaceIdx > 0 && text.endsWith('\n')) {
+      const ping = parseInt(trimmed.substring(0, spaceIdx))
+      const name = trimmed.substring(spaceIdx + 1).replace(/\n$/, '')
+      if (!isNaN(ping) && name !== 'unconnected') {
+        for (let i = clState.pingPlayerIndex; i < clState.maxclients; i++) {
+          if (clState.scores[i].name.length === 0) continue
+          if (name === clState.scores[i].name || name.startsWith(clState.scores[i].name)) {
+            clState.scores[i].ping = ping
+            pingReceivedSet.add(i)
+            clState.pingPlayerIndex = i + 1
+            return true
+          }
+        }
+      }
+    }
+    // Ping cycle complete — players the server skipped are bots
+    clState.parsingPings = false
+    for (let i = 0; i < clState.maxclients; i++) {
+      if (clState.scores[i].name.length === 0) continue
+      clState.scores[i].isBot = !pingReceivedSet.has(i)
+      clState.scores[i].pinged = true
+    }
+    pingReceivedSet.clear()
+  }
+
+  if (text === 'Client ping times:\n' && clState.expectingPingTimes > sys.floatTime()) {
+    clState.parsingPings = true
+    clState.pingPlayerIndex = 0
+    return true
+  }
+
+  return false
+}
+
+// Every centerprint off the wire - svc_centerprint plus the finale/cutscene svcs, as QSS routes
+// them (CL_ParseCenterPrint, cl_parse.c:2585/2742/2752). The progs gets first refusal.
+const centerPrint = function (text: string) {
+  if (!csqc.parseCenterPrint(text))
+    scr.centerPrint(text);
+};
 
 export type ClState = {
   viewangles: V3
   time: number
   mtime: number[]
   mviewangles: [V3, V3]
+  // The move being composed for this server tick (QSS usercmd_t, protocol.h:509-532). buttons and
+  // impulse land here, not at write time, so CSQC_Input_Frame sees and may rewrite a whole move.
   cmd: {
+    forwardmove: number,
+    sidemove: number,
+    upmove: number,
+    buttons: number,
+    impulse: number
+  }
+  // mouse/controller movement accumulated per render frame, consumed by the next server tick's sendCmd
+  pendingcmd: {
     forwardmove: number,
     sidemove: number,
     upmove: number
   }
   movemessages: number
+  // Client time the last move was composed at; the next move's input_timelength comes off it
+  // (QSS cl.lastcmdtime, client.h:175).
+  lastcmdtime: number
   stats: number[]
+  // QSS cl.statsf/statss (client.h:179-180): int stats mirrored as float, plus the separate
+  // EV_STRING stat pool (getstati/getstatf/getstats).
+  statsf: number[]
+  statss: Record<number, string>
   items: number
   item_gettime: number[]
   faceanimtime: number
@@ -75,32 +153,79 @@ export type ClState = {
   looptrack: number
   sound_precache: Sound[]
   protocol: number
+  protocolFlags: number
+  // Negotiated FTE protocol extensions as echoed back in svc_serverinfo (QSS cl.protocol_pext1/2);
+  // reset with the rest of clState, then filled in by parseServerInfo before anything reads them.
+  protocol_pext1: number
+  protocol_pext2: number
+  // Server entity number -> csqc edict number for the svcdp_csqcentities stream (QSS
+  // cl.ssqc_to_csqc, client.h:318-319). 0 means no csqc edict; edict 0 is never streamed.
+  ssqc_to_csqc: Int32Array
   maxclients: number
   scores: Score[]
   gametype: number
   levelname: string
   model_precache: Model[]
+  // Models/effects the client progs precached itself (QSS cl.model_name_csqc/model_precache_csqc,
+  // cl.local_particle_precache): indexed from 1, referenced by the NEGATED index so csqc-side
+  // handles never collide with the server's precache numbering.
+  model_name_csqc: string[]
+  model_precache_csqc: Model[]
+  particle_precache: string[] // dp_precache-transported effectinfo names, index -> name (see pscript.findParticleType)
+  local_particle_precache: string[]
+  // Sound listener the csqc SetListener builtin published this frame (QSS client.h:321-323).
+  listener_defined: boolean
+  listener_origin: V3
+  listener_forward: V3
+  listener_right: V3
+  listener_up: V3
   worldmodel: Model
   viewheight: number
   onground: boolean
   inwater: boolean
   paused: boolean
   nodrift: boolean
+  parsingPings: boolean
+  pingPlayerIndex: number
+  expectingPingTimes: number
+  pingReceivedSet: Set<number>
+}
+
+export type DownloadState = {
+  model_names: string[]
+  sound_names: string[]
+  model_download_index: number
+  sound_download_index: number
+  download_check_wait: number
+  download: {
+    active: boolean
+    filename: string
+    size: number
+    received: number
+    lastPct: number
+    data: Uint8Array | null
+    lastFilename: string
+  }
 }
 
 const initClState = (): ClState => ({
   movemessages: 0,
+  lastcmdtime: 0.0,
   cmd: {
+    forwardmove: 0.0,
+    sidemove: 0.0,
+    upmove: 0.0,
+    buttons: 0,
+    impulse: 0
+  },
+  pendingcmd: {
     forwardmove: 0.0,
     sidemove: 0.0,
     upmove: 0.0
   },
-  stats: [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0
-  ],
+  stats: new Array(def.MAX_CL_STATS).fill(0),
+  statsf: new Array(def.MAX_CL_STATS).fill(0),
+  statss: {},
   items: 0,
   item_gettime: [
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -133,20 +258,55 @@ const initClState = (): ClState => ({
   looptrack: 0,
   sound_precache: [],
   protocol: 0,
+  protocolFlags: 0,
+  protocol_pext1: 0,
+  protocol_pext2: 0,
+  ssqc_to_csqc: new Int32Array(0),
   maxclients: 0,
   scores: [],
   gametype: 0,
   levelname: '',
   model_precache: [],
+  model_name_csqc: [],
+  model_precache_csqc: [],
+  particle_precache: [],
+  local_particle_precache: [],
+  listener_defined: false,
+  listener_origin: vec.emptyV3(),
+  listener_forward: vec.emptyV3(),
+  listener_right: vec.emptyV3(),
+  listener_up: vec.emptyV3(),
   worldmodel: null,
   viewheight: 0,
   onground: false,
   inwater: false,
   paused: false,
-  nodrift: false
+  nodrift: false,
+  parsingPings: false,
+  pingPlayerIndex: 0,
+  expectingPingTimes: 0,
+  pingReceivedSet: new Set(),
+})
+
+const initDlState = (): DownloadState => ({
+  model_names: [],
+  sound_names: [],
+  model_download_index: 1,
+  sound_download_index: 1,
+  download_check_wait: 0,
+  download: {
+    active: false,
+    filename: '',
+    size: 0,
+    received: 0,
+    lastPct: -1,
+    data: null,
+    lastFilename: '',
+  }
 })
 
 export let clState: ClState
+export let dlState: DownloadState
 
 export type Beam = {
   endtime: number,
@@ -175,6 +335,15 @@ export type TempEntities = {
   sfx_r_exp3: Sound
 }
 
+export type SpriteEffect = {
+  origin: V3,
+  model: Model,
+  startframe: number,
+  framecount: number,
+  framerate: number,
+  starttime: number,
+}
+
 export type ClientStaticState = {
   state: number,
   signon: number
@@ -183,6 +352,10 @@ export type ClientStaticState = {
   message: IDatagram
   demoplayback: boolean,
   demofile: ArrayBuffer
+  // cached views over demofile, rebuilt by demoView/demoU8 when recording growth or a
+  // demo load replaces the buffer
+  demofileView: DataView
+  demofileU8: Uint8Array
   timedemo: boolean
   demoofs: number
   td_lastframe: number
@@ -194,6 +367,13 @@ export type ClientStaticState = {
   demoname: string
   demos: string[]
   forcetrack: number
+  sendprespawn: boolean
+  protocol_dpdownload: number
+  // connected to a same-machine server (in-process loop OR the server Worker),
+  // vs a genuinely remote host. Lets local-only decisions (e.g. skip asset
+  // downloads — files are already local) avoid reading sv.state.server.phase,
+  // which is empty on the main thread when the server runs on the Worker.
+  isLocalServer: boolean
 }
 
 export let cls: ClientStaticState = {
@@ -201,9 +381,11 @@ export let cls: ClientStaticState = {
   state: 0,
   spawnparms: '',
   demonum: 0,
-  message: {data: new ArrayBuffer(def.max_message), cursize: 0},
+  message: sz.newDatagram(def.max_message),
   demoplayback:false,
   demofile: null,
+  demofileView: null,
+  demofileU8: null,
   timedemo: false,
   demoofs: 0,
   td_lastframe: 0,
@@ -214,17 +396,22 @@ export let cls: ClientStaticState = {
   demorecording: false,
   demoname: '',
   forcetrack: 0,
-  demos: []
+  demos: [],
+  sendprespawn: false,
+  protocol_dpdownload: 0,
+  isLocalServer: false
 }
 
 const initStaticState = (): ClientStaticState => ({
   state: 0,
   spawnparms: '',
   demonum: 0,
-  message: {data: new ArrayBuffer(def.max_message), cursize: 0},
+  message: sz.newDatagram(def.max_message),
   signon: 0,
   demoplayback: false,
   demofile: null,
+  demofileView: null,
+  demofileU8: null,
   timedemo: false,
   demoofs: 0,
   td_lastframe: 0,
@@ -235,8 +422,13 @@ const initStaticState = (): ClientStaticState => ({
   demorecording: false,
   demoname: '',
   forcetrack: 0,
-  demos: []
+  demos: [],
+  sendprespawn: false,
+  protocol_dpdownload: 0,
+  isLocalServer: false
 })
+
+export type ShowLmpEntry = { pic: tx.Pic, x: number, y: number };
 
 export type ClientState = {
   entities: Entity[],
@@ -252,8 +444,9 @@ export type ClientState = {
   host: string
   impulse: number
   beams: Beam[]
-  pefragtopnode: Leaf | Node
   tents: TempEntities
+  effects: SpriteEffect[]
+  showlmps: Map<string, ShowLmpEntry>
 }
 
 const initState = (): ClientState => ({
@@ -264,13 +457,12 @@ const initState = (): ClientState => ({
   lastmsg: 0.0,
   temp_entities: [],
   num_temp_entities: 0,
-  sendmovebuf: {data: new ArrayBuffer(20), cursize: 0},
+  sendmovebuf: sz.newDatagram(20),
   dlights: [],
   host: '',
   impulse: 0,
   lightstyle: [],
   beams: [],
-  pefragtopnode: null, 
   tents: {
     sfx_wizhit: null,
     sfx_knighthit: null,
@@ -279,10 +471,15 @@ const initState = (): ClientState => ({
     sfx_ric2: null,
     sfx_ric3: null,
     sfx_r_exp3: null
-  }
+  },
+  effects: [],
+  showlmps: new Map()
 });
 
 export let state: ClientState = initState()
+
+
+
 
 export const cvr: CVars = {}
 
@@ -358,11 +555,21 @@ const SVC_STRINGS = [
   'cutscene'
 ];
 
-const newEntity = (num: number): Entity => ({
+// Named svcs above the vanilla block, for shownet traces; sparse on purpose, the gaps trace as
+// 'svc_undefined'.
+SVC_STRINGS[protocol.SVC.dp_csqcentities] = 'dp_csqcentities';
+SVC_STRINGS[protocol.SVC.dp_updatestatbyte] = 'dp_updatestatbyte';
+SVC_STRINGS[protocol.SVC.fte_updatestatstring] = 'fte_updatestatstring';
+SVC_STRINGS[protocol.SVC.fte_updatestatfloat] = 'fte_updatestatfloat';
+SVC_STRINGS[protocol.SVC.fte_cgamepacket] = 'fte_cgamepacket';
+
+export const newEntity = (num: number): Entity => ({
     num: num,
     update_type: 0,
+    scale: protocol.ENTSCALE_DEFAULT,
     baseline: {
       alpha: 0,
+      scale: protocol.ENTSCALE_DEFAULT,
       origin: vec.emptyV3(),
       angles: vec.emptyV3(),
       modelindex: 0,
@@ -386,6 +593,7 @@ const newEntity = (num: number): Entity => ({
     alpha: 0,
     free: false,
     model: null,
+    modelindex: 0,
     forcelink: false,
     area: null,
     leafnums: [],
@@ -395,8 +603,23 @@ const newEntity = (num: number): Entity => ({
     v_int: null,
     colormap: 0,
     lerpflags: 0,
+    snapFrame2: 0,
+    snapLerpfrac: 0,
+    snapTime1: 0,
+    snapTime2: 0,
+    colormod: [1.0, 1.0, 1.0],
+    eflags: 0,
     lerpfinish: 0,
-    topnode: null
+    lerpstart: 0,
+    lerptime: 0,
+    previouspose: -1,
+    currentpose: -1,
+    movelerpstart: 0,
+    previousorigin: vec.emptyV3(),
+    currentorigin: vec.emptyV3(),
+    previousangles: vec.emptyV3(),
+    currentangles: vec.emptyV3(),
+    lightcache: { surf: 0, ds: 0, dt: 0, pos: new Float32Array(3) }
 })
 // demo
 
@@ -411,6 +634,18 @@ export const stopPlayback = function()
     finishTimeDemo();
 };
 
+const demoView = (): DataView => {
+  if (cls.demofileView == null || cls.demofileView.buffer !== cls.demofile)
+    cls.demofileView = new DataView(cls.demofile);
+  return cls.demofileView;
+};
+
+const demoU8 = (): Uint8Array => {
+  if (cls.demofileU8 == null || cls.demofileU8.buffer !== cls.demofile)
+    cls.demofileU8 = new Uint8Array(cls.demofile);
+  return cls.demofileU8;
+};
+
 export const writeDemoMessage = function()
 {
   var len = cls.demoofs + 16 + net.state.message.cursize;
@@ -420,12 +655,12 @@ export const writeDemoMessage = function()
     cls.demofile = new ArrayBuffer(cls.demofile.byteLength + 16384);
     (new Uint8Array(cls.demofile)).set(src);
   }
-  var f = new DataView(cls.demofile, cls.demoofs, 16);
-  f.setInt32(0, net.state.message.cursize, true);
-  f.setFloat32(4, clState.viewangles[0], true);
-  f.setFloat32(8, clState.viewangles[1], true);
-  f.setFloat32(12, clState.viewangles[2], true);
-  (new Uint8Array(cls.demofile)).set(new Uint8Array(net.state.message.data, 0, net.state.message.cursize), cls.demoofs + 16);
+  var f = demoView();
+  f.setInt32(cls.demoofs, net.state.message.cursize, true);
+  f.setFloat32(cls.demoofs + 4, clState.viewangles[0], true);
+  f.setFloat32(cls.demoofs + 8, clState.viewangles[1], true);
+  f.setFloat32(cls.demoofs + 12, clState.viewangles[2], true);
+  demoU8().set(sz.u8(net.state.message).subarray(0, net.state.message.cursize), cls.demoofs + 16);
   cls.demoofs = len;
 };
 
@@ -451,23 +686,27 @@ export const getMessage = function()
       stopPlayback();
       return 0;
     }
-    var view = new DataView(cls.demofile);
+    var view = demoView();
     net.state.message.cursize = view.getUint32(cls.demoofs, true);
     if (net.state.message.cursize > def.max_message)
       sys.error('Demo message > MAX_MSGLEN');
-    clState.mviewangles[1] = clState.mviewangles[0];
-    clState.mviewangles[0] = [view.getFloat32(cls.demoofs + 4, true), view.getFloat32(cls.demoofs + 8, true), view.getFloat32(cls.demoofs + 12, true)];
+    clState.mviewangles[1][0] = clState.mviewangles[0][0];
+    clState.mviewangles[1][1] = clState.mviewangles[0][1];
+    clState.mviewangles[1][2] = clState.mviewangles[0][2];
+    clState.mviewangles[0][0] = view.getFloat32(cls.demoofs + 4, true);
+    clState.mviewangles[0][1] = view.getFloat32(cls.demoofs + 8, true);
+    clState.mviewangles[0][2] = view.getFloat32(cls.demoofs + 12, true);
     cls.demoofs += 16;
     if ((cls.demoofs + net.state.message.cursize) > cls.demosize)
     {
       stopPlayback();
       return 0;
     }
-    var src = new Uint8Array(cls.demofile, cls.demoofs, net.state.message.cursize);
-    var dest = new Uint8Array(net.state.message.data, 0, net.state.message.cursize);
+    var src = demoU8();
+    var dest = sz.u8(net.state.message);
     var i;
     for (i = 0; i < net.state.message.cursize; ++i)
-      dest[i] = src[i];
+      dest[i] = src[cls.demoofs + i];
     cls.demoofs += net.state.message.cursize;
     return 1;
   };
@@ -478,7 +717,7 @@ export const getMessage = function()
     r = net.getMessage(cls.netcon);
     if ((r !== 1) && (r !== 2))
       return r;
-    if ((net.state.message.cursize === 1) && ((new Uint8Array(net.state.message.data, 0, 1))[0] === protocol.SVC.nop))
+    if ((net.state.message.cursize === 1) && (sz.u8(net.state.message)[0] === protocol.SVC.nop))
       con.print('<-- server to client keepalive\n');
     else
       break;
@@ -747,12 +986,26 @@ export const adjustAngles = function()
     angles[2] = -50.0;
 };
 
+// Per-render-frame input: keyboard look + mouse apply to viewangles every frame
+// so aiming stays full-rate; mouse movement accumulates into pendingcmd until the
+// next server tick (QSS CL_AccumulateCmd).
+export const accumulateCmd = function()
+{
+  if (cls.signon !== 4)
+  {
+    // No moves yet, so keep the clock the next one measures against level with the server's, or
+    // the first move of a connection reports the whole session as its length (QSS cl_main.c:1319).
+    clState.lastcmdtime = clState.mtime[0];
+    return;
+  }
+  adjustAngles();
+  input.move();
+};
+
 export const baseMove = function()
 {
   if (cls.signon !== 4)
     return;
-
-  adjustAngles();
 
   var _cmd = clState.cmd;
 
@@ -775,18 +1028,11 @@ export const baseMove = function()
   }
 };
 
-export const sendMove = async function()
+// Button bits and pending impulse (QSS CL_FinishMove, cl_input.c:427-469). Must run before
+// sendMove, so CSQC_Input_Frame can rewrite a complete move before any of it is written.
+// Two button bits only: vanilla NQ has no +button3..8.
+export const finishMove = function()
 {
-  var buf = state.sendmovebuf;
-  buf.cursize = 0;
-  msg.writeByte(buf, protocol.CLC.move);
-  msg.writeFloat(buf, clState.mtime[0]);
-  msg.writeAngle16(buf, clState.viewangles[0]);
-  msg.writeAngle16(buf, clState.viewangles[1]);
-  msg.writeAngle16(buf, clState.viewangles[2]);
-  msg.writeShort(buf, clState.cmd.forwardmove);
-  msg.writeShort(buf, clState.cmd.sidemove);
-  msg.writeShort(buf, clState.cmd.upmove);
   var bits = 0;
   if ((state.kbuttons[KBUTTON.attack].state & 3) !== 0)
     bits += 1;
@@ -794,9 +1040,34 @@ export const sendMove = async function()
   if ((state.kbuttons[KBUTTON.jump].state & 3) !== 0)
     bits += 2;
   state.kbuttons[KBUTTON.jump].state &= 5;
-  msg.writeByte(buf, bits);
-  msg.writeByte(buf, state.impulse);
+  clState.cmd.buttons = bits;
+  clState.cmd.impulse = state.impulse;
   state.impulse = 0;
+};
+
+export const sendMove = function()
+{
+  var buf = state.sendmovebuf;
+  buf.cursize = 0;
+  // FitzQuake/RMQ CLC_MOVE always carries 16-bit angles regardless of protocolFlags
+  // (matches QSS-M cl_input.c CL_SendMove); NetQuake stays byte-precision.
+  const isFitz = clState.protocol === protocol.fitzquake || clState.protocol === protocol.rmq
+  msg.writeByte(buf, protocol.CLC.move);
+  msg.writeFloat(buf, clState.mtime[0]);
+  if (isFitz) {
+    msg.writeAngle16(buf, clState.viewangles[0]);
+    msg.writeAngle16(buf, clState.viewangles[1]);
+    msg.writeAngle16(buf, clState.viewangles[2]);
+  } else {
+    msg.writeAngle(buf, clState.viewangles[0], clState.protocolFlags);
+    msg.writeAngle(buf, clState.viewangles[1], clState.protocolFlags);
+    msg.writeAngle(buf, clState.viewangles[2], clState.protocolFlags);
+  }
+  msg.writeShort(buf, clState.cmd.forwardmove);
+  msg.writeShort(buf, clState.cmd.sidemove);
+  msg.writeShort(buf, clState.cmd.upmove);
+  msg.writeByte(buf, clState.cmd.buttons);
+  msg.writeByte(buf, clState.cmd.impulse);
   if (cls.demoplayback === true)
     return;
   if (++clState.movemessages <= 2)
@@ -804,7 +1075,7 @@ export const sendMove = async function()
   if (net.sendUnreliableMessage(cls.netcon, buf) === -1)
   {
     con.print('CL.SendMove: lost server connection\n');
-    await disconnect();
+    disconnect();
     sys.quit('Lost connection to the game server.\n');
   }
 };
@@ -818,14 +1089,17 @@ export const initInput = function()
     'strafe', 'moveleft', 'moveright', 'speed',
     'attack', 'use', 'jump', 'klook'
   ];
+  // Every input command is csqc-interceptable, as QSS makes them for the whole of CL_InitInput
+  // (cl_input.c:615).
+  const interceptable = { interceptable: true };
   for (i = 0; i < commands.length; ++i)
   {
-    cmd.addCommand('+' + commands[i], keyDown);
-    cmd.addCommand('-' + commands[i], keyUp);
+    cmd.addCommand('+' + commands[i], keyDown, interceptable);
+    cmd.addCommand('-' + commands[i], keyUp, interceptable);
   }
-  cmd.addCommand('impulse', impulse);
-  cmd.addCommand('+mlook', keyDown);
-  cmd.addCommand('-mlook', mLookUp);
+  cmd.addCommand('impulse', impulse, interceptable);
+  cmd.addCommand('+mlook', keyDown, interceptable);
+  cmd.addCommand('-mlook', mLookUp, interceptable);
   for (i = 0; i < KBUTTON.num; ++i)
     state.kbuttons[i] = {down: [0, 0], state: 0};
 };
@@ -882,7 +1156,13 @@ export const rcon_f = function()
 
 export const clearState = function()
 {
-  if (sv.state.server.active !== true)
+  // Ahead of anything the csprogs could still be looking at (QSS CL_ClearState, cl_main.c:113-121).
+  csqc.shutdown();
+  // Safe: the new server's csqc_prog* stufftexts are buffered behind the serverinfo being parsed
+  // now and run before the next csqc.load, so this can never eat the new advertisement.
+  csqc.clearAdvertisement();
+
+  if (sv.state.server.phase !== 'active')
   {
     con.dPrint('Clearing memory\n');
     mod.clearAll();
@@ -894,8 +1174,11 @@ export const clearState = function()
   });
 
   clState = initClState();
+  dlState = initDlState();
 
   cls.message.cursize = 0;
+  state.showlmps.clear();
+  state.effects = [];
 
   state.entities = [];
   
@@ -937,38 +1220,48 @@ export const disconnect = async function()
     cls.message.cursize = 0;
     net.close(cls.netcon);
     cls.state = ACTIVE.disconnected;
-    if (sv.state.server.active === true)
+    if (sv.state.server.phase === 'active')
       await host.shutdownServer();
   }
   cls.demoplayback = cls.timedemo = false;
   cls.signon = 0;
+  // QSS CL_Disconnect nulls these (cl_main.c:203); ownsView keys on worldmodel.
+  csqc.shutdown();
+  clState.worldmodel = null;
+  clState.intermission = 0;
 };
 
 export const connect = function(sock: ISocket)
 {
+  Object.keys(clState).forEach(function(key) { delete (clState as any)[key]; });
+  clState = initClState();
+  dlState = initDlState();
+  cls.sendprespawn = false;
+  cls.protocol_dpdownload = 0;
   cls.netcon = sock;
+  // 'local' is the loopback address for both the in-process server and the
+  // server Worker; any other host is remote (WebRTC / WebSocket).
+  cls.isLocalServer = state.host === 'local';
   con.dPrint('CL.Connect: connected to ' + state.host + '\n');
   cls.demonum = -1;
   cls.state = ACTIVE.connected;
   cls.signon = 0;
 };
 
-export const establishConnection = async function(host_url : string)
+// Returns false when no driver produced a socket; callers decide whether that is
+// fatal (app join-on-load) or drops to the console (connect command, per vanilla).
+export const establishConnection = async function(host_url : string): Promise<boolean>
 {
   if (cls.demoplayback === true)
-    return;
+    return true;
   await disconnect();
   state.host = host_url;
   var sock = await net.connect(host_url);
-  if (sock == null)
-    await host.error('CL.EstablishConnection: connect failed\n');
-
   // TODO: Joe -  Fix types on connect - should *only* return a socket?
-  if (sock === 'connected' || sock === 'failed') {
-    await host.error('Socket not returned by connect');
-    return
-  }
+  if ((sock == null) || (sock === 'connected') || (sock === 'failed'))
+    return false;
   connect(sock);
+  return true;
 };
 
 export const signonReply = function()
@@ -977,8 +1270,7 @@ export const signonReply = function()
   switch (cls.signon)
   {
   case 1:
-    msg.writeByte(cls.message, protocol.CLC.stringcmd);
-    msg.writeString(cls.message, 'prespawn');
+    cls.sendprespawn = true;
     return;
   case 2:
     msg.writeByte(cls.message, protocol.CLC.stringcmd);
@@ -1092,7 +1384,8 @@ export const decayLights = function()
 export const lerpPoint = function()
 {
   var f = clState.mtime[0] - clState.mtime[1];
-  if ((f === 0.0) || (cvr.nolerp.value !== 0) || (cls.timedemo === true) || (sv.state.server.active === true))
+  if ((f === 0.0) || (cvr.nolerp.value !== 0) || (cls.timedemo === true) ||
+    ((sv.state.server.phase === 'active') && (host.state.netinterval === 0)))
   {
     clState.time = clState.mtime[0];
     return 1.0;
@@ -1103,25 +1396,35 @@ export const lerpPoint = function()
     f = 0.1;
   }
   var frac = (clState.time - clState.mtime[1]) / f;
-  if (frac < 0.0)
+  if (frac >= 0.0 && frac <= 1.0)
+    return frac;
+  // Remote server: vanilla hard resync. cl.time must stay locked to the
+  // server's message timeline — a gradual correction lets it drift up to
+  // 100ms off, seen online as added display latency / rubber banding.
+  if (sv.state.server.phase !== 'active')
   {
     if (frac < -0.01)
       clState.time = clState.mtime[1];
-    return 0.0;
-  }
-  if (frac > 1.0)
-  {
-    if (frac > 1.01)
+    else if (frac > 1.01)
       clState.time = clState.mtime[0];
-    return 1.0;
+    return frac < 0.0 ? 0.0 : 1.0;
   }
-  return frac;
+  // Local isolated server (netinterval): vanilla's hard snap freezes cl.time
+  // onto the 72Hz tick grid, quantizing all interpolated entity motion to
+  // 72Hz. Keep cl.time monotonic and bleed drift off slowly instead.
+  var bound = frac < 0.0 ? clState.mtime[1] : clState.mtime[0];
+  var err = clState.time - bound;
+  if (Math.abs(err) > 0.1)
+    clState.time = bound; // way off (map load, pause, stall): snap
+  else
+    clState.time -= err * 0.1;
+  return frac < 0.0 ? 0.0 : 1.0;
 };
 
 export const relinkEntities = function()
 {
   var i, j;
-  var frac = lerpPoint(), f, d, delta = [];
+  var frac = lerpPoint(), f, d, delta = vec.scratch();
 
   state.numvisedicts = 0;
 
@@ -1143,7 +1446,7 @@ export const relinkEntities = function()
   }
 
   var bobjrotate = vec.anglemod(100.0 * clState.time);
-  var ent, oldorg = vec.emptyV3(), dl;
+  var ent, oldorg = vec.scratch(), dl;
   for (i = 1; i < state.entities.length; ++i)
   {
     ent = state.entities[i];
@@ -1152,6 +1455,7 @@ export const relinkEntities = function()
     if (ent.msgtime !== clState.mtime[0])
     {
       ent.model = null;
+      ent.lerpflags |= r.LERP.resetmove | r.LERP.resetanim;
       continue;
     }
     oldorg[0] = ent.origin[0];
@@ -1169,8 +1473,13 @@ export const relinkEntities = function()
       {
         delta[j] = ent.msg_origins[0][j] - ent.msg_origins[1][j];
         if ((delta[j] > 100.0) || (delta[j] < -100.0))
+        {
           f = 1.0;
+          ent.lerpflags |= r.LERP.resetmove;
+        }
       }
+      if ((r.cvr.lerpmove.value !== 0) && ((ent.lerpflags & r.LERP.movestep) !== 0))
+        f = 1.0;
       for (j = 0; j <= 2; ++j)
       {
         ent.origin[j] = ent.msg_origins[1][j] + f * delta[j];
@@ -1184,36 +1493,53 @@ export const relinkEntities = function()
     }
 
     if ((ent.model.flags & mod.FLAGS.rotate) !== 0)
+    {
       ent.angles[1] = bobjrotate;
+      // QSS-M cl_main.c:1796. Rides 0..10 above the resting origin, so the pickup never
+      // sinks into the floor. Before the model-flag trails below, so an EF_GIB pickup
+      // drips as it bobs.
+      if (cvr.bobbing.value !== 0)
+        ent.origin[2] += Math.sin(bobjrotate / 90.0 * Math.PI) * 5.0 + 5.0;
+    }
     if ((ent.effects & mod.EFFECTS.brightfield) !== 0)
       r.entityParticles(ent);
     if ((ent.effects & mod.EFFECTS.muzzleflash) !== 0)
     {
       dl = allocDlight(i);
-      const fv = vec.emptyV3();
+      const fv = vec.scratch();
       vec.angleVectors(ent.angles, fv);
-      dl.origin = [
-        ent.origin[0] + 18.0 * fv[0],
-        ent.origin[1] + 18.0 * fv[1],
-        ent.origin[2] + 16.0 + 18.0 * fv[2]
-      ];
+      dl.origin[0] = ent.origin[0] + 18.0 * fv[0];
+      dl.origin[1] = ent.origin[1] + 18.0 * fv[1];
+      dl.origin[2] = ent.origin[2] + 16.0 + 18.0 * fv[2];
       dl.radius = 200.0 + Math.random() * 32.0;
       dl.minlight = 32.0;
       dl.die = clState.time + 0.1;
+      if (r.cvr.lerpmodels.value !== 2) {
+        if (i === clState.viewentity)
+          clState.viewent.lerpflags |= r.LERP.resetanim | r.LERP.resetanim2;
+        else
+          ent.lerpflags |= r.LERP.resetanim | r.LERP.resetanim2;
+      }
     }
     if ((ent.effects & mod.EFFECTS.brightlight) !== 0)
     {
       dl = allocDlight(i);
-      dl.origin = [ent.origin[0], ent.origin[1], ent.origin[2] + 16.0];
+      dl.origin[0] = ent.origin[0]; dl.origin[1] = ent.origin[1]; dl.origin[2] = ent.origin[2] + 16.0;
       dl.radius = 400.0 + Math.random() * 32.0;
       dl.die = clState.time + 0.001;
     }
-    if ((ent.effects & mod.EFFECTS.dimlight) !== 0)
+    if ((ent.effects & (mod.EFFECTS.dimlight | mod.EFFECTS.red | mod.EFFECTS.blue)) !== 0)
     {
       dl = allocDlight(i);
-      dl.origin = [ent.origin[0], ent.origin[1], ent.origin[2] + 16.0];
+      dl.origin[0] = ent.origin[0]; dl.origin[1] = ent.origin[1]; dl.origin[2] = ent.origin[2] + 16.0;
       dl.radius = 200.0 + Math.random() * 32.0;
       dl.die = clState.time + 0.001;
+      if ((ent.effects & (mod.EFFECTS.red | mod.EFFECTS.blue)) !== 0)
+      {
+        dl.color[0] = (ent.effects & mod.EFFECTS.red) !== 0 ? 1.0 : 0.0;
+        dl.color[1] = 0.0;
+        dl.color[2] = (ent.effects & mod.EFFECTS.blue) !== 0 ? 1.0 : 0.0;
+      }
     }
     if ((ent.model.flags & mod.FLAGS.gib) !== 0)
       r.rocketTrail(oldorg, ent.origin, 2);
@@ -1227,7 +1553,7 @@ export const relinkEntities = function()
     {
       r.rocketTrail(oldorg, ent.origin, 0);
       dl = allocDlight(i)
-      dl.origin = [ent.origin[0], ent.origin[1], ent.origin[2]];
+      dl.origin[0] = ent.origin[0]; dl.origin[1] = ent.origin[1]; dl.origin[2] = ent.origin[2];
       dl.radius = 200.0;
       dl.die = clState.time + 0.01;
     }
@@ -1242,16 +1568,36 @@ export const relinkEntities = function()
   }
 };
 
+// modelindex -> model for the csqc VM's edicts (QSS PR_CSQC_GetModel, pr_cmds.c:1953). Negative
+// indices are the csqc-side precache list.
+export const modelForIndex = function (index: number): Model
+{
+  if (index < 0)
+    return clState.model_precache_csqc[-index] ?? null;
+  if (index >= clState.model_precache.length)
+    return null;
+  return clState.model_precache[index];
+};
+
 export const readFromServer = async function()
 {
   clState.oldtime = clState.time;
   clState.time += host.state.frametime;
+
+  // Debug: periodic nqnetchan health check
+  if (cls.netcon?.protocol === 'nqnetchan' && Math.floor(host.state.realtime) !== Math.floor(host.state.realtime - host.state.frametime)) {
+    const q = cls.netcon.receiveMessage?.length ?? 0
+    const cs = cls.netcon.canSend
+    if (q > 5 || !cs)
+      console.warn(`[nqnetchan] queue=${q} canSend=${cs} recvSeq=${cls.netcon.receiveSequence}`)
+  }
+
   var ret;
   for (;;)
   {
     ret = getMessage();
     if (ret === -1)
-      await host.error('CL.ReadFromServer: lost server connection');
+      host.throwError('CL.ReadFromServer: lost server connection');
     if (ret === 0)
       break;
     clState.last_received_message = host.state.realtime;
@@ -1261,11 +1607,18 @@ export const readFromServer = async function()
   }
   if (cvr.shownet.value !== 0)
     con.print('\n');
-  relinkEntities();
-  updateTEnts();
+  // Relink runs with the client VM switched in, unconditionally - it feeds csqc's world links
+  // and predraw hooks (QSS cl_main.c:1255-1258).
+  pr.switchVM(pr.vms.csqc);
+  try {
+    relinkEntities();
+    updateTEnts();
+  } finally {
+    pr.switchVM(pr.vms.ssqc);
+  }
 };
 
-export const sendCmd = async function()
+export const sendCmd = function()
 {
   if (cls.state !== ACTIVE.connected)
     return;
@@ -1273,8 +1626,18 @@ export const sendCmd = async function()
   if (cls.signon === 4)
   {
     baseMove();
-    input.move();
-    await sendMove();
+    var pending = clState.pendingcmd;
+    clState.cmd.forwardmove += pending.forwardmove;
+    clState.cmd.sidemove += pending.sidemove;
+    clState.cmd.upmove += pending.upmove;
+    pending.forwardmove = pending.sidemove = pending.upmove = 0.0;
+    finishMove();
+    // Between finishMove and sendMove: the move is composed, not yet written, and the progs may
+    // rewrite it (QSS CSQC_Input_Frame, cl_main.c:1338-1346). Delta from QSS: it also runs the
+    // hook pre-signon on a zeroed move it discards; we compose no move at all until signon.
+    csqc.inputFrame();
+    sendMove();
+    clState.lastcmdtime = clState.time;
   }
 
   if (cls.demoplayback === true)
@@ -1293,7 +1656,7 @@ export const sendCmd = async function()
   }
 
   if (net.sendMessage(cls.netcon, cls.message) === -1)
-    await host.error('CL.SendCmd: lost server connection');
+    host.throwError('CL.SendCmd: lost server connection');
 
   cls.message.cursize = 0;
 };
@@ -1302,6 +1665,7 @@ export const init = async function()
 {
   state = initState();
   clState = initClState();
+  dlState = initDlState();
   cls = initStaticState();
   clearState();
   initInput();
@@ -1316,9 +1680,12 @@ export const init = async function()
   cvr.yawspeed = cvar.registerVariable('cl_yawspeed', '140');
   cvr.pitchspeed = cvar.registerVariable('cl_pitchspeed', '150');
   cvr.anglespeedkey = cvar.registerVariable('cl_anglespeedkey', '1.5');
-  cvr.maxfps = cvar.registerVariable('cl_maxfps', '60', true);
+  cvr.maxfps = cvar.registerVariable('cl_maxfps', '0', true);
   cvr.shownet = cvar.registerVariable('cl_shownet', '0');
   cvr.nolerp = cvar.registerVariable('cl_nolerp', '0');
+  // JoeQuake item bob (QSS-M cl_main.c:95). Off by default, as vanilla spins EF_ROTATE
+  // pickups without bobbing them.
+  cvr.bobbing = cvar.registerVariable('cl_bobbing', '0', true);
   cvr.lookspring = cvar.registerVariable('lookspring', '0', true);
   cvr.lookstrafe = cvar.registerVariable('lookstrafe', '0', true);
   cvr.sensitivity = cvar.registerVariable('sensitivity', '3', true);
@@ -1326,6 +1693,8 @@ export const init = async function()
   cvr.m_yaw = cvar.registerVariable('m_yaw', '0.022', true);
   cvr.m_forward = cvar.registerVariable('m_forward', '1', true);
   cvr.m_side = cvar.registerVariable('m_side', '0.8', true);
+  // Suppresses our reply to the server's `cmd pext` probe (QSS cmd.c:27); takes a reconnect.
+  cvr.cl_nopext = cvar.registerVariable('cl_nopext', '0');
   cvr.rcon_password = cvar.registerVariable('rcon_password', '');
   cvr.rcon_address = cvar.registerVariable('rcon_address', '');
   cmd.addCommand('entities', printEntities_f);
@@ -1335,6 +1704,14 @@ export const init = async function()
   cmd.addCommand('playdemo', playDemo_f);
   cmd.addCommand('timedemo', timeDemo_f);
   cmd.addCommand('rcon', rcon_f);
+  // QSS download extension commands (received via stufftext from server)
+  // Server-sent, so they stay the engine's share of the stufftext stream (QSS registers the same
+  // four with Cmd_AddCommand_ServerCommand, cl_main.c:1734-1736).
+  const fromServer = { fromServer: true };
+  cmd.addCommand('cl_serverextension_download', cl_serverextension_download_f, fromServer);
+  cmd.addCommand('cl_downloadbegin', cl_downloadbegin_f, fromServer);
+  cmd.addCommand('cl_downloadfinished', cl_downloadfinished_f, fromServer);
+  cmd.addCommand('stopdownload', stopdownload_f, fromServer);
 };
 
 // parse
@@ -1350,30 +1727,91 @@ export const entityNum = function(num: number)
   return state.entities[num];
 };
 
-export const parseStartSoundPacket = async function()
+export const parseStartSoundPacket = function()
 {
   var field_mask = msg.readByte();
   var volume = ((field_mask & 1) !== 0) ? msg.readByte() : 255;
   var attenuation = ((field_mask & 2) !== 0) ? msg.readByte() * 0.015625 : 1.0;
-  var channel = msg.readShort();
-  var sound_num = msg.readByte();
-  var ent = channel >> 3;
-  channel &= 7;
-  var pos: V3 = [msg.readCoord(), msg.readCoord(), msg.readCoord()];
-  await s.startSound(ent, channel, clState.sound_precache[sound_num], pos, volume / 255.0, attenuation);
+
+  var ent, channel;
+  if (field_mask & protocol.SND.largeentity) {
+    ent = msg.readShort();
+    channel = msg.readByte();
+  } else {
+    channel = msg.readShort();
+    ent = channel >> 3;
+    channel &= 7;
+  }
+  var sound_num = (field_mask & protocol.SND.largesound) ? msg.readShort() : msg.readByte();
+  if (field_mask & protocol.SND.largesound)
+    con.dPrint('[cl] large sound ' + sound_num + ': ' + clState.sound_precache[sound_num]?.name + '\n');
+
+  var pos: V3 = [msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags)];
+  const sfx = clState.sound_precache[sound_num];
+  // The progs may take the sound, but only one with a precache entry to name - QSS reads a zeroed
+  // array and skips the hook the same way (cl_parse.c:1224), which also covers pre-signon.
+  if ((sfx != null) && csqc.eventSound(ent, channel, sfx.name, volume, attenuation, pos, field_mask >> 8))
+    return;
+  s.startSound(ent, channel, sfx, pos, volume / 255.0, attenuation);
 };
 
 export const parseServerInfo = async function()
 {
   con.dPrint('Serverinfo packet received.\n');
   clearState();
-  var i = msg.readLong();
-  if (i !== protocol.netquake && i !== protocol.fitzquake)
+  // Vanilla-style cache turnover: drop decoded sounds from the previous map; the
+  // new map's precache below reloads what it needs (synchronously from paks).
+  s.flushCache();
+
+  // Agreed FTE extensions ride in front of the protocol long as (magic, mask) pairs (QSS
+  // CL_ParseServerInfo, cl_parse.c:1359-1376). The magics sit far outside any protocol number,
+  // so a plain serverinfo falls through on the first read.
+  var pext1 = 0, pext2 = 0, i;
+  for (;;)
+  {
+    i = msg.readLong();
+    if (i === protocol.PROTOCOL_FTE_PEXT1)
+    {
+      pext1 = msg.readLong() >>> 0;
+      continue;
+    }
+    if (i === protocol.PROTOCOL_FTE_PEXT2)
+    {
+      pext2 = msg.readLong() >>> 0;
+      continue;
+    }
+    break;
+  }
+  if ((pext1 & ~protocol.PEXT1_ACCEPTED_CLIENT) !== 0 || (pext2 & ~protocol.PEXT2_ACCEPTED_CLIENT) !== 0)
+  {
+    // An extension we never advertised can re-encode every later message, so the connection is
+    // unparseable from here (QSS Host_Errors too).
+    host.throwError('Server enabled protocol extensions that are not supported (0x' +
+      ((pext1 & ~protocol.PEXT1_ACCEPTED_CLIENT) >>> 0).toString(16) + ', 0x' +
+      ((pext2 & ~protocol.PEXT2_ACCEPTED_CLIENT) >>> 0).toString(16) + ')');
+    return;
+  }
+  clState.protocol_pext1 = pext1;
+  clState.protocol_pext2 = pext2;
+
+  if (i !== protocol.netquake && i !== protocol.fitzquake && i !== protocol.rmq)
   {
     con.print('Server returned protocol version ' + i + ' which is unsupported.\n');
     return;
   }
   clState.protocol = i
+
+  // RMQ carries a flags long after the protocol long; protocolFlags stores it verbatim
+  // (real PRFL wire bits, no translation). Matches QSS-M CL_ParseServerInfo.
+  if (i === protocol.rmq) {
+    clState.protocolFlags = msg.readLong();
+    const supportedFlags = protocol.PRFL.SHORTANGLE | protocol.PRFL.FLOATANGLE | protocol.PRFL.COORD24 |
+      protocol.PRFL.FLOATCOORD | protocol.PRFL.EDICTSCALE | protocol.PRFL.INT32COORD;
+    if (clState.protocolFlags & ~supportedFlags)
+      con.print('PROTOCOL_RMQ protocolflags ' + clState.protocolFlags + ' contains unsupported flags\n');
+  } else
+    clState.protocolFlags = 0;
+
   clState.maxclients = msg.readByte();
   if ((clState.maxclients <= 0) || (clState.maxclients > 16))
   {
@@ -1387,7 +1825,10 @@ export const parseServerInfo = async function()
       name: '',
       entertime: 0.0,
       frags: 0,
-      colors: 0
+      colors: 0,
+      ping: 0,
+      isBot: false,
+      pinged: false
     };
   }
   clState.gametype = msg.readByte();
@@ -1413,25 +1854,333 @@ export const parseServerInfo = async function()
     sound_precache[numsounds] = str;
   }
 
+  // Store precache names — actual loading is deferred to checkDownloads()
+  // so that missing assets can be downloaded first
+  dlState.model_names = model_precache;
+  dlState.sound_names = sound_precache;
+  dlState.model_download_index = 1;
+  dlState.sound_download_index = 1;
   clState.model_precache = [];
-  for (i = 1; i < nummodels; ++i)
-  {
-    clState.model_precache[i] = await mod.forName(model_precache[i]);
-    if (clState.model_precache[i] == null)
-    {
-      con.print('Model ' + model_precache[i] + ' not found\n');
-      break;
-    }
-  }
   clState.sound_precache = [];
-  for (i = 1; i < numsounds; ++i)
-  {
-    clState.sound_precache[i] = await s.precacheSound(sound_precache[i]);
+  clState.particle_precache = [];
+  pscript.reset(); // effectinfo.txt can differ per mod dir; re-resolved lazily on next lookup
+
+  // Actual model/sound loading is deferred to checkDownloads() in the frame loop.
+  // This allows cl_serverextension_download (received via stufftext in the same message)
+  // to be executed first by cmd.execute() at the top of the next frame, so checkDownloads
+  // knows whether to attempt downloads before loading.
+};
+
+// Lets the browser present the canvas and paint between precache items.
+const yieldToBrowser = function(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve));
+};
+
+const loadAllPrecaches = async function() {
+  const model_precache = dlState.model_names;
+  const sound_precache = dlState.sound_names;
+  const total = (model_precache.length - 1) + (sound_precache.length - 1);
+  let done = 0;
+  try {
+    for (let i = 1; i < model_precache.length; ++i)
+    {
+      const name = model_precache[i];
+      scr.state.loadProgress = {text: 'Loading ' + name, current: done, total};
+      if (name[0] !== '*')
+      {
+        scr.updateScreen();
+        await yieldToBrowser();
+        // loadFileSync only sees files made resident at engine init; pull
+        // anything that arrived later (IndexedDB writes, remote files) into
+        // residency here — this is a pause point, awaits are allowed. Models
+        // already parsed (e.g. shared with the local server) skip the byte
+        // fetch entirely: huge sources are evicted from residency after
+        // parsing (mod.loadBrushModel) and must not be pointlessly re-read.
+        if (mod.needsLoad(name)) {
+          if (com.loadFileSync(name) == null)
+            await com.loadFile(name);
+          if (name.endsWith('.bsp')) {
+            const litName = com.removeExtension(name) + '.lit';
+            if (com.loadFileSync(litName) == null)
+              await com.loadFile(litName);
+          }
+        }
+      }
+      clState.model_precache[i] = mod.forName(name);
+      if (clState.model_precache[i] == null)
+        host.throwError('Model ' + name + ' not found');
+      ++done;
+    }
+    for (let i = 1; i < sound_precache.length; ++i)
+    {
+      scr.state.loadProgress = {text: 'Loading sound/' + sound_precache[i], current: done, total};
+      if ((i & 15) === 1)
+      {
+        scr.updateScreen();
+        await yieldToBrowser();
+      }
+      clState.sound_precache[i] = await s.precacheSound(sound_precache[i]);
+      ++done;
+    }
+  } finally {
+    scr.state.loadProgress = null;
   }
   clState.worldmodel = clState.model_precache[1];
   entityNum(0).model = clState.worldmodel;
   r.newMap();
   host.state.noclip_anglehack = false;
+};
+
+// --- QSS Download Extension Protocol ---
+
+// QSS COM_DownloadNameOkay (common.c:1585-1630), plus the csprogs carve-out below.
+const DOWNLOAD_ALLOWED_PREFIXES = ['sound/', 'progs/', 'maps/', 'models/', 'csprogsvers/'];
+const DOWNLOAD_ALLOWED_EXTENSIONS = [
+  'bsp', 'mdl', 'iqm', 'md3', 'spr', 'spr32',
+  'wav', 'ogg', 'mp3',
+  'tga', 'png',
+  'lux', 'lit2', 'lit'
+];
+
+// The only downloadable gamecode, and only under the hashed cache name csqc.load looks for, so a
+// server can never replace the csprogs another server's client runs. Plain csprogs.dat/progs.dat
+// stay undownloadable, as in FTE (CL_AllowArbitaryDownload; its csqc lands under this prefix too).
+const DOWNLOAD_CSPROGS_PREFIX = 'csprogsvers/';
+
+const downloadNameOkay = function(filename: string): boolean {
+  if (!filename || filename.length === 0)
+    return false;
+  // Block path traversal
+  if (filename.indexOf('\\') !== -1 || filename.indexOf(':') !== -1 ||
+      filename.indexOf('*') !== -1 || filename.indexOf('?') !== -1 ||
+      filename.indexOf('"') !== -1)
+    return false;
+  if (filename.indexOf('//') !== -1)
+    return false;
+  if (filename[0] === '.' || filename.indexOf('/.') !== -1)
+    return false;
+
+  // Check prefix
+  const hasValidPrefix = DOWNLOAD_ALLOWED_PREFIXES.some(p => filename.startsWith(p));
+  if (!hasValidPrefix)
+    return false;
+
+  // Check extension
+  const dot = filename.lastIndexOf('.');
+  if (dot === -1)
+    return false;
+  const ext = filename.substring(dot + 1).toLowerCase();
+  if (filename.startsWith(DOWNLOAD_CSPROGS_PREFIX))
+    return ext === 'dat';
+  return DOWNLOAD_ALLOWED_EXTENSIONS.indexOf(ext) !== -1;
+};
+
+const shouldDownload = function(filename: string): boolean {
+  if (!cls.protocol_dpdownload)
+    return false;
+  if (cls.isLocalServer) // local server (in-process or Worker) — files are already local
+    return false;
+  if (filename[0] === '*') // internal names (inline models)
+    return false;
+  if (!downloadNameOkay(filename))
+    return false;
+  return true;
+};
+
+// Command handler: server sends "cl_serverextension_download 1" via stufftext
+const cl_serverextension_download_f = function() {
+  cls.protocol_dpdownload = q.atoi(cmd.state.argv[1]);
+  con.dPrint('[cl] Server supports download extension: ' + cls.protocol_dpdownload + '\n');
+};
+
+// Command handler: server sends "cl_downloadbegin <size> <filename>" via stufftext
+const cl_downloadbegin_f = function() {
+  const size = parseInt(cmd.state.argv[1]);
+  const filename = cmd.state.argv[2];
+  // Buffer may already be allocated by immediate stufftext intercept
+  if (!dlState.download.data) {
+    dlState.download.size = size;
+    dlState.download.data = new Uint8Array(size);
+    con.print('[cl] Download begin: ' + filename + ' (' + size + ' bytes)\n');
+  }
+  // Respond with sv_startdownload to tell server to start sending data
+  msg.writeByte(cls.message, protocol.CLC.stringcmd);
+  msg.writeString(cls.message, 'sv_startdownload');
+};
+
+// Command handler: server sends "cl_downloadfinished <size> <crc> <filename>" via stufftext
+const cl_downloadfinished_f = async function() {
+  const size = parseInt(cmd.state.argv[1]);
+  const hash = parseInt(cmd.state.argv[2]);
+  const filename = cmd.state.argv[3];
+
+  if (!dlState.download.active || !dlState.download.data) {
+    con.print('[cl] Download finished but no active download\n');
+    return;
+  }
+
+  // Verify size
+  if (size !== dlState.download.size) {
+    con.print('[cl] Download size mismatch: expected ' + dlState.download.size + ', got ' + size + '\n');
+    dlState.download.active = false;
+    dlState.download.data = null;
+    return;
+  }
+
+  // Verify CRC
+  const computedCrc = crc.block(dlState.download.data);
+  if (computedCrc !== hash) {
+    con.print('[cl] Download CRC mismatch for ' + filename + ': expected ' + hash + ', got ' + computedCrc + '\n');
+    dlState.download.active = false;
+    dlState.download.data = null;
+    return;
+  }
+
+  // Re-checked at save time: the name is the server's and a download can arrive unrequested, so
+  // this is what decides which paths a server may write into the game dir.
+  if (!downloadNameOkay(filename)) {
+    con.print('[cl] Refusing to save downloaded file ' + filename + '\n');
+    dlState.download.active = false;
+    dlState.download.data = null;
+    return;
+  }
+
+  // Save the downloaded file to the asset store
+  const game = com.state.searchpaths[com.state.searchpaths.length - 1].dir;
+  const saveBuf = new ArrayBuffer(dlState.download.data.byteLength);
+  new Uint8Array(saveBuf).set(dlState.download.data);
+  await com.state.assetStore.saveDownloadedFile(game, filename, saveBuf);
+  con.print('[cl] Downloaded and saved: ' + filename + '\n');
+
+  dlState.download.active = false;
+  dlState.download.data = null;
+};
+
+// Command handler: server sends "stopdownload" via stufftext when download is rejected
+const stopdownload_f = function() {
+  con.print('[cl] Server rejected download' +
+    (dlState.download.active ? ': ' + dlState.download.filename : '') + '\n');
+  dlState.download.active = false;
+  dlState.download.data = null;
+};
+
+// Handle SVC 50 (svcdp_downloaddata): binary download data chunk
+export const parseDownloadData = function() {
+  const start = msg.readLong();
+  const size = msg.readShort() & 0xFFFF; // unsigned short
+  const data = msg.readData(size);
+
+  if (!dlState.download.active || !dlState.download.data)
+    return;
+
+  // Write data into our buffer at the specified offset
+  if (start >= 0 && start + size <= dlState.download.size) {
+    dlState.download.data.set(data, start);
+    dlState.download.received = start + size;
+
+    // Print progress at every 10% increment
+    const pct = Math.floor(dlState.download.received * 10 / dlState.download.size) * 10;
+    if (pct !== dlState.download.lastPct) {
+      dlState.download.lastPct = pct;
+      con.print('Downloading ' + dlState.download.filename + '... ' + pct + '%\n');
+    }
+  }
+
+  // Send ack back unreliably — reliable acks block the nqnetchan
+  // canSend flag and prevent sv_startdownload and other messages
+  // from being sent in a timely manner
+  const ackBuf: IDatagram = sz.newDatagram(7);
+  msg.writeByte(ackBuf, protocol.CLC.dp_ackdownloaddata);
+  msg.writeLong(ackBuf, start);
+  msg.writeShort(ackBuf, size);
+  net.sendUnreliableMessage(cls.netcon, ackBuf);
+};
+
+// Check if a file needs downloading; if so, request it.
+// Returns: true = file is available (or can't be downloaded), false = waiting for download
+const checkOrDownloadFile = async function(filename: string): Promise<boolean> {
+  if (!shouldDownload(filename))
+    return true;
+
+  // Already downloading?
+  if (dlState.download.active)
+    return false;
+
+  // Already tried this file (prevents infinite retry)
+  if (dlState.download.lastFilename === filename)
+    return true;
+
+  // Check if file exists locally
+  const existing = await com.loadFile(filename);
+  if (existing)
+    return true;
+
+  // Request download
+  con.print('[cl] Requesting download: ' + filename + '\n');
+  dlState.download.active = true;
+  dlState.download.filename = filename;
+  dlState.download.lastFilename = filename;
+  dlState.download.size = 0;
+  dlState.download.received = 0;
+  dlState.download.lastPct = -1;
+  dlState.download.data = null;
+  msg.writeByte(cls.message, protocol.CLC.stringcmd);
+  msg.writeString(cls.message, 'download "' + filename + '"');
+  return false;
+};
+
+// Main download state machine — called each frame from host._frame while sendprespawn is true.
+// Returns true when all downloads are complete and precaches are loaded.
+export const checkDownloads = async function(): Promise<boolean> {
+  // If no model names have been stored, parseServerInfo hasn't run yet
+  // (e.g. FTE protocol negotiation phase). Don't send prespawn — let the
+  // NOP keepalive maintain the connection while the protocols response
+  // reaches the server and triggers the real signon with SVC_SERVERINFO.
+  if (dlState.model_names.length === 0)
+    return false;
+
+  // If dpdownload is not yet set, wait a couple of frames for
+  // cl_serverextension_download stufftext to be processed by cmd.execute.
+  // The stufftext may arrive in the same or a different reliable message
+  // as SVC_SERVERINFO — waiting avoids a premature loadAllPrecaches.
+  if (!cls.protocol_dpdownload) {
+    dlState.download_check_wait++;
+    if (dlState.download_check_wait <= 2)
+      return false;
+  }
+
+  // If download protocol is supported, check for missing files first
+  if (cls.protocol_dpdownload) {
+    // If a download is currently in progress, wait for it to finish
+    if (dlState.download.active)
+      return false;
+
+    // Check models
+    while (dlState.model_download_index < dlState.model_names.length) {
+      const name = dlState.model_names[dlState.model_download_index];
+      if (name && name[0] !== '*') { // skip inline models
+        if (!await checkOrDownloadFile(name)) {
+          return false; // download started, wait
+        }
+      }
+      dlState.model_download_index++;
+    }
+
+    // Check sounds (need "sound/" prefix for download path)
+    while (dlState.sound_download_index < dlState.sound_names.length) {
+      const name = dlState.sound_names[dlState.sound_download_index];
+      if (name) {
+        if (!await checkOrDownloadFile('sound/' + name)) {
+          return false; // download started, wait
+        }
+      }
+      dlState.sound_download_index++;
+    }
+  }
+
+  // All downloads complete (or no download support) — load all precaches
+  await loadAllPrecaches();
+  return true;
 };
 
 export const parseUpdate = function(bits: number)
@@ -1452,6 +2201,11 @@ export const parseUpdate = function(bits: number)
   var ent = entityNum(((bits & protocol.U.longentity) !== 0) ? msg.readShort() : msg.readByte());
 
   var forcelink = ent.msgtime !== clState.mtime[1];
+  // johnfitz -- no update in >0.2s (incl. brand-new entities, msgtime 0): kill all
+  // lerps. Without resetmove, previousorigin stays at its initial (0,0,0) and any
+  // U_LERPFINISH entity is rendered sliding in from the world origin forever.
+  if (ent.msgtime + 0.2 < clState.mtime[0])
+    ent.lerpflags |= r.LERP.resetanim | r.LERP.resetanim2 | r.LERP.resetmove;
   ent.msgtime = clState.mtime[0];
 
   let modNum = ((bits & protocol.U.model) !== 0) ? msg.readByte() : ent.baseline.modelindex
@@ -1459,25 +2213,32 @@ export const parseUpdate = function(bits: number)
   ent.frame = ((bits & protocol.U.frame) !== 0) ? msg.readByte() : ent.baseline.frame;
   ent.colormap = ((bits & protocol.U.colormap) !== 0) ? msg.readByte() : ent.baseline.colormap;
   if (ent.colormap > clState.maxclients)
-    sys.error('i >= cl.maxclients');
+    ent.colormap = 0; // extended player slot beyond maxclients, use default colormap
   ent.skinnum = ((bits & protocol.U.skin) !== 0) ? msg.readByte() : ent.baseline.skin;
   ent.effects = ((bits & protocol.U.effects) !== 0) ? msg.readByte() : ent.baseline.effects;
 
   vec.copy(ent.msg_origins[0], ent.msg_origins[1]);
   vec.copy(ent.msg_angles[0], ent.msg_angles[1]);
-  ent.msg_origins[0][0] = ((bits & protocol.U.origin1) !== 0) ? msg.readCoord() : ent.baseline.origin[0];
-  ent.msg_angles[0][0] = ((bits & protocol.U.angle1) !== 0) ? msg.readAngle() : ent.baseline.angles[0];
-  ent.msg_origins[0][1] = ((bits & protocol.U.origin2) !== 0) ? msg.readCoord() : ent.baseline.origin[1];
-  ent.msg_angles[0][1] = ((bits & protocol.U.angle2) !== 0) ? msg.readAngle() : ent.baseline.angles[1];
-  ent.msg_origins[0][2] = ((bits & protocol.U.origin3) !== 0) ? msg.readCoord() : ent.baseline.origin[2];
-  ent.msg_angles[0][2] = ((bits & protocol.U.angle3) !== 0) ? msg.readAngle() : ent.baseline.angles[2];
+  ent.msg_origins[0][0] = ((bits & protocol.U.origin1) !== 0) ? msg.readCoord(clState.protocolFlags) : ent.baseline.origin[0];
+  ent.msg_angles[0][0] = ((bits & protocol.U.angle1) !== 0) ? msg.readAngle(clState.protocolFlags) : ent.baseline.angles[0];
+  ent.msg_origins[0][1] = ((bits & protocol.U.origin2) !== 0) ? msg.readCoord(clState.protocolFlags) : ent.baseline.origin[1];
+  ent.msg_angles[0][1] = ((bits & protocol.U.angle2) !== 0) ? msg.readAngle(clState.protocolFlags) : ent.baseline.angles[1];
+  ent.msg_origins[0][2] = ((bits & protocol.U.origin3) !== 0) ? msg.readCoord(clState.protocolFlags) : ent.baseline.origin[2];
+  ent.msg_angles[0][2] = ((bits & protocol.U.angle3) !== 0) ? msg.readAngle(clState.protocolFlags) : ent.baseline.angles[2];
 
-  if (bits & protocol.U.alpha) 
+  if (bits & protocol.U.alpha)
     ent.alpha = msg.readByte()
   else
     ent.alpha = ent.baseline.alpha
 
-  if (bits & protocol.U.frame2) 
+  // RMQ (999) .scale; reset to baseline every update so a stale value can't survive
+  // slot reuse -- mirrors CL_ParseUpdate (cl_parse.c) alpha/scale handling.
+  if (bits & protocol.U.scale)
+    ent.scale = msg.readByte()
+  else
+    ent.scale = ent.baseline.scale
+
+  if (bits & protocol.U.frame2)
     ent.frame = (ent.frame & 0x00FF) | (msg.readByte() << 8)
   if (bits & protocol.U.model2) 
     modNum = (modNum & 0x00FF) | (msg.readByte() << 8)
@@ -1489,6 +2250,8 @@ export const parseUpdate = function(bits: number)
     ent.lerpflags &= ~r.LERP.finish
   }
 
+  // live wire index (QSS netstate.modelindex); getentity GE_MODELINDEX reads it
+  ent.modelindex = modNum;
   var model = clState.model_precache[modNum];
   if (model !== ent.model)
   {
@@ -1497,10 +2260,14 @@ export const parseUpdate = function(bits: number)
       ent.syncbase = (model.random === true) ? Math.random() : 0.0;
     else
       forcelink = true;
+    ent.lerpflags |= r.LERP.resetanim;
   }
-  
-  if ((bits & protocol.U.nolerp) !== 0)
+
+  if ((bits & protocol.U.nolerp) !== 0) {
+    ent.lerpflags |= r.LERP.movestep;
     ent.forcelink = true;
+  } else
+    ent.lerpflags &= ~r.LERP.movestep;
 
   if (forcelink === true)
   {
@@ -1527,21 +2294,43 @@ const parseBaseline = function(ent: Entity, version: number)
 
   ent.baseline.colormap = msg.readByte();
   ent.baseline.skin = msg.readByte();
-  ent.baseline.origin[0] = msg.readCoord();
-  ent.baseline.angles[0] = msg.readAngle();
-  ent.baseline.origin[1] = msg.readCoord();
-  ent.baseline.angles[1] = msg.readAngle();
-  ent.baseline.origin[2] = msg.readCoord();
-  ent.baseline.angles[2] = msg.readAngle();
+  ent.baseline.origin[0] = msg.readCoord(clState.protocolFlags);
+  ent.baseline.angles[0] = msg.readAngle(clState.protocolFlags);
+  ent.baseline.origin[1] = msg.readCoord(clState.protocolFlags);
+  ent.baseline.angles[1] = msg.readAngle(clState.protocolFlags);
+  ent.baseline.origin[2] = msg.readCoord(clState.protocolFlags);
+  ent.baseline.angles[2] = msg.readAngle(clState.protocolFlags);
 
   ent.baseline.alpha = bits & protocol.BASE.alpha ? msg.readByte() : protocol.ENT_ALPHA.default
+  // B_SCALE only valid under RMQ, but read whenever the bit is set (server only sets it
+  // under 999) -- matches QSS-M cl_parse.c CL_ParseSpawnBaseline.
+  ent.baseline.scale = bits & protocol.BASE.scale ? msg.readByte() : protocol.ENTSCALE_DEFAULT
+};
+
+// Every numeric stat write keeps stats[] and statsf[] in sync, as QSS CL_ParseStatNumeric does
+// (cl_parse.c:2269-2287).
+const setStat = function(i: number, v: number) {
+  clState.stats[i] = v;
+  clState.statsf[i] = v;
+};
+
+const orStat = function(i: number, bits: number) {
+  clState.stats[i] |= bits;
+  clState.statsf[i] = clState.stats[i];
+};
+
+// getstati on a float stat sees it truncated toward zero, matching QSS CL_ParseStatFloat's plain
+// C conversion (cl_parse.c:2269-2271).
+const setStatFloat = function(i: number, v: number) {
+  clState.stats[i] = Math.trunc(v);
+  clState.statsf[i] = v;
 };
 
 export const parseClientdata = function()
 {
   var i;
 
-  var bits = (new Uint16Array([msg.readShort()]))[0] 
+  var bits = (new Uint16Array([msg.readShort()]))[0]
 
   // fitzquake protocol additional data
 	if (bits & protocol.SU.extend1)
@@ -1552,6 +2341,9 @@ export const parseClientdata = function()
   
   clState.viewheight = ((bits & protocol.SU.viewheight) !== 0) ? msg.readChar() : protocol.default_viewheight;
   clState.idealpitch = ((bits & protocol.SU.idealpitch) !== 0) ? msg.readChar() : 0.0;
+  // Mirrored into the stats array so csqc can getstatf them (QSS CL_SetStati, cl_parse.c:1862).
+  setStat(def.STAT.viewheight, clState.viewheight);
+  setStat(def.STAT.idealpitch, clState.idealpitch);
 
   clState.mvelocity[1] = [clState.mvelocity[0][0], clState.mvelocity[0][1], clState.mvelocity[0][2]];
   for (i = 0; i <= 2; ++i)
@@ -1577,47 +2369,49 @@ export const parseClientdata = function()
     }
     clState.items = i;
   }
+  // items | items2<<23 as stat 15, for getstatbits(STAT_ITEMS) (QSS cl_parse.c:1900-1901).
+  setStat(def.STAT.items, i);
 
   clState.onground = (bits & protocol.SU.onground) !== 0;
   clState.inwater = (bits & protocol.SU.inwater) !== 0;
 
-  clState.stats[def.STAT.weaponframe] = ((bits & protocol.SU.weaponframe) !== 0) ? msg.readByte() : 0;
-  clState.stats[def.STAT.armor] = ((bits & protocol.SU.armor) !== 0) ? msg.readByte() : 0;
-  clState.stats[def.STAT.weapon] = ((bits & protocol.SU.weapon) !== 0) ? msg.readByte() : 0;
-  clState.stats[def.STAT.health] = msg.readShort();
-  clState.stats[def.STAT.ammo] = msg.readByte();
-  clState.stats[def.STAT.shells] = msg.readByte();
-  clState.stats[def.STAT.nails] = msg.readByte();
-  clState.stats[def.STAT.rockets] = msg.readByte();
-  clState.stats[def.STAT.cells] = msg.readByte();
+  setStat(def.STAT.weaponframe, ((bits & protocol.SU.weaponframe) !== 0) ? msg.readByte() : 0);
+  setStat(def.STAT.armor, ((bits & protocol.SU.armor) !== 0) ? msg.readByte() : 0);
+  setStat(def.STAT.weapon, ((bits & protocol.SU.weapon) !== 0) ? msg.readByte() : 0);
+  setStat(def.STAT.health, msg.readShort());
+  setStat(def.STAT.ammo, msg.readByte());
+  setStat(def.STAT.shells, msg.readByte());
+  setStat(def.STAT.nails, msg.readByte());
+  setStat(def.STAT.rockets, msg.readByte());
+  setStat(def.STAT.cells, msg.readByte());
   if (com.state.standard_quake === true)
-    clState.stats[def.STAT.activeweapon] = msg.readByte();
+    setStat(def.STAT.activeweapon, msg.readByte());
   else
-    clState.stats[def.STAT.activeweapon] = 1 << msg.readByte();
+    setStat(def.STAT.activeweapon, 1 << msg.readByte());
 
   if (bits & protocol.SU.weapon2)
-    clState.stats[def.STAT.weapon] |= (msg.readByte() << 8);
+    orStat(def.STAT.weapon, (msg.readByte() << 8));
 
   if (bits & protocol.SU.armor2)
-    clState.stats[def.STAT.armor] |= (msg.readByte() << 8);
+    orStat(def.STAT.armor, (msg.readByte() << 8));
 
   if (bits & protocol.SU.ammo2)
-    clState.stats[def.STAT.ammo] |= (msg.readByte() << 8);
+    orStat(def.STAT.ammo, (msg.readByte() << 8));
 
   if (bits & protocol.SU.shells2)
-    clState.stats[def.STAT.shells] |= (msg.readByte() << 8);
+    orStat(def.STAT.shells, (msg.readByte() << 8));
 
   if (bits & protocol.SU.nails2)
-    clState.stats[def.STAT.nails] |= (msg.readByte() << 8);
+    orStat(def.STAT.nails, (msg.readByte() << 8));
 
   if (bits & protocol.SU.rockets2)
-    clState.stats[def.STAT.rockets] |= (msg.readByte() << 8);
+    orStat(def.STAT.rockets, (msg.readByte() << 8));
 
   if (bits & protocol.SU.cells2)
-    clState.stats[def.STAT.cells] |= (msg.readByte() << 8);
+    orStat(def.STAT.cells, (msg.readByte() << 8));
 
   if (bits & protocol.SU.weaponframe2)
-    clState.stats[def.STAT.weaponframe] |= (msg.readByte() << 8);
+    orStat(def.STAT.weaponframe, (msg.readByte() << 8));
 
   if (bits & protocol.SU.weaponalpha)
     msg.readByte() // TODO: weaponalpha
@@ -1637,6 +2431,7 @@ export const parseStatic = function(version: number) {
   ent.skinnum = ent.baseline.skin;
   ent.effects = ent.baseline.effects;
   ent.alpha = ent.baseline.alpha
+  ent.scale = ent.baseline.scale
   ent.colormap = 0 // TODO: Joe this doesn't seem right.
   ent.origin = [ent.baseline.origin[0], ent.baseline.origin[1], ent.baseline.origin[2]];
   ent.angles = [ent.baseline.angles[0], ent.baseline.angles[1], ent.baseline.angles[2]];
@@ -1645,15 +2440,12 @@ export const parseStatic = function(version: number) {
     var emins: V3 = [ent.origin[0] + ent.model.mins[0], ent.origin[1] + ent.model.mins[1], ent.origin[2] + ent.model.mins[2]];
     var emaxs: V3 = [ent.origin[0] + ent.model.maxs[0], ent.origin[1] + ent.model.maxs[1], ent.origin[2] + ent.model.maxs[2]];
   
-    state.pefragtopnode = null
-    r.splitEntityOnNode(clState.worldmodel.nodes[0], ent, emins, emaxs);
-    // Not used??
-    ent.topnode = state.pefragtopnode
+    r.splitEntityOnNode(0, ent, emins, emaxs);
   }
 };
 
-export const parseStaticSound = async function(version: number) {
-  var org: V3 = [msg.readCoord(), msg.readCoord(), msg.readCoord()];
+export const parseStaticSound = function(version: number) {
+  var org: V3 = [msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags)];
   var sound_num
 
 	//johnfitz -- PROTOCOL_FITZQUAKE
@@ -1665,7 +2457,7 @@ export const parseStaticSound = async function(version: number) {
   
   var vol = msg.readByte();
   var atten = msg.readByte();
-  await s.staticSound(clState.sound_precache[sound_num], org, vol / 255.0, atten);
+  s.staticSound(clState.sound_precache[sound_num], org, vol / 255.0, atten);
 };
 
 export const shownet = function(x: string)
@@ -1677,6 +2469,46 @@ export const shownet = function(x: string)
   }
 };
 
+// The csqc entity stream (QSS CLFTE_ParseCSQCEntitiesUpdate, cl_parse.c:828-883): entity numbers
+// - 14 bits plus an escape byte for the top 8, high bit = remove - each update followed by an
+// opaque .SendEntity payload only the progs can measure, terminated by a 0 short.
+const parseCSQCEntities = function()
+{
+  // QSS Host_Errors instead of trying to skip payloads it has no way to measure (cl_parse.c:881).
+  if (csqc.state.extfuncs.CSQC_Ent_Update === 0)
+    host.throwError('CL.ParseServerMessage: Received svcdp_csqcentities but unable to parse\n');
+
+  var entnum, removeflag, start, isnew;
+  for (;;)
+  {
+    entnum = msg.readShort() & 0xffff;
+    removeflag = (entnum & 0x8000) !== 0;
+    // 22-bit entity numbers unconditionally, matching sv.writeCsqcEntnum; QSS picks the form off
+    // PEXT2_REPLACEMENTDELTAS, which we do not implement.
+    if ((entnum & 0x4000) !== 0)
+      entnum = (entnum & 0x3fff) | (msg.readByte() << 14);
+    else
+      entnum &= ~0x8000;
+    if (((entnum === 0) && (removeflag === false)) || (msg.state.badread === true))
+      return;
+
+    if (removeflag === true)
+    {
+      if (cvr.shownet.value === 2)
+        shownet('    csqc remove ' + entnum);
+      csqc.entRemove(entnum);
+      continue;
+    }
+    start = msg.state.readcount;
+    isnew = csqc.entUpdate(entnum);
+    // Diagnostic only: the wire carries no per-entity length (QSS's sized variant is #if 0'd,
+    // cl_parse.c:866-877), so a progs that reads the wrong count corrupts the rest of the message
+    // and all the engine can report is what each entity consumed.
+    if (cvr.shownet.value === 2)
+      shownet('    csqc update ' + entnum + (isnew === true ? ' new ' : ' ') + (msg.state.readcount - start) + ' bytes');
+  }
+};
+
 export const parseServerMessage = async function()
 {
   if (cvr.shownet.value === 1)
@@ -1684,21 +2516,31 @@ export const parseServerMessage = async function()
   else if (cvr.shownet.value === 2)
     con.print('------------------\n');
 
-  clState.onground = false;
+  // no vanilla `onground = false` reset here (QSS-M cl_parse.c): messages without
+  // clientdata (reliables) would leave a false airborne tick and jerk the view's
+  // stair-step smoothing while riding movers; svc_clientdata is the sole writer
 
   msg.beginReading();
 
   var _cmd, i;
+  var _lastcmd = -1;
   for (;;)
   {
-    if (msg.state.badread === true)
-      await host.error('CL.ParseServerMessage: Bad server message');
+    if (msg.state.badread === true) {
+      const msgBytes = Array.from(new Uint8Array(net.state.message.data, 0, net.state.message.cursize)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+      console.error(`[cl] Bad server message after svc ${_lastcmd} (0x${_lastcmd.toString(16)}), readcount=${msg.state.readcount}, cursize=${net.state.message.cursize}\nFull message: ${msgBytes}`);
+      host.throwError(`CL.ParseServerMessage: Bad server message (after svc ${_lastcmd})`);
+    }
 
     _cmd = msg.readByte();
+    _lastcmd = _cmd;
 
     if (_cmd === -1)
     {
       shownet('END OF MESSAGE');
+      // Flushes a stufftext a mod left without its trailing \n (QSS cl_parse.c:2526-2528, minus
+      // its cursize guard against fragmented datagrams - our transport delivers whole messages).
+      csqc.flushStuffText();
       return;
     }
 
@@ -1712,169 +2554,300 @@ export const parseServerMessage = async function()
     shownet('svc_' + SVC_STRINGS[_cmd]);
     switch (_cmd)
     {
-    case protocol.SVC.nop:
-      continue;
-    case protocol.SVC.time:
-      clState.mtime[1] = clState.mtime[0];
-      clState.mtime[0] = msg.readFloat();
-      continue;
-    case protocol.SVC.clientdata:
-      parseClientdata();
-      continue;
-    case protocol.SVC.version:
-      i = msg.readLong();
-      if (i !== protocol.netquake && i !== protocol.fitzquake)
-        await host.error('CL.ParseServerMessage: Server is protocol ' + i + ' is not supported\n');
-      clState.protocol = i
-      continue;
-    case protocol.SVC.disconnect:
-      await host.endGame('Server disconnected\n');
-    case protocol.SVC.print:
-      con.print(msg.readString());
-      continue;
-    case protocol.SVC.centerprint:
-      scr.centerPrint(msg.readString());
-      continue;
-    case protocol.SVC.stufftext:
-      cmd.state.text += msg.readString();
-      continue;
-    case protocol.SVC.damage:
-      v.parseDamage();
-      continue;
-    case protocol.SVC.serverinfo:
-      await parseServerInfo();
-      scr.state.recalc_refdef = true;
-      continue;
-    case protocol.SVC.setangle:
-      clState.viewangles[0] = msg.readAngle();
-      clState.viewangles[1] = msg.readAngle();
-      clState.viewangles[2] = msg.readAngle();
-      continue;
-    case protocol.SVC.setview:
-      clState.viewentity = msg.readShort();
-      continue;
-    case protocol.SVC.lightstyle:
-      i = msg.readByte();
-      if (i >= 64)
-        sys.error('svc_lightstyle > MAX_LIGHTSTYLES');
-      state.lightstyle[i] = msg.readString();
-      continue;
-    case protocol.SVC.sound:
-      await parseStartSoundPacket();
-      continue;
-    case protocol.SVC.stopsound:
-      i = msg.readShort();
-      s.stopSound(i >> 3, i & 7);
-      continue;
-    case protocol.SVC.updatename:
-      i = msg.readByte();
-      if (i >= clState.maxclients)
-        await host.error('CL.ParseServerMessage: svc_updatename > MAX_SCOREBOARD');
-      clState.scores[i].name = msg.readString();
-      continue;
-    case protocol.SVC.updatefrags:
-      i = msg.readByte();
-      if (i >= clState.maxclients)
-        await host.error('CL.ParseServerMessage: svc_updatefrags > MAX_SCOREBOARD');
-      clState.scores[i].frags = msg.readShort();
-      continue;
-    case protocol.SVC.updatecolors:
-      i = msg.readByte();
-      if (i >= clState.maxclients)
-        await host.error('CL.ParseServerMessage: svc_updatecolors > MAX_SCOREBOARD');
-      clState.scores[i].colors = msg.readByte();
-      continue;
-    case protocol.SVC.particle:
-      r.parseParticleEffect();
-      continue;
-    case protocol.SVC.spawnbaseline:
-      parseBaseline(entityNum(msg.readShort()), 1);
-      continue;
-    case protocol.SVC.spawnstatic:
-      parseStatic(1);
-      continue;
-    case protocol.SVC.temp_entity:
-      await parseTEnt();
-      continue;
-    case protocol.SVC.setpause:
-      clState.paused = msg.readByte() !== 0;
-      if (clState.paused === true)
-        cdAudio.pause();
-      else
-        await cdAudio.resume();
-      continue;
-    case protocol.SVC.signonnum:
-      i = msg.readByte();
-      if (i <= cls.signon)
-        await host.error('Received signon ' + i + ' when at ' + cls.signon);
-      cls.signon = i;
-      signonReply();
-      continue;
-    case protocol.SVC.killedmonster:
-      ++clState.stats[def.STAT.monsters];
-      continue;
-    case protocol.SVC.foundsecret:
-      ++clState.stats[def.STAT.secrets];
-      continue;
-    case protocol.SVC.updatestat:
-      i = msg.readByte();
-      if (i >= 32)
-        sys.error('svc_updatestat: ' + i + ' is invalid');
-      clState.stats[i] = msg.readLong();
-      continue;
-    case protocol.SVC.spawnstaticsound:
-      await parseStaticSound(1);
-      continue;
-    case protocol.SVC.cdtrack:
-      clState.cdtrack = msg.readByte();
-      msg.readByte();
-      if (((cls.demoplayback === true) || (cls.demorecording === true)) && (cls.forcetrack !== -1))
-        await cdAudio.play(cls.forcetrack, true);
-      else
-        await cdAudio.play(clState.cdtrack, true);
-      continue;
-    case protocol.SVC.intermission:
-      clState.intermission = 1;
-      clState.completed_time = clState.time;
-      scr.state.recalc_refdef = true;
-      continue;
-    case protocol.SVC.finale:
-      clState.intermission = 2;
-      clState.completed_time = clState.time;
-      scr.state.recalc_refdef = true;
-      scr.centerPrint(msg.readString());
-      continue;
-    case protocol.SVC.cutscene:
-      clState.intermission = 3;
-      clState.completed_time = clState.time;
-      scr.state.recalc_refdef = true;
-      scr.centerPrint(msg.readString());
-      continue;
-    case protocol.SVC.sellscreen:
-      await cmd.executeString('help', cmd.CMD_SOURCE.src_command);
-      continue;
-    case protocol.SVC.showlmp:
-      sys.error('showlmp not implemented')
-    case protocol.SVC.hidelmp:
-      sys.error('hidelmp not implemented')
-    case protocol.SVC.skybox:
-      sys.error('skybox not implemented')
-    case protocol.SVC.bf:
-      sys.error('bf not implemented')
-    case protocol.SVC.fog:
-      sys.error('fog not implemented')
-    case protocol.SVC.spawnbaseline2: //PROTOCOL_FITZQUAKE
-      parseBaseline(entityNum(msg.readShort()), 2);
-      continue;
-    case protocol.SVC.spawnstatic2:
-      parseStatic(2)
-      continue;
-    case protocol.SVC.spawnstaticsound2:
-      await parseStaticSound(2);
-      continue;
-  
+      case protocol.SVC.nop:
+        continue;
+      case protocol.SVC.time:
+        clState.mtime[1] = clState.mtime[0];
+        clState.mtime[0] = msg.readFloat();
+        continue;
+      case protocol.SVC.clientdata:
+        parseClientdata();
+        continue;
+      case protocol.SVC.version:
+        i = msg.readLong();
+        if (i !== protocol.netquake && i !== protocol.fitzquake && i !== protocol.rmq)
+          host.throwError('CL.ParseServerMessage: Server is protocol ' + i + ' is not supported\n');
+        clState.protocol = i
+        continue;
+      case protocol.SVC.disconnect:
+        host.throwEndGame('Server disconnected\n');
+      case protocol.SVC.print: {
+        const printtext = msg.readString()
+        // csqc.parsePrint owns both halves as QSS CL_ParsePrint does: the hook, or con.print.
+        if (!parseSpecialPrint(printtext))
+          csqc.parsePrint(printtext);
+        continue;
+      }
+      case protocol.SVC.centerprint:
+        centerPrint(msg.readString());
+        continue;
+      case protocol.SVC.stufftext: {
+        const stuffed = msg.readString();
+        // Handle download-related stufftext immediately rather than waiting
+        // for cmd.execute() next frame — SVC 50 data chunks may follow in
+        // the same server message and need the download state set up.
+        if (stuffed.startsWith('cl_serverextension_download ')) {
+          cls.protocol_dpdownload = parseInt(stuffed.split(' ')[1]) || 0;
+        } else if (stuffed.startsWith('cl_downloadbegin ')) {
+          // Parse and set up the download buffer immediately so that
+          // SVC 50 chunks in the same message aren't discarded
+          const parts = stuffed.trim().split(' ');
+          const dlSize = parseInt(parts[1]);
+          const dlName = parts[2];
+          if (dlSize > 0 && dlName) {
+            dlState.download.size = dlSize;
+            dlState.download.data = new Uint8Array(dlSize);
+            con.print('[cl] Download begin: ' + dlName + ' (' + dlSize + ' bytes)\n');
+          }
+        }
+        // A CSQC_Parse_StuffCmd hook claims every line that isn't a fromServer command.
+        if (!csqc.parseStuffText(stuffed))
+          cmd.state.text += stuffed;
+        continue;
+      }
+      case protocol.SVC.damage:
+        v.parseDamage();
+        continue;
+      case protocol.SVC.serverinfo:
+        await parseServerInfo();
+        scr.state.recalc_refdef = true;
+        continue;
+      case protocol.SVC.setangle: {
+        clState.viewangles[0] = msg.readAngle(clState.protocolFlags);
+        clState.viewangles[1] = msg.readAngle(clState.protocolFlags);
+        clState.viewangles[2] = msg.readAngle(clState.protocolFlags);
+        continue;
+      }
+      case protocol.SVC.setview:
+        clState.viewentity = msg.readShort();
+        continue;
+      case protocol.SVC.lightstyle:
+        i = msg.readByte();
+        if (i >= 64)
+          sys.error('svc_lightstyle > MAX_LIGHTSTYLES');
+        state.lightstyle[i] = msg.readString();
+        continue;
+      case protocol.SVC.sound:
+        parseStartSoundPacket();
+        continue;
+      case protocol.SVC.stopsound:
+        i = msg.readShort();
+        s.stopSound(i >> 3, i & 7);
+        continue;
+      case protocol.SVC.updatename:
+        i = msg.readByte();
+        if (i >= clState.maxclients) {
+          msg.readString();
+          continue;
+        }
+        clState.scores[i].name = msg.readString();
+        continue;
+      case protocol.SVC.updatefrags:
+        i = msg.readByte();
+        if (i >= clState.maxclients) {
+          msg.readShort();
+          continue;
+        }
+        clState.scores[i].frags = msg.readShort();
+        continue;
+      case protocol.SVC.updatecolors:
+        i = msg.readByte();
+        if (i >= clState.maxclients) {
+          msg.readByte();
+          continue;
+        }
+        clState.scores[i].colors = msg.readByte();
+        continue;
+      case protocol.SVC.particle:
+        r.parseParticleEffect();
+        continue;
+      case protocol.SVC.spawnbaseline:
+        parseBaseline(entityNum(msg.readShort()), 1);
+        continue;
+      case protocol.SVC.spawnstatic:
+        parseStatic(1);
+        continue;
+      case protocol.SVC.temp_entity:
+        parseTEnt();
+        continue;
+      case protocol.SVC.setpause:
+        clState.paused = msg.readByte() !== 0;
+        if (clState.paused === true)
+          cdAudio.pause();
+        else
+          await cdAudio.resume();
+        continue;
+      case protocol.SVC.signonnum:
+        i = msg.readByte();
+        if (i <= cls.signon)
+          host.throwError('Received signon ' + i + ' when at ' + cls.signon);
+        cls.signon = i;
+        signonReply();
+        continue;
+      case protocol.SVC.killedmonster:
+        setStat(def.STAT.monsters, clState.stats[def.STAT.monsters] + 1);
+        continue;
+      case protocol.SVC.foundsecret:
+        setStat(def.STAT.secrets, clState.stats[def.STAT.secrets] + 1);
+        continue;
+      case protocol.SVC.updatestat:
+        i = msg.readByte();
+        if (i >= def.MAX_CL_STATS) {
+          msg.readLong(); // out-of-range stat index - read and discard
+          continue;
+        }
+        setStat(i, msg.readLong());
+        continue;
+      // Extended stat encodings (QSS cl_parse.c:2879-2895). Fatal when unnegotiated, as with the
+      // entity stream: the payload widths differ, so there is nothing safe to skip.
+      case protocol.SVC.dp_updatestatbyte:
+        if ((clState.protocol_pext1 & protocol.PEXT1_CSQC) === 0)
+          host.throwError('CL.ParseServerMessage: Received svcdp_updatestatbyte but extension not active\n');
+        i = msg.readByte();
+        if (i >= def.MAX_CL_STATS) {
+          msg.readByte();
+          continue;
+        }
+        setStat(i, msg.readByte());
+        continue;
+      case protocol.SVC.fte_updatestatfloat:
+        if ((clState.protocol_pext1 & protocol.PEXT1_CSQC) === 0)
+          host.throwError('CL.ParseServerMessage: Received svcfte_updatestatfloat but extension not active\n');
+        i = msg.readByte();
+        if (i >= def.MAX_CL_STATS) {
+          msg.readFloat();
+          continue;
+        }
+        setStatFloat(i, msg.readFloat());
+        continue;
+      case protocol.SVC.fte_updatestatstring:
+        if ((clState.protocol_pext1 & protocol.PEXT1_CSQC) === 0)
+          host.throwError('CL.ParseServerMessage: Received svcfte_updatestatstring but extension not active\n');
+        i = msg.readByte();
+        // An empty string is stored, not deleted, so getstats on a cleared stat returns ""
+        // (QSS CL_ParseStatString strdups whatever it got).
+        if (i >= def.MAX_CL_STATS) {
+          msg.readString();
+          continue;
+        }
+        clState.statss[i] = msg.readString();
+        continue;
+      case protocol.SVC.spawnstaticsound:
+        parseStaticSound(1);
+        continue;
+      case protocol.SVC.cdtrack:
+        clState.cdtrack = msg.readByte();
+        msg.readByte();
+        // fire-and-forget: the track lookup can probe 8 asset paths (IndexedDB queued
+        // behind package installs, remote file list) and must not stall svc parsing
+        if (((cls.demoplayback === true) || (cls.demorecording === true)) && (cls.forcetrack !== -1))
+          cdAudio.play(cls.forcetrack, true).catch(function() {});
+        else
+          cdAudio.play(clState.cdtrack, true).catch(function() {});
+        continue;
+      case protocol.SVC.intermission:
+        clState.intermission = 1;
+        clState.completed_time = clState.time;
+        scr.state.recalc_refdef = true;
+        continue;
+      case protocol.SVC.finale:
+        clState.intermission = 2;
+        clState.completed_time = clState.time;
+        scr.state.recalc_refdef = true;
+        centerPrint(msg.readString());
+        continue;
+      case protocol.SVC.cutscene:
+        clState.intermission = 3;
+        clState.completed_time = clState.time;
+        scr.state.recalc_refdef = true;
+        centerPrint(msg.readString());
+        continue;
+      case protocol.SVC.sellscreen:
+        cmd.executeString('help', cmd.CMD_SOURCE.src_command);
+        continue;
+      // Read and drop, as QSS-M cl_parse.c:4514 does: no achievement backend, but the
+      // string still has to leave the stream.
+      case protocol.SVC.achievement:
+        con.dPrint('Ignoring svc_achievement (' + msg.readString() + ')\n');
+        continue;
+      case protocol.SVC.showlmp: {
+        const slotname = msg.readString();
+        const lmpfile = msg.readString();
+        const lx = msg.readByte();
+        const ly = msg.readByte();
+        tx.loadLmp(lmpfile).then(pic => {
+          if (pic) state.showlmps.set(slotname, { pic, x: lx, y: ly });
+        });
+        continue;
+      }
+      case protocol.SVC.hidelmp:
+        // FTE NQ mode: [byte player][short value] (player stat update, not Nehahra hidelmp)
+        msg.readByte();
+        msg.readShort();
+        continue;
+      case protocol.SVC.skybox:
+        // FTE NQ mode: [byte player][long value] (player stat update, not FitzQuake skybox string)
+        msg.readByte();
+        msg.readLong();
+        continue;
+      case protocol.SVC.bf:
+        // FTE NQ mode: [byte player][long flags][string infostring] (player info update, not FitzQuake bf)
+        msg.readByte();
+        msg.readLong();
+        msg.readString();
+        continue;
+      case protocol.SVC.fog:
+        msg.readByte(); msg.readByte(); msg.readByte(); msg.readByte(); // density, r, g, b
+        msg.readShort(); // time in centiseconds
+        continue;
+      case protocol.SVC.spawnbaseline2: //PROTOCOL_FITZQUAKE
+        parseBaseline(entityNum(msg.readShort()), 2);
+        continue;
+      case protocol.SVC.spawnstatic2:
+        parseStatic(2)
+        continue;
+      case protocol.SVC.spawnstaticsound2:
+        parseStaticSound(2);
+        continue;
+      case protocol.SVC.dp_downloaddata:
+        parseDownloadData();
+        continue;
+      case protocol.SVC.effect:
+        parseEffect(false);
+        continue;
+      case protocol.SVC.effect2:
+        // In NQ/FitzQuake protocol (non-DP7), SVC 53 appears to be a 2-byte FTE message (e.g. playernum + ping)
+        msg.readByte();
+        msg.readByte();
+        continue;
+      case protocol.SVC.dp_csqcentities:
+        // Unnegotiated and unskippable, so fatal (QSS cl_parse.c:2842-2848).
+        if ((clState.protocol_pext1 & protocol.PEXT1_CSQC) === 0)
+          host.throwError('CL.ParseServerMessage: Received svcdp_csqcentities but extension not active\n');
+        parseCSQCEntities();
+        continue;
+      case protocol.SVC.fte_cgamepacket:
+        // Likewise unskippable (QSS cl_parse.c:2918-2920).
+        if ((clState.protocol_pext1 & protocol.PEXT1_CSQC) === 0)
+          host.throwError('CL.ParseServerMessage: Received svcfte_cgamepacket but extension not active\n');
+        csqc.parseEvent();
+        continue;
+      case protocol.SVC.dp_precache:
+        parseDpPrecache();
+        continue;
+      case protocol.SVC.dp_trailparticles:
+        parseDpTrailParticles();
+        continue;
+      case protocol.SVC.dp_pointparticles:
+        parseDpPointParticles(false);
+        continue;
+      case protocol.SVC.dp_pointparticles1:
+        parseDpPointParticles(true);
+        continue;
     }
-    await host.error('CL.ParseServerMessage: Illegible server message\n');
+    const msgBytes = Array.from(new Uint8Array(net.state.message.data, 0, net.state.message.cursize)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+    console.error(`[cl] Illegible server message code ${_cmd} (0x${_cmd.toString(16)}), readcount=${msg.state.readcount}, cursize=${net.state.message.cursize}\nMessage bytes: ${msgBytes}`);
+    host.throwError(`CL.ParseServerMessage: Illegible server message code ${_cmd}\n`);
   }
 };
 
@@ -1894,8 +2867,8 @@ export const initTEnts = async function()
 export const parseBeam = function(m: Model)
 {
   var ent = msg.readShort();
-  var start = [msg.readCoord(), msg.readCoord(), msg.readCoord()];
-  var end = [msg.readCoord(), msg.readCoord(), msg.readCoord()];
+  var start = [msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags)];
+  var end = [msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags)];
   let i, b: Beam;
   for (i = 0; i <= 23; ++i)
   {
@@ -1923,37 +2896,53 @@ export const parseBeam = function(m: Model)
   con.print('beam list overflow!\n');
 };
 
-export const parseTEnt = async function()
+export const parseTEnt = function()
 {
+  // The progs either consumes the whole payload (nonzero) or leaves the read cursor exactly where
+  // it found it for the engine parse below (QSS cl_tent.c:152-167).
+  if (csqc.parseTempEntity())
+    return;
+
   var type = msg.readByte();
 
   switch (type)
   {
   case protocol.TE.lightning1:
-    parseBeam(await mod.forName('progs/bolt.mdl', true));
+    parseBeam(mod.forName('progs/bolt.mdl', true));
     return;
   case protocol.TE.lightning2:
-    parseBeam(await mod.forName('progs/bolt2.mdl', true));
+    parseBeam(mod.forName('progs/bolt2.mdl', true));
     return;
   case protocol.TE.lightning3:
-    parseBeam(await mod.forName('progs/bolt3.mdl', true));
+    parseBeam(mod.forName('progs/bolt3.mdl', true));
     return;
   case protocol.TE.beam:
-    parseBeam(await mod.forName('progs/beam.mdl', true));
+    parseBeam(mod.forName('progs/beam.mdl', true));
+    return;
+  case protocol.TE.dp_particlerain:
+  case protocol.TE.dp_particlesnow: {
+    const minb = vec.scratch(), maxb = vec.scratch(), wdir = vec.scratch();
+    minb[0] = msg.readCoord(clState.protocolFlags); minb[1] = msg.readCoord(clState.protocolFlags); minb[2] = msg.readCoord(clState.protocolFlags);
+    maxb[0] = msg.readCoord(clState.protocolFlags); maxb[1] = msg.readCoord(clState.protocolFlags); maxb[2] = msg.readCoord(clState.protocolFlags);
+    wdir[0] = msg.readCoord(clState.protocolFlags); wdir[1] = msg.readCoord(clState.protocolFlags); wdir[2] = msg.readCoord(clState.protocolFlags);
+    const cnt = msg.readShort() & 0xffff;
+    const colour = msg.readByte();
+    pscript.runParticleWeather(minb as unknown as pscript.Vec3, maxb as unknown as pscript.Vec3, wdir as unknown as pscript.Vec3, cnt, colour, type === protocol.TE.dp_particlesnow ? 'snow' : 'rain');
     return;
   }
+  }
 
-  var pos: V3 = [msg.readCoord(), msg.readCoord(), msg.readCoord()];
+  var pos: V3 = [msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags)];
   var dl;
   switch (type)
   {
   case protocol.TE.wizspike:
     r.runParticleEffect(pos, vec.origin, 20, 20);
-    await s.startSound(-1, 0, state.tents.sfx_wizhit, pos, 1.0, 1.0);
+    s.startSound(-1, 0, state.tents.sfx_wizhit, pos, 1.0, 1.0);
     return;
   case protocol.TE.knightspike:
     r.runParticleEffect(pos, vec.origin, 226, 20);
-    await s.startSound(-1, 0, state.tents.sfx_knighthit, pos, 1.0, 1.0);
+    s.startSound(-1, 0, state.tents.sfx_knighthit, pos, 1.0, 1.0);
     return;
   case protocol.TE.spike:
     r.runParticleEffect(pos, vec.origin, 0, 10);
@@ -1971,11 +2960,11 @@ export const parseTEnt = async function()
     dl.radius = 350.0;
     dl.die = clState.time + 0.5;
     dl.decay = 300.0;
-    await s.startSound(-1, 0, state.tents.sfx_r_exp3, pos, 1.0, 1.0);
+    s.startSound(-1, 0, state.tents.sfx_r_exp3, pos, 1.0, 1.0);
     return;
   case protocol.TE.tarexplosion:
     r.blobExplosion(pos);
-    await s.startSound(-1, 0, state.tents.sfx_r_exp3, pos, 1.0, 1.0);
+    s.startSound(-1, 0, state.tents.sfx_r_exp3, pos, 1.0, 1.0);
     return;
   case protocol.TE.lavasplash:
     r.lavaSplash(pos);
@@ -1992,25 +2981,159 @@ export const parseTEnt = async function()
     dl.radius = 350.0;
     dl.die = clState.time + 0.5;
     dl.decay = 300.0;
-    await s.startSound(-1, 0, state.tents.sfx_r_exp3, pos, 1.0, 1.0);
+    s.startSound(-1, 0, state.tents.sfx_r_exp3, pos, 1.0, 1.0);
     return;
   }
 
   sys.error('CL.ParseTEnt: bad type');
 };
 
+// Entity .colormap -> shirt/pants colors byte (FTE pr_csqc.c:861-879): 1..32 are scoreboard slots,
+// an unset one reading 0/0 grey; anything larger is DP's direct nibble encoding.
+export const colormapColors = function (colormap: number): number {
+  if (colormap <= 32) {
+    const score = clState.scores[colormap - 1];
+    return (score != null) ? score.colors : 0;
+  }
+  return colormap & 0xff;
+};
+
 export const newTempEntity = function()
 {
-  var ent = newEntity(0);
-  state.temp_entities[state.num_temp_entities++] = ent;
+  // temp_entities is a growing pool, reused frame to frame by index — every
+  // caller fully overwrites origin/angles/model/frame right after this call.
+  var ent = state.temp_entities[state.num_temp_entities];
+  if (ent == null)
+  {
+    ent = newEntity(0);
+    state.temp_entities[state.num_temp_entities] = ent;
+  }
+  // temp entities bypass parseUpdate, so reset lerp state here (Ironwail
+  // memsets per spawn); without this previouspose stays -1 and binds as a
+  // negative VBO offset. The csqc-only extras reset too; QSS memsets the
+  // whole temp entity per spawn.
+  ent.lerpflags |= r.LERP.resetanim | r.LERP.resetmove;
+  ent.lerpflags &= ~r.LERP.explicit;
+  ent.colormod[0] = 1.0; ent.colormod[1] = 1.0; ent.colormod[2] = 1.0;
+  ent.eflags = 0;
+  ent.colormap = 0;
+  ++state.num_temp_entities;
   state.visedicts[state.numvisedicts++] = ent;
   return ent;
+};
+
+const parseEffect = function(big: boolean)
+{
+  const origin: V3 = [msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags), msg.readCoord(clState.protocolFlags)];
+  const modelindex = big ? msg.readShort() : msg.readByte();
+  const startframe = big ? msg.readShort() : msg.readByte();
+  const framecount = msg.readByte();
+  const framerate = msg.readByte();
+  const model = clState.model_precache[modelindex];
+  if (model == null)
+    return;
+  state.effects.push({
+    origin,
+    model,
+    startframe,
+    framecount: framecount || model.numframes,
+    framerate,
+    starttime: clState.time,
+  });
+};
+
+// dp_precache (svc 54): [short] index|(type<<14) [string] name. We only act on the particle
+// slice; model/sound tags are read and discarded so the stream doesn't desync (our own server
+// never sends those tags, but a foreign QSS-M server could in principle).
+const parseDpPrecache = function()
+{
+  const code = msg.readShort();
+  const index = code & 0x3fff;
+  const type = (code >> 14) & 0x3;
+  const name = msg.readString();
+  if (type === protocol.PRECACHE_TYPE.particle) {
+    clState.particle_precache[index] = name;
+    // Kick the background effectinfo.txt parse as soon as we know we'll need it -- idempotent,
+    // see ensureEffectsLoaded's own comment. Timing compromise: a pointparticles/trailparticles
+    // svc arriving before this resolves silently drops (findParticleType returns -1); in
+    // practice the precache table fills at signon time, well before gameplay effects fire.
+    pscript.ensureEffectsLoaded();
+    return;
+  }
+  // A precache made after the map spawned (pf.latePrecache): no loading screen to await a
+  // download behind, so only already-resident content resolves. A miss leaves the slot null and
+  // the entity model-less rather than dropping the connection.
+  if (type === protocol.PRECACHE_TYPE.model) {
+    const m = mod.forName(name);
+    if (m != null)
+      clState.model_precache[index] = m;
+    else
+      con.dPrint('[cl] delayed model precache ' + name + ' not resident\n');
+    return;
+  }
+  if (type === protocol.PRECACHE_TYPE.sound)
+    s.precacheSound(name).then(sfx => { if (sfx != null) clState.sound_precache[index] = sfx; });
+};
+
+// dp_trailparticles (svc 60): [short] entnum [short] effectnum [coord3] start [coord3] end.
+// entnum only keys QSS-M's persistent per-entity trailstate cache, which pscript.runTrailEffect
+// doesn't reproduce (see its comment) -- start/end already carry the absolute positions.
+const parseDpTrailParticles = function()
+{
+  msg.readShort(); // entnum, unused (see comment above)
+  const efnum = msg.readShort();
+  const start = vec.scratch();
+  start[0] = msg.readCoord(clState.protocolFlags); start[1] = msg.readCoord(clState.protocolFlags); start[2] = msg.readCoord(clState.protocolFlags);
+  const end = vec.scratch();
+  end[0] = msg.readCoord(clState.protocolFlags); end[1] = msg.readCoord(clState.protocolFlags); end[2] = msg.readCoord(clState.protocolFlags);
+  const name = clState.particle_precache[efnum];
+  if (name) pscript.runTrailEffect(pscript.findParticleType(name), start, end);
+};
+
+// dp_pointparticles / dp_pointparticles1 (svc 61/62): compact === true is the count==1,
+// vel==0 short form (svc 62); compact === false reads the full vel+count form (svc 61).
+const parseDpPointParticles = function(compact: boolean)
+{
+  const efnum = msg.readShort();
+  const org = vec.scratch();
+  org[0] = msg.readCoord(clState.protocolFlags); org[1] = msg.readCoord(clState.protocolFlags); org[2] = msg.readCoord(clState.protocolFlags);
+  const vel = vec.scratch();
+  let count = 1;
+  if (compact) {
+    vel[0] = 0; vel[1] = 0; vel[2] = 0;
+  } else {
+    vel[0] = msg.readCoord(clState.protocolFlags); vel[1] = msg.readCoord(clState.protocolFlags); vel[2] = msg.readCoord(clState.protocolFlags);
+    count = msg.readShort();
+  }
+  const name = clState.particle_precache[efnum];
+  if (name) pscript.runParticleEffect(pscript.findParticleType(name), org, vel, count);
 };
 
 export const updateTEnts = function()
 {
   state.num_temp_entities = 0;
-  var i, b, dist = [], yaw, pitch, org = [], d, ent;
+  var i, b, dist = vec.scratch(), yaw, pitch, org = vec.scratch(), d, ent;
+
+  // sprite effects
+  for (i = state.effects.length - 1; i >= 0; --i)
+  {
+    const ef = state.effects[i];
+    const frame = Math.floor((clState.time - ef.starttime) * ef.framerate) + ef.startframe;
+    if (frame >= ef.startframe + ef.framecount)
+    {
+      state.effects.splice(i, 1);
+      continue;
+    }
+    ent = newTempEntity();
+    ent.origin[0] = ef.origin[0]; ent.origin[1] = ef.origin[1]; ent.origin[2] = ef.origin[2];
+    ent.model = ef.model;
+    ent.frame = frame;
+    ent.angles[0] = 0; ent.angles[1] = 0; ent.angles[2] = 0;
+    ent.colormap = 0;
+    ent.skinnum = 0;
+    ent.effects = 0;
+  }
+
   for (i = 0; i <= 23; ++i)
   {
     b = state.beams[i];
@@ -2048,9 +3171,9 @@ export const updateTEnts = function()
     for (; d > 0.0; )
     {
       ent = newTempEntity();
-      ent.origin = [org[0], org[1], org[2]];
+      ent.origin[0] = org[0]; ent.origin[1] = org[1]; ent.origin[2] = org[2];
       ent.model = b.model;
-      ent.angles = [pitch, yaw, Math.random() * 360.0];
+      ent.angles[0] = pitch; ent.angles[1] = yaw; ent.angles[2] = Math.random() * 360.0;
       org[0] += dist[0] * 30.0;
       org[1] += dist[1] * 30.0;
       org[2] += dist[2] * 30.0;

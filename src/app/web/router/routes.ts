@@ -13,7 +13,7 @@ import GameLauncher from '../components/page/Game/GameLauncher.vue'
 import RoomHub from '../components/page/Room/RoomHub.vue'
 import Room from '../components/page/Room/Room.vue'
 import SharewareLicense from '../components/page/SharewareLicense.vue'
-import Frontend from '../components/layout/Frontend.vue'
+import Frontend from '../components/layout/Layout.vue'
 import RoomGameLauncher from '../components/page/Room/RoomGameLauncher.vue'
 
 const routes: RouteRecordRaw[] = [
@@ -26,16 +26,7 @@ const routes: RouteRecordRaw[] = [
       { name: 'multiplayer', path: '/multiplayer', component: Multiplayer },
       { name: 'singleplayer', path: '/singleplayer', component: Singleplayer },
       { name: 'room', path: '/room/:id', component: Room },
-      { 
-        name: 'setup',
-        path: '/setup',
-        component: Setup,
-        children: [
-          { name: 'assets', path: 'assets', component: SetupGame },
-          { name: 'config', path: 'config', component: Config },
-          { name: 'autoexec', path: 'autoexec', component: Autoexec }
-        ]
-      },
+      { name: 'setup', path: '/setup', component: Setup },
       { name: 'faq', path: '/faq', component: Faq },
       { name: 'slicnse', path: '/slicnse', component: SharewareLicense }
     ]

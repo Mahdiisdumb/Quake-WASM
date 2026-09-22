@@ -1,4 +1,5 @@
 import * as cl from './cl'
+import * as csqc from './csqc'
 import * as host from './host'
 import * as cmd from './cmd'
 import * as vid from './vid'
@@ -13,13 +14,19 @@ import * as s from './s'
 import * as sbar from './sbar'
 import * as m from './m'
 import * as GL from './GL'
-import * as tx from './texture'
+import * as render from './render'
 
 
 export const state = {
   con_current: 0,
   centertime_off: 0.0,
   centerstring: [],
+	// Precache progress drawn during map load; null when not loading.
+	loadProgress: null as null | { text: string, current: number, total: number },
+	sizeDirty: true,
+	clientWidth: 320,
+	clientHeight: 200,
+	pixelRatio: 1.0,
 	fps: {
 		oldtime: 0,
 		lastVal: 0,
@@ -27,25 +34,37 @@ export const state = {
 	}
 } as any
 
+const markSizeDirty = () => { state.sizeDirty = true; }
+
 export const cvr = {
 } as any
+
+// Vanilla's centerprint canvas is 40 columns wide (320/8).
+const CENTER_COLS = 40;
+
+// The column break is ours — vanilla, QSS-M and Ironwail all split on '\n' only and let a long
+// line run off both edges. It breaks between words because rerelease strings arrive as one
+// unwrapped line (mg3_start_intermission is 300 chars with no '\n') that a hard chop mangles.
+const wrapCenterLine = function(line: string, out: string[])
+{
+	while (line.length > CENTER_COLS)
+	{
+		// lastIndexOf is inclusive, so a space on the boundary still yields a full-width line.
+		var brk = line.lastIndexOf(' ', CENTER_COLS);
+		if (brk <= 0)
+			brk = CENTER_COLS;	// a single word wider than the canvas: chop it
+		out[out.length] = line.substring(0, brk);
+		line = line.substring(line.charCodeAt(brk) === 32 ? brk + 1 : brk);
+	}
+	out[out.length] = line;
+};
 
 export const centerPrint = function(str: string)
 {
 	state.centerstring = [];
-	var i, start = 0, next;
-	for (i = 0; i < str.length; ++i)
-	{
-		if (str.charCodeAt(i) === 10)
-			next = i + 1;
-		else if ((i - start) >= 40)
-			next = i;
-		else
-			continue;
-		state.centerstring[state.centerstring.length] = str.substring(start, i);
-		start = next;
-	}
-	state.centerstring[state.centerstring.length] = str.substring(start, i);
+	var lines = str.split('\n'), i;
+	for (i = 0; i < lines.length; ++i)
+		wrapCenterLine(lines[i], state.centerstring);
 	state.centertime_off = cvr.centertime.value;
 	state.centertime_start = cl.clState.time;
 }
@@ -99,27 +118,25 @@ export const calcRefdef = function()
 	else if (cvr.viewsize.value > 120)
 		cvar.set('viewsize', '120');
 
-	var size, full;
+	var size;
 	if (cl.clState.intermission !== 0)
 	{
-		full = true;
 		size = 1.0;
 		sbar.state.lines = 0;
 	}
 	else
 	{
 		size = cvr.viewsize.value;
-		if (size >= 120.0)
+		// state.lines is only the height the sbar draws, not reserved view space: the sbar
+		// overlays a full-height refresh (QS gl_screen.c, the scr_sbaralpha vrect).
+		if ((size >= 120.0) || csqc.drawsHud())
 			sbar.state.lines = 0;
 		else if (size >= 110.0)
 			sbar.state.lines = 24 * sbar.state.scale;
 		else
 			sbar.state.lines = 48 * sbar.state.scale;
 		if (size >= 100.0)
-		{
-			full = true;
 			size = 100.0;
-		}
 		size *= 0.01;
 	}
 
@@ -131,13 +148,10 @@ export const calcRefdef = function()
 		vrect.width = 96;
 	}
 	vrect.height = Math.floor(vid.state.height * size);
-	if (vrect.height > (vid.state.height - sbar.state.lines))
-		vrect.height = vid.state.height - sbar.state.lines;
+	if (vrect.height > vid.state.height)
+		vrect.height = vid.state.height;
 	vrect.x = (vid.state.width - vrect.width) >> 1;
-	if (full === true)
-		vrect.y = 0;
-	else
-		vrect.y = (vid.state.height - sbar.state.lines - vrect.height) >> 1;
+	vrect.y = (vid.state.height - vrect.height) >> 1;
 
 	if (cvr.fov.value < 10)
 		cvar.set('fov', '10');
@@ -160,23 +174,10 @@ export const calcRefdef = function()
 	GL.ortho[0] = 2.0 / vid.state.width;
 	GL.ortho[5] = -2.0 / vid.state.height;
 
-	r.state.warpwidth = (vrect.width * state.devicePixelRatio) >> 0;
-	r.state.warpheight = (vrect.height * state.devicePixelRatio) >> 0;
-	if (r.state.warpwidth > 2048)
-		r.state.warpwidth = 2048;
-	if (r.state.warpheight > 2048)
-		r.state.warpheight = 2048;
-	if ((r.state.oldwarpwidth !== r.state.warpwidth) || (r.state.oldwarpheight !== r.state.warpheight))
-	{
-		const gl = GL.getContext()
-		r.state.oldwarpwidth = r.state.warpwidth;
-		r.state.oldwarpheight = r.state.warpheight;
-		tx.bind(0, r.state.warptexture);
-		gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, r.state.warpwidth, r.state.warpheight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-		gl.bindRenderbuffer(gl.RENDERBUFFER, r.state.warprenderbuffer);
-		gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, r.state.warpwidth, r.state.warpheight);
-		gl.bindRenderbuffer(gl.RENDERBUFFER, null);
-	}
+	r.state.warpwidth = Math.max(1, Math.min((vrect.width * state.devicePixelRatio) >> 0, 2048));
+	r.state.warpheight = Math.max(1, Math.min((vrect.height * state.devicePixelRatio) >> 0, 2048));
+	// The warp-FBO reallocation (WebGL) moved into the backend (phase5); it re-checks size internally.
+	render.getRenderer().resizeWarp();
 };
 
 export const sizeUp_f = function()
@@ -196,6 +197,10 @@ export const init = async function()
   state.con_current = 0
   state.centertime_off = 0.0
   state.centerstring = []
+	state.sizeDirty = true
+	// remove first so re-initializing the engine doesn't stack listeners
+	window.removeEventListener('resize', markSizeDirty)
+	window.addEventListener('resize', markSizeDirty)
 	cvr.fov = cvar.registerVariable('fov', '90');
 	cvr.viewsize = cvar.registerVariable('viewsize', '100', true);
 	cvr.conspeed = cvar.registerVariable('scr_conspeed', '300');
@@ -204,6 +209,12 @@ export const init = async function()
 	cvr.centertime = cvar.registerVariable('scr_centertime', '2');
 	cvr.printspeed = cvar.registerVariable('scr_printspeed', '8');
 	cvr.showfps = cvar.registerVariable('scr_showfps', '0');
+	// Status-bar / CSQC virtual-canvas scale. The CSQC 2D canvas clamps it into [1, width/320]
+	// (pfcl.vmScale, QSS PR_GetVMScale).
+	cvr.sbarscale = cvar.registerVariable('scr_sbarscale', '2');
+	// Inert: the rerelease QC sets it unconditionally and only needs it to exist. In FTE it
+	// switches prints to UTF-8 kfont parsing, which loc.ts's charset fold covers instead.
+	cvr.usekfont = cvar.registerVariable('scr_usekfont', '0');
 	cmd.addCommand('screenshot', screenShot_f);
 	cmd.addCommand('sizeup', sizeUp_f);
 	cmd.addCommand('sizedown', sizeDown_f);
@@ -226,10 +237,58 @@ export const drawTurtle = function()
 		draw.pic(r.state.refdef.vrect.x, r.state.refdef.vrect.y, state.turtle);
 };
 
+export const drawDownloadProgress = function()
+{
+	if (!cl.dlState.download.active || cl.dlState.download.size <= 0)
+		return;
+	const pct = Math.floor(cl.dlState.download.received * 100 / cl.dlState.download.size);
+	const filename = cl.dlState.download.filename;
+	const textSize = con.cvr.textsize?.value || 16;
+	const text = 'Downloading ' + filename + ' ' + pct + '%';
+	const x = (vid.state.width - text.length * textSize) >> 1;
+	const y = vid.state.height >> 1;
+	draw.string(x, y, text, textSize);
+
+	// Draw a simple progress bar below the text
+	const barWidth = Math.min(vid.state.width - 64, 320);
+	const barX = (vid.state.width - barWidth) >> 1;
+	const barY = y + textSize + 4;
+	const barHeight = textSize;
+	const fillWidth = Math.floor(barWidth * cl.dlState.download.received / cl.dlState.download.size);
+	draw.fill(barX, barY, barWidth, barHeight, 0);
+	if (fillWidth > 0)
+		draw.fill(barX, barY, fillWidth, barHeight, 79);
+};
+
+export const drawLoadProgress = function()
+{
+	const p = state.loadProgress;
+	if (p == null || p.total <= 0)
+		return;
+	const textSize = con.cvr.textsize?.value || 16;
+	const x = (vid.state.width - p.text.length * textSize) >> 1;
+	const y = vid.state.height >> 1;
+	draw.string(x, y, p.text, textSize);
+
+	const barWidth = Math.min(vid.state.width - 64, 320);
+	const barX = (vid.state.width - barWidth) >> 1;
+	const barY = y + textSize + 4;
+	const fillWidth = Math.floor(barWidth * p.current / p.total);
+	draw.fill(barX, barY, barWidth, textSize, 0);
+	if (fillWidth > 0)
+		draw.fill(barX, barY, fillWidth, textSize, 79);
+};
+
 export const drawNet = function()
 {
 	if (((host.state.realtime - cl.clState.last_received_message) >= 0.3) && (cl.cls.demoplayback !== true))
 		draw.pic(r.state.refdef.vrect.x, r.state.refdef.vrect.y, state.net);
+};
+
+export const drawShowlmps = function()
+{
+	for (const entry of cl.state.showlmps.values())
+		draw.pic(entry.x, entry.y, entry.pic);
 };
 
 export const drawPause = function()
@@ -325,25 +384,40 @@ export const endLoadingPlaque = function()
 	con.clearNotify();
 };
 
+// The engine crosshair, centred on the 3D view rect (QSS SCR_DrawCrosshair). Also reached from
+// renderscene for VF_DRAWCROSSHAIR.
+export const drawCrosshair = function()
+{
+	if (v.cvr.crosshair.value === 0)
+		return;
+	draw.character(r.state.refdef.vrect.x + (r.state.refdef.vrect.width >> 1) + v.cvr.crossx.value,
+		r.state.refdef.vrect.y + (r.state.refdef.vrect.height >> 1) + v.cvr.crossy.value, 43);
+};
+
 export const updateScreen = function()
 {
-  const gl = GL.getContext()
-	if (state.disabled_for_loading === true)
-	{
-		if (host.state.realtime <= state.disabled_time)
-			return;
+	render.getRenderer().beginFrame();
+	// In the original C engine, disabled_for_loading blanked the screen during
+	// synchronous map loads. In this async port, loading spans many frames so
+	// blanking causes a visible freeze. Let the normal console/loading path
+	// in setUpToDrawConsole handle the signon transition instead.
+	if (state.disabled_for_loading && host.state.realtime > state.disabled_time) {
 		state.disabled_for_loading = false;
 		con.print('load failed.\n');
 	}
 
-	var elem = document.documentElement;
-	var width = (elem.clientWidth <= 320) ? 320 : elem.clientWidth;
-	var height = (elem.clientHeight <= 200) ? 200 : elem.clientHeight;
-	var pixelRatio;
-	if (window.devicePixelRatio >= 1.0)
-		pixelRatio = window.devicePixelRatio;
-	else
-		pixelRatio = 1.0;
+	// Reading clientWidth/clientHeight forces a synchronous layout pass in the
+	// browser, so only touch the DOM when a resize has actually happened.
+	if (state.sizeDirty) {
+		state.sizeDirty = false;
+		var elem = document.documentElement;
+		state.clientWidth = (elem.clientWidth <= 320) ? 320 : elem.clientWidth;
+		state.clientHeight = (elem.clientHeight <= 200) ? 200 : elem.clientHeight;
+		state.pixelRatio = (window.devicePixelRatio >= 1.0) ? window.devicePixelRatio : 1.0;
+	}
+	var width = state.clientWidth;
+	var height = state.clientHeight;
+	var pixelRatio = state.pixelRatio;
 	if ((vid.state.width !== width) || (vid.state.height !== height) || (state.devicePixelRatio !== pixelRatio) || (host.state.framecount === 0))
 	{
 		vid.state.width = width;
@@ -370,12 +444,33 @@ export const updateScreen = function()
 		calcRefdef();
 
 	setUpToDrawConsole();
-	v.renderView();
-	GL.set2D();
-	if (r.state.dowarp === true)
-		r.warpScreen();
-	if (con.state.forcedup !== true)
-		r.polyBlend();
+
+	// A progs with CSQC_UpdateView owns the screen: no engine refresh, sbar or crosshair, only the
+	// common tail below draws on top (QSS gl_screen.c:1141-1179). The QC re-enters the 3D pass
+	// through pfcl_scene.renderscene, so begin2D both before the call and after it (QSS 1178),
+	// since the QC may leave the renderer in whatever state its last renderscene set up.
+	const csqcview = csqc.ownsView();
+	if (csqcview === true)
+	{
+		// Stands in for v.renderView's frame clear. The per-scene DEPTH clear stays in renderscene
+		// so a second camera composites.
+		render.getRenderer().clearFrame(true, true);
+		render.getRenderer().begin2D();
+		csqc.updateView();
+		render.getRenderer().begin2D();
+	}
+	else
+	{
+		v.renderView();
+		render.getRenderer().begin2D();
+		if (r.state.dowarp === true)
+			render.getRenderer().endScene();
+		if (con.state.forcedup !== true)
+			render.getRenderer().polyBlend(v.blend);
+	}
+
+	drawDownloadProgress();
+	drawLoadProgress();
 
 	if (cl.cls.state === cl.ACTIVE.connecting)
 		drawConsole();
@@ -390,29 +485,28 @@ export const updateScreen = function()
 		drawCenterString();
 	else
 	{
-		if (v.cvr.crosshair.value !== 0)
-		{
-			draw.character(r.state.refdef.vrect.x + (r.state.refdef.vrect.width >> 1) + v.cvr.crossx.value,
-				r.state.refdef.vrect.y + (r.state.refdef.vrect.height >> 1) + v.cvr.crossy.value, 43);
-		}
+		// Once the QC owns the view the crosshair is the VF_DRAWCROSSHAIR viewprop's and the hud is
+		// CSQC_DrawHud's; QSS keeps both in the non-csqc branch too (gl_screen.c:1201-1205).
+		if (csqcview !== true)
+			drawCrosshair();
 		drawNet();
 		drawTurtle();
 		drawPause();
 		drawCenterString();
-		sbar.drawSbar();
+		drawShowlmps();
+		if (csqcview !== true)
+			sbar.drawSbar();
 		drawFPS();
 		drawConsole();
 		m.drawMenu();
 	}
 
-	GL.streamFlush();
-
-	gl.disable(gl.BLEND);
+	render.getRenderer().endFrame();
 
 	if (state.screenshot === true)
 	{
 		state.screenshot = false;
-    	gl.finish();
+		render.getRenderer().finishFrame();
 		// OPEN is not defined, wtf?
 		// oh it's browser API.
 		open(vid.state.mainwindow.toDataURL('image/jpeg'));

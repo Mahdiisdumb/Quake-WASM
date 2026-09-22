@@ -1,34 +1,49 @@
 <template lang="pug">
-.message-event
-  .prefix
-    font-awesome-icon.icon(v-if="player.type === 'host'" icon="fa-solid fa-crown" size="xs") 
-  .name 
-    img(v-if="props.playerImageDataUrl" :src="props.playerImageDataUrl")
-    span(v-else) {{props.player.name}}
-  .colon 
-    span :&nbsp;
-
-  .message {{props.message}}
+.msg
+  span.msg-name(v-if="player" v-html="quakeTextToHtml(player.name)")
+  span.host-star(v-if="player?.isHost") ★
+  span.msg-sep :&nbsp;
+  span.msg-text {{ message }}
 </template>
-  
+
 <script lang="ts" setup>
-import { computed } from 'vue';
-import type  { ChatMessage, ChatMessages, PlayerId } from '../../../../../types/Room';
+import type { ChatMessage, ChatMessages, PlayerId } from '../../../../../types/Room'
+import { quakeTextToHtml } from '../../../../../util/quakeText'
 
 type Props = {
-  message: Extract<ChatMessage['content'],  { tag: 'text' }>['message'],
-  player: ChatMessages['players'][PlayerId],
-  playerImageDataUrl?: string
+  message: Extract<ChatMessage['content'], { tag: 'text' }>['message']
+  player: ChatMessages['players'][PlayerId]
 }
-const props = defineProps<Props>()
-
+defineProps<Props>()
 </script>
+
 <style lang="scss" scoped>
-.message-event {
-  display: flex;
-  align-items: flex-start;
-  .prefix {
-    width: 1rem;
-  }
+@import '../../../../../scss/tokens';
+
+.msg {
+  line-height: 1.5;
+}
+
+.msg-name {
+  font-size: $font-2xs;
+  font-weight: $fw-bold;
+  color: $palette-bright;
+}
+
+.msg-sep {
+  font-size: $font-2xs;
+  color: $palette-muted;
+}
+
+.host-star {
+  color: $palette-yellow;
+  margin-left: 2px;
+  margin-right: 1px;
+  font-size: 10px;
+}
+
+.msg-text {
+  font-size: $font-sm;
+  color: $palette-text;
 }
 </style>

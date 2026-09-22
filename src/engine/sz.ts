@@ -19,9 +19,35 @@ export const getSpace = function(buf: IDatagram, length: number)
 	return cursize;
 };
 
+// SZ_Alloc: construct every datagram here so the cached views exist from birth and
+// per-frame code never needs to build a view over .data (see IDatagram). A function
+// declaration (not const) so module-scope state literals in the sz<->net/sv import
+// cycle can call it before sz's body has evaluated (hoisted at instantiation).
+export function newDatagram(size: number, cursize: number = 0): IDatagram
+{
+	const data = new ArrayBuffer(size);
+	return { data: data, cursize: cursize, view: new DataView(data), u8: new Uint8Array(data) };
+}
+
+export const dataView = function(buf: IDatagram)
+{
+	if ((buf.view == null) || (buf.view.buffer !== buf.data))
+		buf.view = new DataView(buf.data);
+	return buf.view;
+};
+
+export const u8 = function(buf: IDatagram)
+{
+	if ((buf.u8 == null) || (buf.u8.buffer !== buf.data))
+		buf.u8 = new Uint8Array(buf.data);
+	return buf.u8;
+};
+
 export const write = function(message: IDatagram, data:Uint8Array, length: number)
 {
-	(new Uint8Array(message.data, getSpace(message, length), length)).set(data.subarray(0, length));
+	if (length === 0)
+		return;  // the per-frame reliable-datagram append is usually empty
+	u8(message).set(length === data.length ? data : data.subarray(0, length), getSpace(message, length));
 };
 
 // Don't think this is used. 

@@ -1,182 +1,217 @@
 <template lang="pug">
-.server-row
-  MapImage(
-    :mapName="props.server.map"
+.server-row(:class="{disabled: props.disabled}")
+  MapImage.map-thumb(:mapName="props.server.map")
+  .server-info
+    .s-name(:class="{muted: props.disabled}") {{props.server.name}}
+    .s-sub
+      font-awesome-icon.icon(icon="fa-solid fa-location-dot" size="xs")
+      |  {{props.server.location}}
+      template(v-if="props.shareware")
+        |  · #[span.shareware-tag shareware]
+  .s-map {{props.server.map}}
+  .s-players(:class="{'has-players': humanCount > 0}")
+    | {{formatPlayerCount}}
+    span.bot-count(v-if="botCount > 0")
+      | +{{botCount}}
+      font-awesome-icon.bot-icon(icon="fa-solid fa-robot")
+  .s-ping(:class="pingClass")
+    template(v-if="isNumericPing")
+      | {{props.server.ping}}
+      span.ms ms
+    template(v-else) —
+  button.join-btn(
+    v-if="!props.disabled"
+    @click="emit('join', props.server)"
+  ) Join
+  .join-locked(
+    v-else
     v-tippy
-    :content="props.server.map")
-    .map-text {{props.server.map}}
-  .detail
-    .name 
-      span(:class="{disabled: props.disabled}") {{props.server.name}} &nbsp;
-      span.shareware(
-        v-if="props.shareware"
-        v-tippy
-        content="This server allows anyone to join")
-        a(href="/slicnse"  target="_blank") shareware
-    .location
-      span(v-tippy content="location")
-        font-awesome-icon.icon(icon="fa-solid fa-location-dot" size="xs") 
-        | {{props.server.location}}
-    .ping 
-      span(v-tippy content="ping")
-        font-awesome-icon.icon(icon="fa-solid fa-signal" size="xs") 
-        | {{props.server.ping}} ms
-  .players Players
-
-    .activity.active(v-if="props.server.players.length"
-      v-tippy="{allowHTML: true}"
-      :content="model.playerTooltipHtml")  {{formatPlayerCount}}
-  
-    .activity.inactive(v-else)  {{formatPlayerCount}}
-  .action
-    QButton(
-        @click="emit('join', props.server)" 
-        :disabled="props.disabled" 
-        :tooltipPlacement="TooltipPlacement.left"
-        :tooltip="joinTooltipText"
-    ) Join
-
+    :content="joinTooltipText"
+  )
+    font-awesome-icon(icon="fa-solid fa-lock" size="xs")
 </template>
 
 <script lang="ts" setup>
-import {reactive, onMounted, computed, watch, ref} from 'vue'
-import { createWriter } from "../../../helpers/charmap"
-import { useGameStore } from '../../../stores/game';
-import QButton, {TooltipPlacement, ButtonType} from '../../input/QButton.vue'
-import type { ServerStatus } from '../../../stores/multiplayer';
+import { computed } from 'vue'
+import { humanPlayerCount, type ServerStatus } from '../../../stores/multiplayer'
 import MapImage from '../../MapImage.vue'
-import { getMapImageUrl, genericImageUrl } from '../../../helpers/map';
 
-const mapEl = ref<HTMLImageElement|null>(null)
 const emit = defineEmits<{
-  (e: 'join', server: ServerStatus): void}
->()
+  (e: 'join', server: ServerStatus): void
+}>()
 
-const gameStore = useGameStore()
 const props = defineProps<{
   server: ServerStatus
   disabled: boolean
   shareware: boolean
 }>()
 
-const model = reactive<{playerTooltipHtml: string}>({playerTooltipHtml: ''})
-const formatPlayerCount = computed(() => `${props.server.players.length}/${props.server.maxPlayers}`)
-const joinTooltipText = computed(() => props.disabled ? "You must load your pak1.pak before\nplaying modified games.\nSee FAQ for details." : "Join this game server")
-const joinUrl = computed(() => {
-  var query: Record<string, string> = {
-    "-connect": `wss://${props.server.connecthostport}`,
-  }
-  if (props.server.game && props.server.game !== 'id1') {
-    query["-game"] = props.server.game
-  }
+const humanCount = computed(() => humanPlayerCount(props.server))
+const botCount = computed(() => props.server.players.length - humanCount.value)
+const formatPlayerCount = computed(() => `${humanCount.value}/${props.server.maxPlayers}`)
+const joinTooltipText = computed(() => props.disabled
+  ? "You must load your pak1.pak before\nplaying modified games.\nSee FAQ for details."
+  : "Join this server"
+)
+
+const numericPing = computed(() => {
+  const n = parseInt(props.server.ping)
+  return isNaN(n) ? -1 : n
+})
+const isNumericPing = computed(() => numericPing.value >= 0)
+const pingClass = computed(() => {
+  if (!isNumericPing.value) return 'ping-unknown'
+  if (numericPing.value <= 100) return 'ping-good'
+  if (numericPing.value <= 200) return 'ping-ok'
+  return 'ping-bad'
 })
 
-watch(props, () => {
-  createWriter()
-    .then(writer => {
-      const body = [...props.server.players]
-        .sort((a, b) => parseInt(b.frags) - parseInt(a.frags))
-        .map((player) => {
-          return `<tr style="line-height: 1;">
-          <td style="text-align:right;">
-            <img src="${writer.writeScore(14, parseInt(player.frags), (player.colors & 0xf0) >> 4, player.colors & 0xf)}" style="display:inline;">
-          </td>
-          <td style="padding-left: 1rem; text-align: left">
-            <img src="${writer.write(12, btoa(player.name))}" style="display:inline;">
-          </td>
-          </tr>`;
-        })
-        .join('');
 
-      model.playerTooltipHtml = `<table><tbody>${body}</tbody></table>`;
-    })
-}, {immediate: true})
 </script>
 
 <style lang="scss" scoped>
-@import '../../../scss/colors.scss';
-@import '../../../scss/variables.scss';
+@import '../../../scss/tokens';
 
 .server-row {
-  padding: .2rem 0;
-  border-top: 1px solid grey;
-
-  &:last-child {
-    border-bottom: 1px solid grey;
-  }
-
-  width: 100%;
   display: grid;
-  grid-template-columns: auto 8rem 2rem;
-  grid-template-areas: 
-    "details players action";
-  @media only screen and (min-width: $phone-breakpoint)  {
-    grid-template-columns: 150px auto 8rem 2rem;
-    grid-template-areas: 
-      "map details players action";
+  grid-template-columns: 1fr 52px 56px;
+  align-items: center;
+  gap: $gap-3;
+  padding: 10px 16px;
+  border-bottom: $border-subtle;
+  transition: background 0.1s;
+
+  .join-btn:hover { color: $palette-red; }
+  .map-thumb { display: none; }
+  .s-map { display: none; }
+  .s-players { display: none; }
+  .s-ping { grid-column: 2; }
+  .join-btn, .join-locked { grid-column: 3; }
+
+  @media (min-width: 480px) {
+    grid-template-columns: 56px 1fr 52px 56px;
+
+    .map-thumb { display: block; }
+    .s-ping { grid-column: 3; }
+    .join-btn, .join-locked { grid-column: 4; }
   }
 
-  .detail {
-    margin-left: .5rem;
-    grid-area: details;
-    color: darken($body-font-color, 30%);
-    .icon {
-      font-size: .7rem;
-      padding-right: .7rem;
+  @media (min-width: 600px) {
+    grid-template-columns: 56px 1fr 60px 52px 56px;
+
+    .s-players {
+      display: flex;
+      align-items: center;
+      grid-column: 3;
     }
-    .name {
-      color: $body-font-color;
-      font-weight: 700;
-      font-size: 1rem;
-      .disabled {
-        color: darken($body-font-color, 50%);
-      }
-      .shareware {
-        font-size: .8rem;
-      }
-    }
+    .s-ping { grid-column: 4; }
+    .join-btn, .join-locked { grid-column: 5; }
   }
-  .players {
-    grid-area: players;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    font-weight: 700;
-      color: darken($body-font-color, 30%);
-    font-size: 1rem;
-    .activity {
-      &.active {
-        color: $light-color;
-      }
-    }
-  }
-  .action {
-    grid-area: action;
-    display: flex;
-    justify-content: center;
-    flex-direction: column;
-    align-items: center;
-    margin-right: 2rem;
-  }
-  .map-image {
-    display: none;
-    @media only screen and (min-width: $phone-breakpoint) {
+
+  @media (min-width: 800px) {
+    grid-template-columns: 56px 1fr 90px 60px 52px 56px;
+
+    .s-map {
       display: block;
+      grid-column: 3;
     }
-    grid-area: map;
-    background-position: right;
-    position: relative;
-    height: 100%;
-    background-repeat: no-repeat;
-    background-size: cover;
-
-    .map-text {
-      text-shadow: 2px 2px rgb(0,0,0);
-      //background-color: rgba(0,0,0,.4);
-      position: absolute;
-      bottom: 2px;
-      left: 2px;
-    }
+    .s-players { grid-column: 4; }
+    .s-ping { grid-column: 5; }
+    .join-btn, .join-locked { grid-column: 6; }
   }
+
+  @media (min-width: 900px) {
+    grid-template-columns: 80px 1fr 120px 72px 72px 72px;
+  }
+}
+
+.map-thumb {
+  height: 52px;
+  border: $border-subtle;
+  background-position: center;
+}
+
+.server-info { overflow: hidden; }
+
+.s-name {
+  font-size: $font-base;
+  font-weight: $fw-bold;
+  color: $palette-bright;
+  word-break: break-word;
+
+  @media (min-width: 900px) {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &.muted { color: $palette-muted; }
+}
+
+.s-sub {
+  font-size: $font-xs;
+  color: $palette-muted;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  .icon { font-size: 10px; margin-right: 3px; }
+  .shareware-tag { color: $palette-yellow; }
+}
+
+.s-map {
+  font-size: 14px;
+  font-weight: $fw-semibold;
+  color: $palette-text;
+}
+
+.s-players {
+  font-size: $font-base;
+  font-weight: $fw-bold;
+  color: $palette-muted;
+  cursor: default;
+
+  &.has-players { color: $palette-text; }
+
+  .bot-count {
+    font-size: $font-xs;
+    font-weight: $fw-semibold;
+    color: $palette-muted;
+    margin-left: 3px;
+  }
+
+  .bot-icon { margin-left: 2px; }
+}
+
+.s-ping {
+  font-size: $font-base;
+  font-weight: $fw-bold;
+
+  .ms { font-size: $font-2xs; font-weight: 400; color: $palette-muted; margin-left: 1px; }
+
+  &.ping-good    { color: $palette-text; }
+  &.ping-ok      { color: #e08030; }
+  &.ping-bad     { color: $palette-red; }
+  &.ping-unknown { color: $palette-muted; }
+}
+
+.join-btn {
+  font-size: $font-sm;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-links;
+  color: $palette-text;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: $transition-color;
+  text-align: right;
+  padding: 0;
+}
+
+.join-locked {
+  color: $palette-muted;
+  text-align: right;
 }
 </style>

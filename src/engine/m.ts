@@ -58,7 +58,11 @@ const state = {
 
   // Help menu
   num_help_pages: 6,
-  scale: 3
+  get scale() {
+    // Largest integer scale where the 320×200 menu fits entirely within the viewport.
+    // Capped at 3 (original desktop scale) so large screens are unchanged.
+    return Math.max(1, Math.min(3, Math.floor(Math.min(vid.state.width / 320, vid.state.height / 200))))
+  }
 } as any
 
 const bindnames = [
@@ -274,7 +278,7 @@ export const singlePlayer_Key = async function(k: number)
     switch (state.singleplayer_cursor)
     {
     case 0:
-      if (sv.state.server.active === true)
+      if (sv.state.server.phase === 'active')
       {
         if (confirm('Are you sure you want to start a new game?') !== true)
           return;
@@ -295,6 +299,7 @@ export const singlePlayer_Key = async function(k: number)
 export const scanSaves = async function()
 {
   var searchpaths = com.state.searchpaths, i, j, search = 'Quake.' + com.state.gamedir[0].dir + '/s', f, version, name, j, c;
+  for (i = 0; i < state.max_savegames; ++i) state.filenames[i] = '--- UNUSED SLOT ---';
   com.state.searchpaths = com.state.gamedir;
   for (i = 0; i < state.max_savegames; ++i)
   {
@@ -303,14 +308,17 @@ export const scanSaves = async function()
       state.removable[i] = true;
     else
     {
-      state.removable[i] = false;
+      // saves now live in IndexedDB (via the asset store); anything the store
+      // can find is deletable through com.eraseFile
       f = await com.loadTextFile('s' + i + '.sav');
       if (f == null)
       {
+        state.removable[i] = false;
         state.filenames[i] = '--- UNUSED SLOT ---';
         state.loadable[i] = false;
         continue;
       }
+      state.removable[i] = true;
     }
     for (version = 0; version < f.length; ++version)
     {
@@ -348,7 +356,7 @@ export const menu_Load_f = async function()
 
 export const menu_Save_f = async function()
 {
-  if ((sv.state.server.active !== true) || (cl.clState.intermission !== 0) || (sv.state.svs.maxclients !== 1))
+  if ((sv.state.server.phase !== 'active') || (cl.clState.intermission !== 0) || (sv.state.svs.maxclients !== 1))
     return;
   state.entersound = true;
   state.menu = MENU_STATE.save;
@@ -407,7 +415,7 @@ export const load_Key = async function(k: number)
       return;
     if (confirm('Delete selected game?') !== true)
       return;
-    localStorage.removeItem('Quake.' + com.state.gamedir[0].dir + '/s' + state.load_cursor + '.sav');
+    await com.eraseFile('s' + state.load_cursor + '.sav');
     await scanSaves();
   }
 };
@@ -441,7 +449,7 @@ export const save_Key = async function(k: number)
       return;
     if (confirm('Delete selected game?') !== true)
       return;
-    localStorage.removeItem('Quake.' + com.state.gamedir[0].dir + '/s' + state.load_cursor + '.sav');
+    await com.eraseFile('s' + state.load_cursor + '.sav');
     await scanSaves();
   }
 };
@@ -973,7 +981,17 @@ export const init = async function()
   gl = GL.getContext()
   
   cmd.addCommand('togglemenu', toggleMenu_f);
-  cmd.addCommand('menu_main', menu_Main_f);
+  // the menu_main CONSOLE COMMAND only exists for configs (AD's quake.rc issues it to
+  // boot desktop players into the menu); our frontend auto-starts a game, so a config
+  // must not pop the menu over an active session. ESC/togglemenu calls menu_Main_f
+  // directly and never passes through this wrapper.
+  cmd.addCommand('menu_main', () => {
+    if (sv.state.server.phase === 'active' || cl.cls.state === cl.ACTIVE.connected || host.state.connectOnLoad !== '') {
+      con.dPrint('menu_main command ignored: game session active\n');
+      return;
+    }
+    menu_Main_f();
+  });
   cmd.addCommand('menu_singleplayer', menu_SinglePlayer_f);
   cmd.addCommand('menu_load', menu_Load_f);
   cmd.addCommand('menu_save', menu_Save_f);
@@ -983,6 +1001,8 @@ export const init = async function()
   cmd.addCommand('menu_keys', menu_Keys_f);
   cmd.addCommand('help', menu_Help_f);
   cmd.addCommand('menu_quit', menu_Quit_f);
+  // stuffcmd'd by the rerelease QC at episode end; a no-op, as in QSS-M (menu.c:24304).
+  cmd.addCommand('menu_credits', () => { });
 
   state.sfx_menu1 = await s.precacheSound('misc/menu1.wav');
   state.sfx_menu2 = await s.precacheSound('misc/menu2.wav');
@@ -1039,6 +1059,9 @@ export const init = async function()
       trans[(i << 2) + 3] = 255;
     }
   }
+  // Retain the 64×64 index buffer so the WebGPU backend can CPU-remap this pic in drawPicTranslate
+  // (WebGL uses the `trans` mask texture below + the PicTranslate shader instead).
+  state.menuplyr.translateData = data;
   state.menuplyr.translate = gl.createTexture();
   tx.bind(0, state.menuplyr.translate);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, trans);

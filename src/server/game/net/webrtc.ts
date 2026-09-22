@@ -3,13 +3,14 @@ import ISocket from '../../../engine/interfaces/net/ISocket'
 import IDatagram from '../../../engine/interfaces/net/IDatagram'
 import * as sv from '../../../engine/sv'
 import * as net from '../../../engine/net'
+import * as sz from '../../../engine/sz'
 import * as wrtc from '@roamhq/wrtc'
-import {FTEBroker} from '../../../engine/webrtc/FTEBroker'
+import {FTEBroker} from '../../../shared/webrtc/FTEBroker'
 import { QConnectStatus } from '../../../engine/interfaces/net/INetworkDriver'
 import { print } from '../sys'
 import { CVars } from '../../../engine/cvar'
 import * as cvar from '../../../engine/cvar'
-import { Signaling } from '../../../engine/webrtc/signaling'
+import { Signaling } from '../../../shared/webrtc/signaling'
 
 export const name = "webrtc"
 export var initialized = false
@@ -111,10 +112,10 @@ export const acceptNewConnection = async (clientId: string) => {
 
 export const init = function()
 {
-  cvr.webrtc_broker = cvar.registerVariable('webrtc_broker', 'netquake.io'); // netquake.io | fte
-  
+  cvr.net_ice_broker = cvar.registerVariable('net_ice_broker', 'wss://master.quakeone.com:27950')
+
   const ws = new client()
-  ws.connect(`wss://master.frag-net.com:27950/FTE-Quake/` + net.cvr.hostname.string, 'rtc_host')
+  ws.connect(cvr.net_ice_broker.string + '/FTE-Quake/' + net.cvr.hostname.string, 'rtc_host')
   //ws.connect('ws://localhost:8080', 'rtc_host')
   ws.on('connect', (connection) => {
     state.broker = new FTEBroker(createSignaling(connection))
@@ -262,7 +263,7 @@ export const getMessage = (sock: ISocket) => {
 	var message = new Uint8Array(buffer, 1, buffer.byteLength - 1)
   // console.log(byteArayToString(message))
 	net.state.message.cursize = message.length;
-	(new Uint8Array(net.state.message.data)).set(message);
+	sz.u8(net.state.message).set(message);
 	return message[0];
 }
 

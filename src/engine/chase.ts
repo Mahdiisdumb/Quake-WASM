@@ -8,6 +8,12 @@ export const cvr: cvar.CVars = {
 
 }
 
+export const state = {
+  // persistent camera trace; built on first update (chase<->sv import cycle forbids
+  // sv.emptyTrace at module scope) and reset via sv.resetTrace before each use
+  trace: null as sv.Trace | null
+}
+
 export const init = function()
 {
   cvr.back = cvar.registerVariable('chase_back', '100');
@@ -18,13 +24,18 @@ export const init = function()
 
 export const update = function()
 {
-  var forward = vec.emptyV3(), right = vec.emptyV3();
+  var forward = vec.scratch(), right = vec.scratch();
   vec.angleVectors(cl.clState.viewangles, forward, right);
-  var trace = {plane: {}} as any, org = r.state.refdef.vieworg;
-  sv.recursiveHullCheck(cl.clState.worldmodel.hulls[0], 0, 0.0, 1.0, org, [
-    org[0] + 4096.0 * forward[0],
-    org[1] + 4096.0 * forward[1],
-    org[2] + 4096.0 * forward[2]], trace);
+  if (state.trace == null)
+    state.trace = sv.emptyTrace();
+  var trace = state.trace, org = r.state.refdef.vieworg;
+  // vec.origin end seed keeps the vanilla memset-zero endpos on a no-hit trace
+  sv.resetTrace(trace, vec.origin);
+  var end = vec.scratch();
+  end[0] = org[0] + 4096.0 * forward[0];
+  end[1] = org[1] + 4096.0 * forward[1];
+  end[2] = org[2] + 4096.0 * forward[2];
+  sv.recursiveHullCheck(cl.clState.worldmodel.hulls[0], 0, 0.0, 1.0, org, end, trace);
   var stop = trace.endpos;
   stop[2] -= org[2];
   var dist = (stop[0] - org[0]) * forward[0] + (stop[1] - org[1]) * forward[1] + stop[2] * forward[2];

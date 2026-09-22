@@ -1,7 +1,7 @@
 
-import { EventEmitter } from "../eventEmitter"
-import { Signaling } from "./signaling"
-import {IWebRTCBroker, MessageEvents} from './IWebRTCBroker'
+import { EventEmitter } from "../../shared/eventEmitter"
+import { Signaling } from "../../shared/webrtc/signaling"
+import {IWebRTCBroker, MessageEvents} from '../../shared/webrtc/IWebRTCBroker'
 import { dPrint } from "../console"
 
 type BrokerMessageType = 'sdp' | 'candidate'

@@ -1,5 +1,6 @@
 import * as msg from './msg'
 import * as con from './console'
+import * as csqc from './csqc'
 import * as cvar from './cvar'
 import * as com from './com'
 import * as cl from './cl'
@@ -13,7 +14,15 @@ export enum CMD_SOURCE {
 }
 export type Function = {
   name: string;
-  command: () => void
+  // null = no engine handler; the command exists only so CSQC_ConsoleCommand can see it
+  // (registercommand #352, QSS pr_ext.c:5961-5965).
+  command: (() => any) | null;
+  // Client progs gets first refusal; the engine handler runs only if it declines
+  // (QSS cmd_function_t::qcinterceptable, cmd.c:866).
+  interceptable?: boolean;
+  // Servers send this by stufftext (QSS src_server commands). Only these are taken out of the
+  // stufftext stream before CSQC_Parse_StuffCmd sees it.
+  fromServer?: boolean;
 }
 export type Alias = {
   name: string;
@@ -28,6 +37,10 @@ export type CmdState = {
   client: Client | null;
   args: string;
   cmdSource: CMD_SOURCE;
+  pendingCommand: Promise<unknown> | null;
+  // Rejection from pendingCommand, rethrown on the next execute() so it
+  // surfaces on the frame path (host error handling + error reporting).
+  pendingCommandError: unknown | null;
 }
 
 const initState = (): CmdState => {
@@ -39,7 +52,9 @@ const initState = (): CmdState => {
     functions: [],
     client: null,
     args: '',
-    cmdSource: CMD_SOURCE.src_client
+    cmdSource: CMD_SOURCE.src_client,
+    pendingCommand: null,
+    pendingCommandError: null
   }
 }
 
@@ -169,7 +184,7 @@ export const completeCommand = function(partial: string)
   }
 };
 
-export const executeString = async function(text: string, cmdSource: CMD_SOURCE)
+export const executeString = function(text: string, cmdSource: CMD_SOURCE): void | Promise<unknown>
 {
   state.cmdSource = cmdSource;
   tokenizeString(text);
@@ -181,7 +196,18 @@ export const executeString = async function(text: string, cmdSource: CMD_SOURCE)
   {
     if (state.functions[i].name === name)
     {
-      await state.functions[i].command();
+      // QSS Cmd_ExecuteString (cmd.c:857-899). csqc.consoleCommand leaves the csqc VM switched
+      // out before returning, so the engine handler runs outside any VM sandwich.
+      const f = state.functions[i];
+      if ((f.command != null) && (f.interceptable !== true))
+        return f.command();
+      if (csqc.consoleCommand(text))
+        return;
+      if (f.command != null)
+        return f.command();
+      // Registered by progs that is no longer running: QSS keeps it registered for the session
+      // and reports, rather than falling through to aliases/cvars.
+      con.print('gamecode not running, cannot "' + name + '"\n');
       return;
     }
   }
@@ -209,6 +235,18 @@ export const forwardToServer = function()
   var args = String.fromCharCode(protocol.CLC.stringcmd);
   if (state.argv[0].toLowerCase() !== 'cmd')
     args += state.argv[0] + ' ';
+  else if (state.args === 'pext' && (cl.cvr.cl_nopext == null || cl.cvr.cl_nopext.value === 0))
+  {
+    // Answer `cmd pext` with (magic, mask) pairs (QSS Cmd_ForwardToServer, cmd.c:965-973).
+    // cl_nopext 1 falls through and forwards a bare `pext`, negotiating nothing.
+    args += 'pext';
+    if (protocol.PEXT1_SUPPORTED_CLIENT !== 0)
+      args += ' 0x' + protocol.PROTOCOL_FTE_PEXT1.toString(16) + ' 0x' + protocol.PEXT1_SUPPORTED_CLIENT.toString(16);
+    if (protocol.PEXT2_SUPPORTED_CLIENT !== 0)
+      args += ' 0x' + protocol.PROTOCOL_FTE_PEXT2.toString(16) + ' 0x' + protocol.PEXT2_SUPPORTED_CLIENT.toString(16);
+    msg.writeString(cl.cls.message, args);
+    return;
+  }
   if (state.argv.length >= 2)
     args += state.args;
   else
@@ -216,7 +254,13 @@ export const forwardToServer = function()
   msg.writeString(cl.cls.message, args);
 }
 
-export const addCommand = function(name: string, command: () => any)
+export const forwardToServer_string = function(command: string) {
+  if (cl.cls.state !== cl.ACTIVE.connected) return
+  if (cl.cls.demoplayback === true) return
+  msg.writeString(cl.cls.message, String.fromCharCode(protocol.CLC.stringcmd) + command + '\n')
+}
+
+export const addCommand = function(name: string, command: (() => any) | null, opts?: { interceptable?: boolean, fromServer?: boolean })
 {
   var i;
   for (i = 0; i < cvar.vars.length; ++i)
@@ -235,7 +279,24 @@ export const addCommand = function(name: string, command: () => any)
       return;
     }
   }
-  state.functions[state.functions.length] = {name: name, command: command};
+  state.functions[state.functions.length] = {
+    name: name, command: command,
+    interceptable: opts?.interceptable, fromServer: opts?.fromServer
+  };
+}
+
+// Is `name` a command the engine accepts from a server? QSS asks this through cmd_source: a
+// stufftext line matches only Cmd_AddCommand_ServerCommand names, never an alias or cvar
+// (cmd.c:851-911). Everything else goes to CSQC_Parse_StuffCmd.
+export const isServerCommand = function(name: string): boolean
+{
+  const lower = name.toLowerCase();
+  for (let i = 0; i < state.functions.length; ++i)
+  {
+    if (state.functions[i].name === lower)
+      return state.functions[i].fromServer === true;
+  }
+  return false;
 }
 
 export const init = function()
@@ -253,9 +314,17 @@ export const init = function()
 
 }
 
-export const execute = async function()
+export const execute = function()
 {
-  var i, c, line = '', quotes = false;
+  if (state.pendingCommandError != null)
+  {
+    const e = state.pendingCommandError;
+    state.pendingCommandError = null;
+    throw e;
+  }
+  if (state.pendingCommand != null)
+    return;
+  var c, line = '', quotes = false;
   while (state.text.length !== 0)
   {
     c = state.text.charCodeAt(0);
@@ -270,7 +339,15 @@ export const execute = async function()
     {
       if (line.length === 0)
         continue;
-      await executeString(line, CMD_SOURCE.src_command);
+      const r = executeString(line, CMD_SOURCE.src_command);
+      if (r != null && typeof (r as any).then === 'function')
+      {
+        state.pendingCommand = (r as Promise<unknown>).then(
+          () => { state.pendingCommand = null; },
+          (e) => { state.pendingCommand = null; state.pendingCommandError = e; }
+        );
+        return;
+      }
       if (state.wait === true)
       {
         state.wait = false;
@@ -280,6 +357,17 @@ export const execute = async function()
       continue;
     }
     line += String.fromCharCode(c);
+  }
+  if (line.length > 0)
+  {
+    const r = executeString(line, CMD_SOURCE.src_command);
+    if (r != null && typeof (r as any).then === 'function')
+    {
+      state.pendingCommand = (r as Promise<unknown>).then(
+        () => { state.pendingCommand = null; },
+        (e) => { state.pendingCommand = null; state.pendingCommandError = e; }
+      );
+    }
   }
   state.text = '';
 };

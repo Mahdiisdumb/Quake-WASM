@@ -1,11 +1,12 @@
 <template lang="pug">
 .name-maker
-  input(ref="input" :value="value" @input="emit('input', $event.target.value)" @keydown="inputKeyDown")
-  .buttons
-    button.btn(@click="space") Space
-    button.btn(@click="backspace") Backspace
-    button.btn.right(@click.stop="done") Done
-  canvas(ref="canvas" :height="model.charsetSize" :width="model.charsetSize" @mousemove="canvashover" @click="canvasclick")
+  input.nm-input-hidden(ref="input" :value="value" @input="emit('input', $event.target.value)" @keydown="inputKeyDown")
+  .nm-toolbar
+    .nm-toolbar-left
+      button.nm-btn(@click.stop="space") Space
+      button.nm-btn(@click.stop="backspace") ← Backspace
+    button.nm-btn.nm-btn-done(@click.stop="done") Done
+  canvas.nm-canvas(ref="canvas" :height="model.charsetSize" :width="model.charsetSize" @mousemove="canvashover" @click.stop="canvasclick")
 </template>
 
 <script lang="ts" setup>
@@ -30,24 +31,18 @@ const props = withDefaults(defineProps<{
 const model = reactive<{
   image: CanvasImageSource | null,
   charsetSize: number,
-  name: string,
   hoverPosition: {x: number, y: number} 
 }>({
   image: null,
   charsetSize: 400,
-  name: props.value,
   hoverPosition: {x: -1, y: -1}
-})
-
-watch(props, () => {
-  model.name = props.value
 })
 
 const insertCharacter = (char: string) => {
   if (!input.value) return
   const selectionStart = input.value.selectionStart!
   const selectionEnd = input.value.selectionEnd!
-  const newName = model.name.slice(0, selectionStart) + char + model.name.slice(selectionEnd);
+  const newName = props.value.slice(0, selectionStart) + char + props.value.slice(selectionEnd);
   
   if (newName.length <= props.maxLength) {
     change(newName)
@@ -59,22 +54,22 @@ const insertCharacter = (char: string) => {
 }
 
 const change = (newName: string) => {
-  if (model.name.length <= props.maxLength) {
+  if (props.value.length <= props.maxLength) {
     emit('input', newName)
   }
 }
 
 const space = () => {
-  if (model.name.length <= props.maxLength) {
+  if (props.value.length <= props.maxLength) {
     insertCharacter(' ')
   }
 }
 const backspace = () => {
   if (!input.value) return
-  if (model.name.length && input.value) {
+  if (props.value.length && input.value) {
     const selectionStart = input.value.selectionStart!
     const selectionEnd = input.value.selectionEnd!
-    const newName = model.name.slice(0, selectionStart - 1) + model.name.slice(selectionEnd);
+    const newName = props.value.slice(0, selectionStart - 1) + props.value.slice(selectionEnd);
     
     change(newName)
     nextTick(() => {
@@ -85,7 +80,7 @@ const backspace = () => {
 }
 
 const done = () => {
-  if (!model.name) {
+  if (!props.value) {
     emit('input', 'player')
   }
   // hack because for some reason the above doesn't trigger change if done is executed the same time.
@@ -101,7 +96,7 @@ const inputKeyDown = (e: KeyboardEvent) => {
   if (key === "Backspace" || key === "Delete" || key==="ArrowLeft" || key==="ArrowRight") {
     return
   }
-  if (model.name.length > props.maxLength) {
+  if (props.value.length > props.maxLength) {
     e.preventDefault()
     return false
   }
@@ -149,6 +144,7 @@ const canvashover = (e: MouseEvent) => {
 }
 
 onMounted(() => {
+  input.value?.focus()
   if (!canvas.value) return
   if (canvas.value.getContext) {
       const ctx = canvas.value.getContext('2d');
@@ -168,20 +164,69 @@ onMounted(() => {
 
       };
 
-      charset.src = '/static/img/charset.png';
+      charset.src = '/static/img/charset-6.png';
   }
   
 })
 </script>
 
 <style lang="scss" scoped>
+@import '../../scss/tokens';
+
 .name-maker {
   display: flex;
   flex-direction: column;
-  .buttons {
-    .right { 
-      float: right;
-    }
-  }
+  width: 240px;
+}
+
+.nm-input-hidden {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  height: 0;
+}
+
+.nm-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: $border-subtle;
+  border-bottom: none;
+  background: $palette-surface;
+}
+
+.nm-toolbar-left {
+  display: flex;
+}
+
+.nm-btn {
+  font-family: inherit;
+  font-size: $font-2xs;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-links;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-right: $border-subtle;
+  color: $palette-muted;
+  cursor: pointer;
+  transition: $transition-color;
+  &:hover { color: $palette-bright; }
+}
+
+.nm-btn-done {
+  border-right: none;
+  border-left: $border-subtle;
+  color: $palette-text;
+  &:hover { color: $palette-bright; }
+}
+
+.nm-canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  border: $border-subtle;
 }
 </style>

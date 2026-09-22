@@ -8,5 +8,8 @@ export interface ISys {
   getExternalCommand: () => string,
   init: (argv: string) => void,
   assetStore: IAssetStore,
-  requestPak: () => Promise<any>
+  requestPak: () => Promise<any>,
+  // The local player renamed in-game; lets the host environment sync its
+  // own name storage. Absent on the dedicated server.
+  nameChanged?: (name: string) => void
 }

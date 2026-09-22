@@ -37,57 +37,52 @@ const select = (colorValue: number) => {
 </script>
 
 <style lang="scss">
-@import '../scss/colors.scss';
+@import '../scss/tokens';
+
+.color-select { position: relative; display: inline-block; }
+
 .selection-container {
-  padding: .15rem;
   display: flex;
   align-items: center;
-  background-color: lighten($body-bg, 1%);
-  box-shadow: 0px 8px 15px rgba(0, 0, 0, 0.1);
-  padding:4px;
+  background: $palette-body;
+  border: $border-subtle;
+  padding: 4px;
   cursor: pointer;
-  :active {
-    box-shadow: 0 0 0 0.1rem rgb(87 85 217 / 20%);;
-  }
-  .color-current {
-    position: relative;
-  }
-  i {
-    margin-left: .25rem;
-    font-size: .5rem;
-    color:$border-color;
-  }
+  transition: border-color 0.15s;
+  &:hover { border-color: $palette-muted; }
 }
-.color-dropdown {
-  .color-option {
-    &.selected {
-      border: 2px solid $border-color;
-    }
-    margin-bottom: .5rem;
-    box-shadow: 0px 8px 15px rgba(0, 0, 0, 0.1);
-    width: 25px;
-    height: 25px;
-  }
-  ul {
-    background-color: $body-bg;
-    display: none;
-    columns: 4;
-    padding: 0px;
-    padding: .5rem;
-    position: absolute;
-    z-index: 9;
-    top: 0px;
-    &.show {
-      display: block;
-    }
-    li{
-      margin: 0;  
-      display: block;
-    }
-  }
-}
+
+.color-current { position: relative; }
+
 .color-value {
-  width: 75px;
-  height: 20px;
+  width: 80px;
+  height: 22px;
+  display: block;
+}
+
+.color-dropdown {
+  ul {
+    display: none;
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 4px);
+    left: 0;
+    background: $palette-surface;
+    border: $border-subtle;
+    padding: 6px;
+    columns: 4;
+    &.show { display: block; }
+    li { margin: 0; display: block; }
+  }
+
+  .color-option {
+    width: 24px;
+    height: 24px;
+    margin-bottom: 4px;
+    cursor: pointer;
+    transition: outline 0.1s;
+    &.selected { outline: 2px solid $palette-bright; }
+    &:hover { outline: 2px solid $palette-muted; }
+  }
 }
 </style>

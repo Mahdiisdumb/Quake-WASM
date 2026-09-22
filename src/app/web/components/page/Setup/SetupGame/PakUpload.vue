@@ -8,11 +8,10 @@
     @dragleave.prevent="model.active = false")
     input.loader-file-input(:id="props.inputId" type="file" multiple name="files[]" accept=".pak" @change="handleFileSelect")
     slot
-      .columns
-        .column.col-12.text Drop pak files here&nbsp;
-          label.browse(:for="props.inputId")
-            | or browse
-            i(:class="'icon icon-upload'")
+      .text Drop pak files here&nbsp;
+        label.browse(:for="props.inputId")
+          | or browse
+          font-awesome-icon(icon="fa-solid fa-upload")
 </template>
 
 <script lang="ts" setup>
@@ -61,6 +60,8 @@ const handleFileSelect = (e: Event) => {
 </script>
 
 <style lang="scss" scoped>
+.loader-file-input { display: none; }
+
 .upload-zone {
   &.border {
     padding: 2rem;

@@ -1,12 +1,12 @@
 <template lang="pug">
 .asset {{props.label}}
   template(v-if="props.assetMeta !== null")
-    .asset-loaded.columns
-      .column.col-5.asset-loaded {{props.assetMeta.fileName}} 
-      .column.col-5.asset-fileCount {{props.assetMeta.fileCount}} Files
-      .column.col-2.asset-remove 
-        button.btn.btn-action.btn-sm(@click="remove")
-          i(class="icon icon-cross" style="margin: .3rem; color: red")</template>
+    .asset-loaded.grid.grid-cols-12.gap-2
+      .col-span-5.asset-loaded {{props.assetMeta.fileName}}
+      .col-span-5.asset-fileCount {{props.assetMeta.fileCount}} Files
+      .col-span-2.asset-remove
+        button.btn.btn-action.btn-sm(@click="remove" style="color: red")
+          font-awesome-icon(icon="fa-solid fa-xmark")</template>
 
 <script lang="ts" setup>
 import {reactive} from 'vue'

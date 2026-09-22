@@ -3,11 +3,13 @@ import * as palette from './palette'
 import * as sys from './sys'
 import * as def from './def'
 import * as GL from './GL'
+import * as image from './image'
 import * as w from './w'
 import * as tx from './texture'
 import * as vid from './vid'
 import * as con from './console'
 import { Pic } from './texture'
+import { getRenderer } from './render'
 
 type DrawState = {
   char_texture: WebGLTexture
@@ -67,6 +69,14 @@ export const init = async function()
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 128, 128, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(trans));
   gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // WebGPU backend: retain the 128x128 conchars RGBA so the WebGPU renderer can upload its font atlas.
+  // Additive + backend-gated (WebGL never sets these). char_texture is a raw WebGLTexture used as the
+  // stable cache key on the WebGPU side, with the pixels carried on the same object.
+  if (getRenderer().backend === 'webgpu') {
+    (state.char_texture as any).rgba = new Uint8Array(trans);
+    (state.char_texture as any).rgbaW = 128;
+    (state.char_texture as any).rgbaH = 128;
+  }
 
   var cb = await com.loadFile('gfx/conback.lmp');
   if (cb == null)
@@ -81,7 +91,7 @@ export const init = async function()
     translate: null
   }
 
-  var ver = '(WebQuake build ' + def.webquake_version + ') 1.09';
+  var ver = '(WebQuake build ' + def.webquake_version + ') 2.01';
   for (i = 0; i < ver.length; ++i)
     charToConback(ver.charCodeAt(i), 59829 - ((ver.length - i) << 3));
   state.conback.texnum = tx.loadPicTexture(state.conback);
@@ -103,10 +113,20 @@ export const init = async function()
     ],
     []);
   GL.createProgram('Pic',
-    ['uOrtho'],
+    ['uOrtho', 'uColor'],
     [
       GL.createAttribParam('aPosition', gl.FLOAT, 2), 
       GL.createAttribParam('aTexCoord', gl.FLOAT, 2)
+    ],
+    ['tTexture']);
+  // Pic with per-vertex rgba instead of a uniform tint: the CSQC 2D polygon path only
+  // (FTE R_PolygonVertex).
+  GL.createProgram('PicPoly',
+    ['uOrtho'],
+    [
+      GL.createAttribParam('aPosition', gl.FLOAT, 2),
+      GL.createAttribParam('aTexCoord', gl.FLOAT, 2),
+      GL.createAttribParam('aColor', gl.UNSIGNED_BYTE, 4, true)
     ],
     ['tTexture']);
   GL.createProgram('PicTranslate',
@@ -120,22 +140,29 @@ export const init = async function()
 
 export const char = function(x: number, y: number, num: number, size: number)
 {
-  GL.streamDrawTexturedQuad(x, y, size, size,
+  // char UV math (glyph index → char-atlas cell UVs) stays here; the gl submission is in the backend.
+  getRenderer().drawCharacter(x, y, size, size,
     (num & 15) * 0.0625, (num >> 4) * 0.0625,
     ((num & 15) + 1) * 0.0625, ((num >> 4) + 1) * 0.0625);
 }
 
+// char with a non-square cell and an rgba modulate, for CSQC drawcharacter/drawstring.
+export const charTinted = function(x: number, y: number, w: number, h: number, num: number,
+  r: number, g: number, b: number, a: number)
+{
+  getRenderer().drawCharacter(x, y, w, h,
+    (num & 15) * 0.0625, (num >> 4) * 0.0625,
+    ((num & 15) + 1) * 0.0625, ((num >> 4) + 1) * 0.0625,
+    r, g, b, a);
+}
+
 export const character = function(x: number, y: number, num: number, size = con.cvr.textsize.value)
 {
-  var program = GL.useProgram('Pic', true);
-  tx.bind(program.textures.tTexture, state.char_texture, true);
   char(x, y, num, size);
 };
 
 export const string = function(x: number, y: number, str: string, size = con.cvr.textsize.value)
 {
-  var program = GL.useProgram('Pic', true);
-  tx.bind(program.textures.tTexture, state.char_texture, true);
   for (var i = 0; i < str.length; ++i)
   {
     char(x, y, str.charCodeAt(i), size);
@@ -145,8 +172,6 @@ export const string = function(x: number, y: number, str: string, size = con.cvr
 
 export const stringWhite = function(x: number, y: number, str: string, size = con.cvr.textsize.value)
 {
-  var program = GL.useProgram('Pic', true);
-  tx.bind(program.textures.tTexture, state.char_texture, true);
   for (var i = 0; i < str.length; ++i)
   {
     char(x, y, str.charCodeAt(i) + 128, size);
@@ -173,14 +198,19 @@ export const picFromWad = function(name: string): Pic
   return dat
 };
 
-export const cachePic = async function(path: string)
+// Load a .lmp pic by full path — mod HUD art named by path in a data file (wwheel.txt), not by
+// wad lump. Returns null when absent or malformed; cachePic errors out instead.
+export const cachePicPath = async function(path: string): Promise<tx.Pic>
 {
-  path = 'gfx/' + path + '.lmp';
+  if ((path == null) || (path.length === 0))
+    return null;
   var buf = await com.loadFile(path);
-  if (buf == null)
-    sys.error('Draw.CachePic: failed to load ' + path);
+  if ((buf == null) || (buf.byteLength < 8))
+    return null;
   var view = new DataView(buf, 0, 8);
   const [width, height] = [view.getUint32(0, true), view.getUint32(4, true)]
+  if ((width <= 0) || (height <= 0) || (buf.byteLength < 8 + width * height))
+    return null;
   const dat: tx.Pic = {
     width,
     height,
@@ -192,50 +222,84 @@ export const cachePic = async function(path: string)
   return dat;
 };
 
+// Truecolor pic by name for HUD art that is a png/tga rather than a .lmp, null when none exists.
+// Any image extension on the name is stripped so loadImage's own extension sweep runs, as FTE's
+// R_RegisterPic -> Image_GetTexture does.
+export const cacheImagePic = async function(name: string): Promise<tx.Pic>
+{
+  if ((name == null) || (name.length === 0))
+    return null;
+  const img = await image.loadImage(name.replace(/\.(tga|png|jpg|jpeg|pcx|lmp)$/i, ''));
+  if (img == null)
+    return null;
+  return tx.picFromRGBA(img.width, img.height, img.data);
+};
+
+export const cachePic = async function(path: string)
+{
+  path = 'gfx/' + path + '.lmp';
+  const dat = await cachePicPath(path);
+  if (dat == null)
+    sys.error('Draw.CachePic: failed to load ' + path);
+  return dat;
+};
+
 export const pic = function(x: number, y: number, _pic: Pic, scale = 1)
 {
-  var program = GL.useProgram('Pic', true);
-  tx.bind(program.textures.tTexture, _pic.texnum, true);
-  GL.streamDrawTexturedQuad(x, y, _pic.width * scale, _pic.height * scale, 0.0, 0.0, 1.0, 1.0);
+  getRenderer().drawPic(x, y, _pic, scale);
 };
 
 export const picTranslate = function(x: number, y: number, pic: Pic, top: number, bottom: number, scale: number = 1)
 {
-  const gl = GL.getContext()
-  GL.streamFlush();
-  var program = GL.useProgram('PicTranslate');
-  tx.bind(program.textures.tTexture, pic.texnum);
-  tx.bind(program.textures.tTrans, pic.translate);
-
-  var p = vid.d_8to24table[top];
-  var _scale = 1.0 / 191.25;
-  gl.uniform3f(program.uniforms.uTop, (p & 0xff) * _scale, ((p >> 8) & 0xff) * _scale, (p >> 16) * _scale);
-  p = vid.d_8to24table[bottom];
-  gl.uniform3f(program.uniforms.uBottom, (p & 0xff) * _scale, ((p >> 8) & 0xff) * _scale, (p >> 16) * _scale);
-
-  GL.streamDrawTexturedQuad(x, y, pic.width * scale, pic.height * scale, 0.0, 0.0, 1.0, 1.0);
-
-  GL.streamFlush();
+  getRenderer().drawPicTranslate(x, y, pic, top, bottom, scale);
 };
 
 export const consoleBackground = function(lines: number)
 {
-  var program = GL.useProgram('Pic', true);
-  tx.bind(program.textures.tTexture, state.conback.texnum, true);
-  GL.streamDrawTexturedQuad(0, lines - vid.state.height, vid.state.width, vid.state.height, 0.0, 0.0, 1.0, 1.0);
+  getRenderer().drawConsoleBackground(lines);
 };
 
 export const fill = function(x: number, y: number, w: number, h: number, c: number)
 {
-  var program = GL.useProgram('Fill', true);
-  var color = vid.d_8to24table[c];
-  GL.streamDrawColoredQuad(x, y, w, h, color & 0xff, (color >> 8) & 0xff, color >> 16, 255);
+  getRenderer().drawFill(x, y, w, h, c);
+};
+
+// CSQC drawpic/drawsubpic: a pic sub-rect (0..1 fractions) stretched into an explicit box, tinted.
+export const subPic = function(x: number, y: number, w: number, h: number, _pic: Pic,
+  s1: number, t1: number, s2: number, t2: number, r: number, g: number, b: number, a: number)
+{
+  getRenderer().drawSubPic(x, y, w, h, _pic, s1, t1, s2, t2, r, g, b, a);
+};
+
+// CSQC drawfill: arbitrary rgba (0-1 floats) rather than fill()'s palette index.
+export const fillRGBA = function(x: number, y: number, w: number, h: number,
+  r: number, g: number, b: number, a: number)
+{
+  getRenderer().drawFillRGBA(x, y, w, h, r, g, b, a);
+};
+
+// CSQC R_BeginPolygon/R_PolygonVertex/R_EndPolygon: one 2D triangle fan. `verts` is count vertices
+// of [x, y, z, u, v, r, g, b, a] (FTE's shared 2D/3D layout, so z is unused here); x/y in pixels,
+// colour 0-1, null pic draws untextured.
+export const polygon2D = function(_pic: Pic, verts: Float32Array, count: number)
+{
+  getRenderer().draw2DPolygon(_pic, verts, count);
+};
+
+// CSQC drawsetcliparea/drawresetcliparea. Pixel coords, top-left origin.
+export const setClip = function(x: number, y: number, w: number, h: number)
+{
+  getRenderer().set2DScissor(x, y, w, h);
+};
+
+export const resetClip = function()
+{
+  getRenderer().clear2DScissor();
 };
 
 export const fadeScreen = function()
 {
-  var program = GL.useProgram('Fill', true);
-  GL.streamDrawColoredQuad(0, 0, vid.state.width, vid.state.height, 0, 0, 0, 204);
+  getRenderer().fadeScreen();
 };
 
 export const beginDisc = function(file: string)

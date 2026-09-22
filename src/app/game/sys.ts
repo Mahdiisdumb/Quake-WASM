@@ -1,5 +1,7 @@
 import * as com from '../../engine/com'
+import * as con from '../../engine/console'
 import * as host from '../../engine/host'
+import * as cvar from '../../engine/cvar'
 import * as key from '../../engine/key'
 import * as vid from '../../engine/vid'
 import * as cl from '../../engine/cl'
@@ -9,8 +11,10 @@ import * as loop from './net/loop'
 import * as webs from './net/webs'
 import * as webrtc from './net/webrtc'
 import * as input from '../../engine/input'
+import * as cmd from '../../engine/cmd'
 import IAssetStore from '../../engine/interfaces/store/IAssetStore'
 import { stat } from 'fs'
+import { reportError } from '../../shared/errorReporting'
 
 export const assetStore: IAssetStore = _assetStore
 type QuitStatus = {quitting: false} | {quitting: true, reason?: string}
@@ -20,6 +24,9 @@ export type UIHooks = {
 	// Initiates the UI to request a pak file
 	// Passes a callback to call when finished.
 	startRequestPak: (callback: (value: unknown) => void) => void
+	// Called when the local player renames in-game, so the UI can write it
+	// back to its source of truth (autoexec.cfg).
+	nameChanged?: (name: string) => void
 }
 
 export type InitArgs = {
@@ -29,20 +36,30 @@ export type InitArgs = {
 }
 
 export type SysState = {
-	scantokey: number[],
+	scantokey: Record<string, number>,
 	oldtime: number,
 	// Used to signal the event loop to quit on next frame so the game can quit gracefully.
 	quitStatus: QuitStatus,
+	// Each init() claims a new generation; a superseded game loop stops silently.
+	generation: number,
+	// True while a host.frame() is executing; dispose() drains it before teardown.
+	frameActive: boolean,
 	hooks: Partial<UIHooks>,
 	initArgs: null | InitArgs
 }
 
 export const state: SysState = {
-  scantokey: [],
+  scantokey: {},
   oldtime: 0.0,
   quitStatus: {quitting:false},
+  generation: 0,
+  frameActive: false,
   hooks: {},
 	initArgs: null
+}
+
+function trackError(message: string, stack?: string) {
+	void reportError({ name: 'Engine Error', message: message || '', stack: stack || '' })
 }
 
 const onbeforeunload = function()
@@ -65,22 +82,129 @@ const onfocus = async function()
 	}
 };
 
+// Text destination for clipboard operations: the console (including the forced-up
+// console, which key.event routes to the edit line while dest is still game),
+// messagemode, or null when the game/menu owns input.
+const textDest = function()
+{
+	if (key.state.dest === key.KEY_DEST.message)
+		return key.KEY_DEST.message;
+	if ((key.state.dest === key.KEY_DEST.console)
+		|| ((key.state.dest === key.KEY_DEST.game) && (con.state.forcedup === true)))
+		return key.KEY_DEST.console;
+	return null;
+};
+
+// Reduces pasted text to what the Quake console accepts: \r dropped, tabs to
+// spaces, \n kept as the line separator, everything else outside printable ASCII dropped.
+const sanitizePaste = function(text: string)
+{
+	var out = '';
+	for (var i = 0; i < text.length; ++i)
+	{
+		var c = text.charCodeAt(i);
+		if (c === 10)
+		{
+			out += '\n';
+			continue;
+		}
+		if (c === 9)
+		{
+			out += ' ';
+			continue;
+		}
+		if ((c < 32) || (c > 126))
+			continue;
+		out += text.charAt(i);
+	}
+	return out;
+};
+
+// Inserts at the console cursor, executing every complete line; the trailing
+// fragment (the whole paste, when single-line) stays in the edit line with the
+// text that followed the cursor after it.
+const pasteToConsole = function(text: string)
+{
+	const after = key.state.edit_line.substring(key.state.edit_pos);
+	const lines = (key.state.edit_line.substring(0, key.state.edit_pos) + text).split('\n');
+	const last = lines.pop() as string;
+	for (var i = 0; i < lines.length; ++i)
+	{
+		if (lines[i].length === 0)
+			continue;
+		con.print(']' + lines[i] + '\n');
+		cmd.state.text += lines[i] + '\n';
+	}
+	key.setEditLine(last + after);
+	key.state.edit_pos = last.length;
+};
+
+// Appends to the chat buffer; messagemode is single-line and capped like key.message.
+const pasteToMessage = function(text: string)
+{
+	key.state.chat_buffer = (key.state.chat_buffer + text.replace(/\n/g, ' ')).substring(0, 54);
+};
+
+const copyEditLine = function()
+{
+	if (key.state.edit_line.length === 0)
+		return;
+	if ((navigator.clipboard == null) || (navigator.clipboard.writeText == null))
+		return;
+	void navigator.clipboard.writeText(key.state.edit_line).catch(function() { /* denied */ });
+};
+
 const onkeydown = async function(e: KeyboardEvent)
 {
-	var _key = state.scantokey[e.keyCode];
+	// Ctrl/Cmd+V and Ctrl/Cmd+C are left to the browser while the console or
+	// messagemode owns input, so the paste event fires and the clipboard write is
+	// inside the gesture; in game/menu they fall through to the normal bind path.
+	if (e.ctrlKey || e.metaKey)
+	{
+		const dest = textDest();
+		if ((e.code === 'KeyV') && (dest != null))
+			return;
+		if ((e.code === 'KeyC') && (dest === key.KEY_DEST.console))
+		{
+			copyEditLine();
+			return;
+		}
+	}
+	const _key = state.scantokey[e.code];
 	if (_key == null)
 		return;
-	await key.event(_key, true);
+	await key.event(_key, true, e.key);
 	e.preventDefault();
 };
 
 const onkeyup = async function(e: KeyboardEvent)
 {
-	var _key = state.scantokey[e.keyCode];
+	const _key = state.scantokey[e.code];
 	if (_key == null)
 		return;
 	await key.event(_key, false);
 	e.preventDefault();
+};
+
+// Maps a browser MouseEvent.which (1-indexed) to a Quake key number.
+// which: 1=left, 2=middle, 3=right, 4=back, 5=forward.
+const mouseButtonToKey = function(which: number)
+{
+	switch (which)
+	{
+	case 1:
+		return key.KEY.mouse1;
+	case 2:
+		return key.KEY.mouse3;
+	case 3:
+		return key.KEY.mouse2;
+	case 4:
+		return key.KEY.mouse4;
+	case 5:
+		return key.KEY.mouse5;
+	default:
+		return null;
+	}
 };
 
 const onmousedown = async function(e: MouseEvent)
@@ -88,21 +212,9 @@ const onmousedown = async function(e: MouseEvent)
 	if (!input.hasPointerLock()) {
 		return
 	}
-	var _key;
-	switch (e.which)
-	{
-	case 1:
-		_key = key.KEY.mouse1;
-		break;
-	case 2:
-		_key = key.KEY.mouse3;
-		break;
-	case 3:
-		_key = key.KEY.mouse2;
-		break;
-	default:
+	var _key = mouseButtonToKey(e.which);
+	if (_key == null)
 		return;
-	}
 	await key.event(_key, true)
 	e.preventDefault();
 };
@@ -112,21 +224,9 @@ const onmouseup = async function(e: MouseEvent)
 	if (!input.hasPointerLock()) {
 		return
 	}
-	var _key;
-	switch (e.which)
-	{
-	case 1:
-		_key = key.KEY.mouse1;
-		break;
-	case 2:
-		_key = key.KEY.mouse3;
-		break;
-	case 3:
-		_key = key.KEY.mouse2;
-		break;
-	default:
+	var _key = mouseButtonToKey(e.which);
+	if (_key == null)
 		return;
-	}
 	await key.event(_key, false)
 	e.preventDefault();
 };
@@ -137,6 +237,24 @@ const onmousewheel = async function(e: WheelEvent)
 	await key.event(_key, true);
 	await key.event(_key, false);
 	e.preventDefault();
+};
+
+const onpaste = function(e: ClipboardEvent)
+{
+	const dest = textDest();
+	if (dest == null)
+		return;
+	const text = e.clipboardData != null ? e.clipboardData.getData('text') : '';
+	if ((text == null) || (text.length === 0))
+		return;
+	e.preventDefault();
+	const clean = sanitizePaste(text);
+	if (clean.length === 0)
+		return;
+	if (dest === key.KEY_DEST.message)
+		pasteToMessage(clean);
+	else
+		pasteToConsole(clean);
 };
 
 const onunload = function()
@@ -153,6 +271,10 @@ const onwheel = async function(e: WheelEvent)
 
 export const init = async (argv: string) =>
 {
+	// A live engine from a previous mount must fully stop before module state is re-entered.
+	await dispose();
+	const gen = ++state.generation;
+
 	if ((document.location.protocol !== 'http:') && (document.location.protocol !== 'https:'))
 		error('Protocol is ' + document.location.protocol + ', not http: or https:');
 	if (Number.isNaN != null)
@@ -201,102 +323,232 @@ export const init = async (argv: string) =>
 	vid.state.height = (elem.clientHeight <= 200) ? 200 : elem.clientHeight;
 	
 	state.quitStatus = {quitting:false};
-	state.scantokey = [];
-	state.scantokey[8] = key.KEY.backspace;
-	state.scantokey[9] = key.KEY.tab;
-	state.scantokey[13] = key.KEY.enter;
-	state.scantokey[16] = key.KEY.shift;
-	state.scantokey[17] = key.KEY.ctrl;
-	state.scantokey[18] = key.KEY.alt;
-	state.scantokey[19] = key.KEY.pause;
-	state.scantokey[27] = key.KEY.escape;
-	state.scantokey[32] = key.KEY.space;
-	state.scantokey[33] = state.scantokey[105] = key.KEY.pgup;
-	state.scantokey[34] = state.scantokey[99] = key.KEY.pgdn;
-	state.scantokey[35] = state.scantokey[97] = key.KEY.end;
-	state.scantokey[36] = state.scantokey[103] = key.KEY.home;
-	state.scantokey[37] = state.scantokey[100] = key.KEY.leftarrow;
-	state.scantokey[38] = state.scantokey[104] = key.KEY.uparrow;
-	state.scantokey[39] = state.scantokey[102] = key.KEY.rightarrow;
-	state.scantokey[40] = state.scantokey[98] = key.KEY.downarrow;
-	state.scantokey[45] = state.scantokey[96] = key.KEY.ins;
-	state.scantokey[46] = state.scantokey[110] = key.KEY.del;
-	for (i = 48; i <= 57; ++i)
-		state.scantokey[i] = i; // 0-9
-	state.scantokey[59] = state.scantokey[186] = 59; // ;
-	state.scantokey[61] = state.scantokey[187] = 61; // =
-	for (i = 65; i <= 90; ++i)
-		state.scantokey[i] = i + 32; // a-z
-	state.scantokey[91] = 170; // *
-	state.scantokey[106] = 42; // *
-	state.scantokey[107] = 43; // +
-	state.scantokey[109] = state.scantokey[173] = state.scantokey[189] = 45; // -
-	state.scantokey[111] = state.scantokey[191] = 47; // /
-	for (i = 112; i <= 123; ++i)
-		state.scantokey[i] = i - 112 + key.KEY.f1; // f1-f12
-	state.scantokey[188] = 44; // ,
-	state.scantokey[190] = 46; // .
-	state.scantokey[192] = 96; // `
-	state.scantokey[219] = 91; // [
-	state.scantokey[220] = 92; // backslash
-	state.scantokey[221] = 93; // ]
-	state.scantokey[222] = 39; // '
+	state.scantokey = {
+		'Backspace':      key.KEY.backspace,
+		'Tab':            key.KEY.tab,
+		'Enter':          key.KEY.enter,
+		'NumpadEnter':    key.KEY.enter,
+		'ShiftLeft':      key.KEY.shift,
+		'ShiftRight':     key.KEY.shift,
+		'ControlLeft':    key.KEY.ctrl,
+		'ControlRight':   key.KEY.ctrl,
+		'AltLeft':        key.KEY.alt,
+		'AltRight':       key.KEY.alt,
+		'Pause':          key.KEY.pause,
+		'Escape':         key.KEY.escape,
+		'Space':          key.KEY.space,
+		'PageUp':         key.KEY.pgup,
+		'Numpad9':        key.KEY.pgup,
+		'PageDown':       key.KEY.pgdn,
+		'Numpad3':        key.KEY.pgdn,
+		'End':            key.KEY.end,
+		'Numpad1':        key.KEY.end,
+		'Home':           key.KEY.home,
+		'Numpad7':        key.KEY.home,
+		'ArrowLeft':      key.KEY.leftarrow,
+		'Numpad4':        key.KEY.leftarrow,
+		'ArrowUp':        key.KEY.uparrow,
+		'Numpad8':        key.KEY.uparrow,
+		'ArrowRight':     key.KEY.rightarrow,
+		'Numpad6':        key.KEY.rightarrow,
+		'ArrowDown':      key.KEY.downarrow,
+		'Numpad2':        key.KEY.downarrow,
+		'Insert':         key.KEY.ins,
+		'Numpad0':        key.KEY.ins,
+		'Delete':         key.KEY.del,
+		'NumpadDecimal':  key.KEY.del,
+		'Digit0': 48, 'Digit1': 49, 'Digit2': 50, 'Digit3': 51, 'Digit4': 52,
+		'Digit5': 53, 'Digit6': 54, 'Digit7': 55, 'Digit8': 56, 'Digit9': 57,
+		'Semicolon':      59,
+		'Equal':          61,
+		'KeyA': 97,  'KeyB': 98,  'KeyC': 99,  'KeyD': 100, 'KeyE': 101,
+		'KeyF': 102, 'KeyG': 103, 'KeyH': 104, 'KeyI': 105, 'KeyJ': 106,
+		'KeyK': 107, 'KeyL': 108, 'KeyM': 109, 'KeyN': 110, 'KeyO': 111,
+		'KeyP': 112, 'KeyQ': 113, 'KeyR': 114, 'KeyS': 115, 'KeyT': 116,
+		'KeyU': 117, 'KeyV': 118, 'KeyW': 119, 'KeyX': 120, 'KeyY': 121,
+		'KeyZ': 122,
+		'MetaLeft':       key.KEY.command,
+		'MetaRight':      key.KEY.command,
+		'NumpadMultiply': 42,
+		'NumpadAdd':      43,
+		'NumpadSubtract': 45,
+		'Minus':          45,
+		'NumpadDivide':   47,
+		'Slash':          47,
+		'F1':  key.KEY.f1,  'F2':  key.KEY.f2,  'F3':  key.KEY.f3,
+		'F4':  key.KEY.f4,  'F5':  key.KEY.f5,  'F6':  key.KEY.f6,
+		'F7':  key.KEY.f7,  'F8':  key.KEY.f8,  'F9':  key.KEY.f9,
+		'F10': key.KEY.f10, 'F11': key.KEY.f11, 'F12': key.KEY.f12,
+		'Comma':          44,
+		'Period':         46,
+		'Backquote':      96,
+		'BracketLeft':    91,
+		'Backslash':      92,
+		'IntlBackslash':  92, // UK extra key (between LShift and Z)
+		'BracketRight':   93,
+		'Quote':          39,
+	};
 
 	state.oldtime = Date.now() * 0.001;
 
 	print('Host.Init\n');
 
+	// Backend selection. The DEFAULT is the WASM sim on the MAIN THREAD (~1.7x faster server
+	// tick than the JS sim, bit-exact vs it); `-nowasm` opts back into the in-process JS
+	// server (kept as the A/B + fallback baseline). `-worker` must STAY OPT-IN, never a
+	// default: running the server on a Worker adds server-round-trip input latency (NQ has
+	// no client prediction to hide it) — see docs/server-worker.md. The sim choice composes
+	// with it (worker+WASM by default, worker+JS with -nowasm).
+	// Degradation stays graceful, with a game-console note: no WebAssembly -> JS server; the
+	// WASM sim failing to instantiate/trapping -> JS server (wasmServer.activate); a browser
+	// that can't spawn the module worker (older Firefox) -> server on the main thread.
+	// (`-wasm` remains accepted as a no-op for old links.)
+	let workerMode = args.indexOf('-worker') !== -1
+	let wasmMode = args.indexOf('-nowasm') === -1
+	if (wasmMode && typeof WebAssembly !== 'object') {
+		con.print('WebAssembly is not supported by this browser — using the JavaScript server.\n')
+		wasmMode = false
+	}
+	let workerServer: any = null
+	if (workerMode) {
+		try {
+			const { createWorkerServer } = await import('./net/workerServer')
+			workerServer = createWorkerServer()
+			// Surface the worker (server) console in the game console, like a non-worker server
+			// prints directly to it — otherwise server output (incl. the [sv_wasm] backend
+			// status) only reaches devtools and looks like nothing happened.
+			workerServer.onConsole = (t: string) => con.print(t)
+			// boot the worker with searchpath args only; every map (initial +map and
+			// later changelevels) is forwarded from this thread's map_f, so strip +map
+			// to avoid a double spawn.
+			const workerArgs: string[] = []
+			for (var wi = 0; wi < args.length; wi++) {
+				if (args[wi] === '+map') { wi++; continue }
+				workerArgs.push(args[wi])
+			}
+			// The worker host is `dedicated` (headless), which otherwise defaults to an
+			// 8-slot listen server -> maxclients>1 -> deathmatch 1, so monsters remove
+			// themselves and only items spawn. Single-player-over-worker hosts exactly
+			// one client (this renderer), so force maxclients=1 (deathmatch 0) unless
+			// the launch explicitly asked for more.
+			if (workerArgs.indexOf('-maxplayers') === -1)
+				workerArgs.push('-maxplayers', '1')
+			workerServer.boot(workerArgs)
+			// Wait for the worker to actually come up BEFORE choosing the network driver, so a
+			// worker that can't start (no module-worker support, etc.) falls back cleanly rather
+			// than hanging on a driver that never answers. `ready` rejects on the worker's
+			// onerror or a timeout (see createWorkerServer).
+			await workerServer.ready
+		} catch (e: any) {
+			con.print('Server worker unavailable (' + ((e && e.message) || e) + ') — running the server on the main thread.\n')
+			try { if (workerServer) workerServer.terminate() } catch (_e) { /* ignore */ }
+			workerServer = null
+			workerMode = false
+		}
+	}
+
 	try {
-		await host.init(false, assetStore, [loop, webrtc, webs]);
+		await host.init(false, assetStore,
+			workerMode ? [workerServer.driver, webrtc, webs] : [loop, webrtc, webs]);
 	}
 	catch (e) {
+		trackError(e.message, e.stack)
 		state.hooks.quit(e.message);
 		return
 	}
 
+	if (workerMode) {
+		host.state.workerServer = { sendCommand: (t: string) => workerServer.sendCommand(t), nextCmdDone: () => workerServer.nextCmdDone() }
+		// run the WASM sim ON the worker. The worker registers its own activator
+		// (serverWorker.ts); enable it by setting the server-side cvar over the cmd channel.
+		if (wasmMode) workerServer.sendCommand('sv_wasm 1')
+	} else {
+		// Main-thread server: register the WASM-sim backend (activated per-map by
+		// host.serverFrame when sv_wasm=1; falls back to sv.physics with a console note if it
+		// fails to instantiate — see wasmServer.activate / disableBackend).
+		const wasmSrv = await import('./net/wasmServer')
+		host.state.wasmServerActivate = () => wasmSrv.activate()
+		if (wasmMode) cvar.set('sv_wasm', '1')   // run the WASM sim in-process
+	}
+
+	// Announce the selected server sim, styled like the `Renderer:` line above it (in worker
+	// mode `sv_wasm` typed in the client console reads the main-thread copy, which stays 0 — the
+	// real server cvar lives on the worker — so this line is the reliable indicator). This is the
+	// INTENT at boot; the per-map truth follows at activation ("[sv_wasm] WASM server backend
+	// loaded (N edicts)") or on the fallback lines (load failure / mid-game trap → JS).
+	con.print('Server sim: ' + (wasmMode ? 'WASM' : 'JavaScript') + ' ('
+		+ (workerMode ? 'Web Worker' : 'main thread')
+		+ (wasmMode ? '' : (typeof WebAssembly !== 'object' ? ', WebAssembly unavailable' : ', -nowasm'))
+		+ ')\n')
+
+	// On mobile (touch) devices the warp FBO path has driver-specific issues on
+	// Android tile-based GPUs. Disable r_waterwarp so the world stays visible
+	// underwater. The console.log from scr.ts will show the FBO status for debugging.
+	const isTouchDevice = navigator.maxTouchPoints > 0 && window.matchMedia('(pointer: coarse)').matches
+	if (isTouchDevice) {
+		queueCommand('r_waterwarp 0')
+	}
+
+  // onpaste is an IDL handler attribute on Document, not Window - assigning it to
+  // window creates an inert expando the browser never invokes.
   const eventNames = Object.keys(events) as (keyof typeof events)[]
 	for (i = 0; i < eventNames.length; ++i){
-		window[eventNames[i] as any] = events[eventNames[i]] as any; // @ts-ignore
+		const target: any = eventNames[i] === 'onpaste' ? document : window;
+		target[eventNames[i]] = events[eventNames[i]] as any; // @ts-ignore
   }
-	const gameLoop: () => void = async () => {
-		var timeIn = new Date().getTime()
+	let rafLastTime = 0
+	const gameLoop = async (timestamp: number) => {
+		// Superseded by a newer init/dispose.
+		if (state.generation !== gen)
+			return;
+		// Skip frames that arrive before the maxfps interval has elapsed; 0 = uncapped
+		// (every rAF), matching host_maxfps 0 semantics -- not a 60fps fallback
+		if (cl.cvr.maxfps.value > 0) {
+			const minInterval = 1000 / cl.cvr.maxfps.value
+			if (timestamp - rafLastTime < minInterval - 1) {
+				requestAnimationFrame(gameLoop)
+				return
+			}
+		}
+		rafLastTime = timestamp
+
+		state.frameActive = true
 		try{
 			await host.frame();
-			if (com.state.inAsync) {
-				debugger
-			}
 		}
 		catch(e) {
 			if(e && e.message)
 			{
 				console.log(e && e.message)
 				console.log(e && e.stack)
+				trackError(e.message, e.stack)
 				debugger
 				quit(e.message)
 			}
 		}
+		finally {
+			state.frameActive = false
+		}
+
+		if (state.generation !== gen)
+			return;
 
 		if(state.quitStatus.quitting) {
 			var i;
 			const eventNames = Object.keys(events)
 			for (i = 0; i < eventNames.length; ++i)
-				window[eventNames[i] as any] = null; // @ts-ignore
+				((eventNames[i] === 'onpaste' ? document : window) as any)[eventNames[i]] = null;
 			host.shutdown();
-			document.body.style.cursor = 'auto';
 			if (state.hooks && state.hooks.quit) {
 				state.hooks.quit(state.quitStatus.reason || '');
 			}
 			return;
 		}
-		
-		// return window.requestAnimationFrame(gameLoop)
 
-		var timeOut = new Date().getTime()
-		var putzAroundTime = Math.max((1000.0 / (cl.cvr.maxfps.value || 60)) - (timeOut - timeIn), 1);
-		return setTimeout(gameLoop, putzAroundTime);
+		requestAnimationFrame(gameLoop)
 	}
 
-	gameLoop();
+	requestAnimationFrame(gameLoop);
 };
 
 const events = {
@@ -308,6 +560,7 @@ const events = {
   onmousedown,
   onmouseup,
   onmousewheel,
+  onpaste,
   onunload,
   onwheel
 }
@@ -326,6 +579,21 @@ export const print = function(text: string)
 export const quit = function(reason? : string)
 {
 	state.quitStatus = {quitting: true, reason}
+};
+
+// Stops the running engine instance without the UI quit hook; drains any in-flight frame.
+export const dispose = async function()
+{
+	++state.generation;
+	while (state.frameActive)
+		await new Promise(resolve => setTimeout(resolve, 10));
+	// isdown: a regular quit already tore down through the game loop; !initialized: never ran.
+	if (host.state.isdown || !host.state.initialized)
+		return;
+	const eventNames = Object.keys(events)
+	for (var i = 0; i < eventNames.length; ++i)
+		((eventNames[i] === 'onpaste' ? document : window) as any)[eventNames[i]] = null;
+	host.shutdown();
 };
 
 export const error = function(text: string)
@@ -349,3 +617,38 @@ export const requestPak = () => {
 	}
 	return Promise.resolve()
 }
+
+export const nameChanged = (name: string) => {
+	state.hooks.nameChanged?.(name)
+}
+
+export const queueCommand = (command: string) => {
+	cmd.state.text += command + '\n'
+}
+
+export const sendMouseDelta = (x: number, y: number) => {
+	input.addMouseDelta(x, y)
+}
+
+export const sendKeyEvent = async (keyCode: number, down: boolean) => {
+	await key.event(keyCode, down)
+}
+
+export const getKeyDest = (): number => {
+	return key.state.dest
+}
+
+// Key code constants for touch controls
+export const TOUCH_KEYS = {
+	uparrow: key.KEY.uparrow,
+	downarrow: key.KEY.downarrow,
+	leftarrow: key.KEY.leftarrow,
+	rightarrow: key.KEY.rightarrow,
+	enter: key.KEY.enter,
+	escape: key.KEY.escape,
+	mwheelup: key.KEY.mwheelup,
+	mwheeldown: key.KEY.mwheeldown,
+}
+
+export const KEY_DEST_GAME = 0
+export const KEY_DEST_MENU = 3

@@ -31,3 +31,7 @@ export const getExternalCommand = (): string => {
 export const requestPak = () => {
 	return sysImpl.requestPak()
 }
+
+export const nameChanged = (name: string): void => {
+	sysImpl.nameChanged?.(name)
+}

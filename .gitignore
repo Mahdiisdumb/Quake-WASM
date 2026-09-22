@@ -21,7 +21,12 @@ hw
 halloween
 *.log
 *.local
+.claude
 lq1
 fbca
 qoetia
 copper
+tsconfig.node.tsbuildinfo
+wasm-sim/build/
+mg1
+mg3

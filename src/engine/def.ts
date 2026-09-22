@@ -1,9 +1,17 @@
-export const webquake_version = 61;
-export const timedate = 'Exe: 12:40:00 Jan 29 2025\n';
+export const webquake_version = 74;
+export const timedate = 'Exe: 14:30:00 Aug 6 2026\n';
 
-export const max_edicts = 8192;
+export const max_edicts = 32000; // hard cap (QuakeSpasm/Ironwail MAX_EDICTS) — huge modern maps
+export const initial_edicts = 8192; // pre-allocated per map; sv.alloc grows lazily up to max_edicts
 export const max_vis_edicts = 4096;
-export const max_message = 65536
+// Reliable/signon buffers must hold a whole map's baselines + precache lists; huge
+// modern maps (Immortal Lock) blow past the classic ~64KB. The netchan fragments
+// reliable messages for transmission, so a large buffer is safe. cursize tracks
+// actual use, so the extra capacity on per-frame datagram buffers costs only memory.
+export const max_message = 2097152
+
+// QSS client.h MAX_CL_STATS: cl.stats[]/statsf[]/statss[] sizing (getstati/getstatf/getstats).
+export const MAX_CL_STATS = 256;
 
 export const STAT = {
   health: 0,
@@ -20,7 +28,12 @@ export const STAT = {
   totalsecrets: 11,
   totalmonsters: 12,
   secrets: 13,
-  monsters: 14
+  monsters: 14,
+  // csqc-visible mirrors of clientdata fields (QSS quakedef.h:134-143): the engine keeps its own
+  // clState copies; these stat slots exist so getstati/getstatf answer like QSS's.
+  items: 15,
+  viewheight: 16,
+  idealpitch: 25
 };
 
 export const IT = {
@@ -109,7 +122,10 @@ export const TEX = {
   missing: 2		// johnfitz -- this texinfo does not have a textur
 }
 
-export const VERTEXSIZE =	7
+export const VERTEXSIZE =	11
+// floats per vertex in a Model.polyVertData staging buffer (xyz + diffuse st +
+// lightmap st); the VBO adds 4 style indices to reach VERTEXSIZE
+export const POLY_VERT_STRIDE = 7
 
 export const TEXPREF = {
   none: 0x000,
@@ -125,7 +141,8 @@ export const TEXPREF = {
   fullbright: 0x0100, // use fullbright mask palette
   nobright: 0x0200,   // use nobright mask palette
   conchars: 0x0400,   //use conchars palette
-  warpimage: 0x0800    // resize this texture when warpimagesize changes
+  warpimage: 0x0800,   // resize this texture when warpimagesize changes
+  skin: 0x1000        // alias skin: fullbright indices get alpha 0 (shader lighting mask)
 }
 
 export const MOD = {

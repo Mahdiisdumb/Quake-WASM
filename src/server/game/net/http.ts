@@ -1,13 +1,10 @@
-import * as https from 'https'
 import * as http from 'http'
 import * as host from '../../../engine/host'
 import * as pr from '../../../engine/pr'
-import * as con from '../../../engine/console'
 import * as net from '../../../engine/net'
 import * as sv from '../../../engine/sv'
 import * as sys from '../sys'
 import * as url from 'url'
-import * as q from '../../../engine/q'
 import * as cvar from '../../../engine/cvar'
 
 const htmlSpecialChars = function (str: string) {
@@ -53,7 +50,7 @@ const createQueryResponse = () => {
     hostname: htmlSpecialChars(net.cvr.hostname.string),
     maxPlayers: sv.state.svs.maxclients.toString(),
     players: getActivePlayers(),
-    map: pr.getString(pr.state.globals_int[pr.globalvars.mapname]),
+    map: pr.getString(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.mapname], pr.vms.ssqc),
     serverSettings: JSON.stringify(getCvars()),
     version: 3
   }
@@ -71,17 +68,12 @@ const onRequest = (request: http.IncomingMessage, response: http.ServerResponse)
   if (request.method === 'OPTIONS') {
     return sendOptions(request, response)
   }
-  if (sv.state.server.active !== true) {
-    response.statusCode = 503;
-    response.end();
-    return;
-  }
-  const pathParams = url.parse(request.url).pathname.split('/');
-  if (pathParams.length === 0) {
-    response.statusCode = 501;
-    response.end();
-    return;
-  } else if (pathParams[1] === 'ping') {
+  const pathname = url.parse(request.url).pathname;
+  const pathParams = pathname.split('/');
+  const lastParam = pathParams[pathParams.length - 1];
+
+  // Ping responds regardless of server state (health check)
+  if (lastParam === 'ping') {
     if (request.method === 'GET' || request.method === 'HEAD') {
       response.statusCode = 200;
       response.setHeader('Access-Control-Allow-Origin', '*');
@@ -98,7 +90,15 @@ const onRequest = (request: http.IncomingMessage, response: http.ServerResponse)
       response.write("Method not allowed")
       response.end();
     }
-  } else if (pathParams[1] === 'status') {
+  }
+
+  if (sv.state.server.phase !== 'active') {
+    response.statusCode = 503;
+    response.end();
+    return;
+  }
+
+  if (lastParam === 'status') {
     if (request.method === 'GET' || request.method === 'HEAD') {
       response.statusCode = 200;
       response.setHeader('Content-Type', 'application/json; charset=UTF-8');
@@ -112,7 +112,7 @@ const onRequest = (request: http.IncomingMessage, response: http.ServerResponse)
       response.write("Method not allowed")
       response.end();
     }
-  } else if (pathParams[1] === 'mastervalidate') {
+  } else if (lastParam === 'mastervalidate') {
     if (request.method === 'POST') {
       response.statusCode = 400;
       response.setHeader('Content-Type', 'application/json; charset=UTF-8');
@@ -135,7 +135,7 @@ const onRequest = (request: http.IncomingMessage, response: http.ServerResponse)
       response.write("Method not allowed")
       response.end();
     }
-  } else if (pathParams[1] === 'rcon') {
+  } else if (lastParam === 'rcon') {
     var data;
     try {
       data = decodeURIComponent(pathParams.slice(2).join('/')).split('\n')[0];
@@ -192,51 +192,3 @@ export const createHttpServer = (port: number) => {
   return server
 }
 
-export const registerWithMaster = () => {
-  const gameVar = cvar.findVar('game')
-  const masterServer = host.cvr.web_masterserver.string
-  if (!masterServer) {
-    return
-  }
-  const serverPost = JSON.stringify({
-    serverId: host.state.serverId,
-    game: gameVar && gameVar.string || '',
-    name: net.cvr.hostname.string,
-    connecthostport: net.cvr.web_connect_url.string,
-    location: host.cvr.web_location.string,
-    description: host.cvr.web_description.string
-  })
-
-  const options = {
-    ...url.parse(masterServer + '/api/server'),
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8'
-    }
-  }
-
-  const postReq = https.request(options, resp => {
-    resp.on('data', (data: Buffer) => {
-      const statusCode = resp.statusCode
-      const text = data.toString('ascii')
-      if (statusCode === 200) {
-        const resp = JSON.parse(text)
-        con.print('Master server: ' + resp.message + '\n')
-      } else {
-        if (statusCode === 404) {
-          con.print('Master server not found\n');
-        } else if (Math.floor(statusCode / 100) === 4) {
-          con.print('Data error connecting to Master Server\n');
-        } else if (Math.floor(statusCode / 100) === 5) {
-          con.print('Error with master server\n');
-        }
-      }
-    });
-  }).on("error", (err) => {
-    con.print('Error updated master server: ' + err.message + '\n');
-  });
-
-  // post the data
-  postReq.write(serverPost);
-  postReq.end();
-}

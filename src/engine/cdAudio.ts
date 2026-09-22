@@ -5,16 +5,74 @@ import * as com from './com'
 import * as q from './q'
 import * as cvar from './cvar'
 
-const known: string[] = [];
+const EXTENSIONS = ['.ogg', '.mp3', '.wav', '.flac'];
+const MIME_TYPES: Record<string, string> = {
+  '.ogg': 'audio/ogg',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.flac': 'audio/flac',
+};
+
+// Cache of track number or filename → blob URL; null = confirmed miss. A full miss
+// probes up to 8 candidate paths through the asset store (IndexedDB reads that queue
+// behind package-install writes, plus a remote file-list fetch), so misses must not be
+// re-paid on every map load. The whole cache flushes when the searchpath/pak set
+// changes (package install, gamedir switch) — a hit kept across a gamedir switch
+// plays the OLD mod's music.
+const trackCache: Record<string, string | null> = {};
 
 const state = {
 
 } as any;
+
+const searchpathEpoch = () => {
+  let e = '';
+  for (const s of com.state.searchpaths)
+    e += s.dir + ':' + (s.packs != null ? s.packs.length : 0) + ',';
+  return e;
+};
+
+const findAudioFile = async (basePath: string): Promise<string | null> => {
+  const epoch = searchpathEpoch();
+  if (epoch !== state.trackCacheEpoch) {
+    state.trackCacheEpoch = epoch;
+    const playing = state.cd != null ? state.cd.src : null;
+    for (const k in trackCache) {
+      const url = trackCache[k];
+      // Don't revoke the blob under a still-playing Audio element.
+      if (url != null && url !== playing)
+        URL.revokeObjectURL(url);
+      delete trackCache[k];
+    }
+  }
+  if (basePath in trackCache) return trackCache[basePath];
+  for (const ext of EXTENSIONS) {
+    const data = await com.loadFile(basePath + ext);
+    if (data) {
+      const blob = new Blob([data], { type: MIME_TYPES[ext] });
+      const url = URL.createObjectURL(blob);
+      trackCache[basePath] = url;
+      return url;
+    }
+  }
+  trackCache[basePath] = null;
+  return null;
+};
+
+// QuakeSpasm convention (music/track02.ogg) first — what paks/mods ship —
+// then the legacy hosted path (media/quake02.ogg).
+const findTrack = async (trackNum: number): Promise<string | null> => {
+  const padded = (trackNum <= 9 ? '0' : '') + trackNum;
+  return await findAudioFile('music/track' + padded)
+    ?? findAudioFile('media/quake' + padded);
+};
+
 export const play = async function(track: number, looping: boolean)
 {
   if ((state.initialized !== true) || (state.enabled !== true))
     return;
-  track -= 2;
+  if (track <= 0)
+    return;
   if (state.playTrack === track)
   {
     if (state.cd != null)
@@ -25,14 +83,22 @@ export const play = async function(track: number, looping: boolean)
     }
     return;
   }
-  if ((track < 0) || (track >= known.length))
+  // QSS-M BGM_PlayCDtrack stops the current music BEFORE trying the new track, so a map change
+  // whose track is missing goes silent instead of carrying the previous map's song. stop() also
+  // bumps playSeq, superseding any older play() still in its async lookup; capture ours after it.
+  stop();
+  var seq = state.playSeq;
+  var url = await findTrack(track);
+  if (seq !== state.playSeq)
+    return;
+  if (url == null)
   {
-    con.dPrint('CDAudio.Play: Bad track number ' + (track + 2) + '.\n');
+    if (track > 1)
+      con.dPrint('CDAudio.Play: track ' + track + ' not found\n');
     return;
   }
-  stop();
   state.playTrack = track;
-  state.cd = new Audio(known[track]);
+  state.cd = new Audio(url);
   state.cd.loop = looping;
   state.cd.volume = state.cdvolume;
   await state.cd.play().catch(() => {});
@@ -42,6 +108,7 @@ export const stop = function()
 {
   if ((state.initialized !== true) || (state.enabled !== true))
     return;
+  state.playSeq = (state.playSeq | 0) + 1;  // supersede any play() still in its lookup
   if (state.cd != null)
     state.cd.pause();
   state.playTrack = null;
@@ -62,6 +129,32 @@ export const resume = async function()
     return;
   if (state.cd != null)
     await state.cd.play().catch(() => {});
+};
+
+const music_f = async function()
+{
+  if (cmd.state.argv.length < 2)
+    return;
+  var filename = cmd.state.argv[1];
+  // Strip quotes if present
+  if (filename.startsWith('"') && filename.endsWith('"'))
+    filename = filename.slice(1, -1);
+  var url = await findAudioFile(filename);
+  if (url == null && !filename.startsWith('music/'))
+    url = await findAudioFile('music/' + filename);
+  if (url == null && !filename.startsWith('media/'))
+    url = await findAudioFile('media/' + filename);
+  if (url == null)
+  {
+    con.dPrint('music: ' + filename + ' not found\n');
+    return;
+  }
+  stop();
+  state.playTrack = -1;
+  state.cd = new Audio(url);
+  state.cd.loop = true;
+  state.cd.volume = state.cdvolume;
+  await state.cd.play().catch(() => {});
 };
 
 export const cd_f = async function()
@@ -94,11 +187,10 @@ export const cd_f = async function()
     await resume();
     return;
   case 'info':
-    con.print(known.length + ' tracks\n');
     if (state.cd != null)
     {
       if (state.cd.paused !== true)
-        con.print('Currently ' + (state.cd.loop === true ? 'looping' : 'playing') + ' track ' + (state.playTrack + 2) + '\n');
+        con.print('Currently ' + (state.cd.loop === true ? 'looping' : 'playing') + ' track ' + state.playTrack + '\n');
     }
     con.print('Volume is ' + state.cdvolume + '\n');
     return;
@@ -120,42 +212,11 @@ export const update = function()
     state.cd.volume = state.cdvolume;
 };
 
-export const trackExists = async function(trackPath: string) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('HEAD', '/' + trackPath);
-    xhr.onload = () => {
-      resolve({
-        status: xhr.status
-      });
-    }
-    xhr.onerror = (e) => reject(e) 
-    xhr.send();
-  })
-}
-
 export const init = async function()
 {
   cmd.addCommand('cd', cd_f);
+  cmd.addCommand('music', music_f);
   if (com.checkParm('-nocdaudio') != null)
-    return;
-  var i, j, track;
-  for (i = 1; i <= 99; ++i)
-  {
-    track = '/media/quake' + (i <= 9 ? '0' : '') + i + '.ogg';
-    for (j = com.state.searchpaths.length - 1; j >= 0; --j)
-    {
-      const exists = await trackExists(com.state.searchpaths[j].dir + track) as any
-      if ((exists.status >= 200) && (exists.status <= 299))
-      {
-        known[i - 1] = com.state.searchpaths[j].dir + track;
-        break;
-      }
-    }
-    if (j < 0)
-      break;
-  }
-  if (known.length === 0)
     return;
   state.initialized = state.enabled = true;
   update();

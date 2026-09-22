@@ -1,69 +1,153 @@
 <template lang="pug">
-.modal.active
-  a.modal-overlay(@click="closeDialog")
+.modal-overlay(@click.self="emit('cancel')")
   .modal-container
     .modal-header
-      a.btn.btn-clear.float-right(aria-label='Close' @click="emit('cancel')")
-      .modal-title.h5 Create New Package
+      span.modal-title Create Package
+      button.modal-close(@click="emit('cancel')")
+        font-awesome-icon(icon="fa-solid fa-xmark")
     .modal-body
-      .form-group
-        label.form-label Package Name
-        input.form-input(
+      .field
+        label.field-label Package Name
+        input.field-input(
           v-model="model.name"
-          placeholder="Enter package name"
+          placeholder="e.g. my_maps"
+          @keyup.enter="model.name.trim() && emit('create', { ...model })"
+          autofocus
         )
-      .form-group
-        label.form-label Game Directory
-        input.form-input(
-          v-model="model.gameDir"
-          placeholder="id1"
-        )
-        p.form-input-hint The directory where maps/mods will be mounted in the game (defaults to "id1")
+      .field
+        label.field-label Game Directory
+        input.field-input(v-model="model.gameDir" placeholder="id1")
+        p.field-hint Assets will be mounted under this directory
     .modal-footer
-      button.btn(@click="emit('cancel')") Cancel
-      button.btn.btn-primary(@click="emit('create', model)" :disabled="!model.name.trim()")
-        | Create Package
-
+      button.btn-ghost-sm(@click="emit('cancel')") Cancel
+      button.btn-save(:disabled="!model.name.trim()" @click="emit('create', { ...model })") Create Package
 </template>
-<script setup lang="ts">
-import { ref, reactive, defineEmits } from 'vue';
 
-const model = reactive<{
-  name: string,
-  gameDir: string
-}>({
-  name: '',
-  gameDir: 'id1'
-})
+<script lang="ts" setup>
+import { reactive } from 'vue'
 
+const randomGameDir = () => 'pkg' + Math.random().toString(36).substring(2, 9)
+const model = reactive<{ name: string; gameDir: string }>({ name: '', gameDir: randomGameDir() })
 const emit = defineEmits<{
-  (e: 'cancel'): void,
-  (e: 'create', newPackage: {name: string, gameDir: string}): void
+  (e: 'cancel'): void
+  (e: 'create', pkg: { name: string; gameDir: string }): void
 }>()
 </script>
 
-<style lang="scss" module>
-.modal {
-  .modal-container {
-    max-width: 400px;
-    
-    
-    .form-group {
-      margin-bottom: 1rem;
-      
-      .form-label {
-        font-weight: 500;
-        margin-bottom: 0.5rem;
-        display: block;
-      }
-      
-      .form-input-hint {
-        font-size: 0.875rem;
-        margin-top: 0.25rem;
-        margin-bottom: 0;
-      }
-    }
-    
-  }
+<style lang="scss" scoped>
+@import '../../../../../scss/tokens';
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+
+.modal-container {
+  background: $palette-surface;
+  border: $border-subtle;
+  width: 100%;
+  max-width: 400px;
+  margin: 0 16px;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: $border-subtle;
+}
+
+.modal-title {
+  font-size: $font-base;
+  font-weight: $fw-bold;
+  color: $palette-bright;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: $palette-muted;
+  font-size: $font-base;
+  padding: 4px;
+  transition: $transition-color;
+  &:hover { color: $palette-bright; }
+}
+
+.modal-body { padding: 20px; }
+
+.field { margin-bottom: 16px; &:last-child { margin-bottom: 0; } }
+
+.field-label {
+  display: block;
+  font-size: $font-xs;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-labels;
+  color: $palette-muted;
+  margin-bottom: 6px;
+}
+
+.field-input {
+  width: 100%;
+  background: $palette-body;
+  border: $border-subtle;
+  color: $palette-text;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: $font-sm;
+  padding: 8px 12px;
+  outline: none;
+  &:focus { border-color: $palette-muted; }
+}
+
+.field-hint {
+  font-size: $font-2xs;
+  color: $palette-muted;
+  margin-top: 6px;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 16px 20px;
+  border-top: $border-subtle;
+}
+
+.btn-ghost-sm {
+  font-family: inherit;
+  font-size: $font-xs;
+  font-weight: $fw-bold;
+  letter-spacing: $tracking-links;
+  text-transform: uppercase;
+  padding: 7px 16px;
+  background: transparent;
+  border: $border-subtle;
+  color: $palette-muted;
+  cursor: pointer;
+  transition: all 0.15s;
+  &:hover { color: $palette-bright; border-color: $palette-text; }
+}
+
+.btn-save {
+  font-family: inherit;
+  font-size: $font-xs;
+  font-weight: $fw-bold;
+  letter-spacing: $tracking-links;
+  text-transform: uppercase;
+  padding: 7px 16px;
+  background: $palette-red;
+  color: $palette-bright;
+  border: none;
+  cursor: pointer;
+  transition: $transition-bg;
+  &:hover:not(:disabled) { background: lighten($palette-red, 6%); }
+  &:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 </style>

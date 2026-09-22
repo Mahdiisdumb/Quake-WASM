@@ -9,10 +9,11 @@ import { FileMode } from '../../engine/interfaces/store/IAssetStore'
 import * as path from 'path'
 import { PackedFile } from '../../engine/types/Com'
 
-const modeMap = {
+const modeMap: Record<FileMode, string> = {
 	[FileMode.READ]: 'r',
 	[FileMode.APPEND]: 'w+',
-	[FileMode.WRITE]: 'w'
+	[FileMode.WRITE]: 'w',
+	[FileMode.READNL]: 'r'	// same open as READ; only fgets' line handling differs
 }
 
 export const openFile = (filename: string, mode: FileMode) => {
@@ -36,10 +37,19 @@ export const readFile = (filename: string) => {
 		})
 }
 
+// Create the target's parent directory (e.g. autosave/) before writing
+const ensureDir = (filename: string) =>
+{
+	const dir = path.dirname(filename)
+	return (dir && dir !== '.' && dir !== '/' ? fs.mkdir(dir, {recursive: true}) : Promise.resolve(undefined))
+}
+
 export const writeFile = (filename: string, data: Uint8Array, len: number) =>
 {
-	return fs.open(filename, 'a')
-		.then(fd => fs.writeFile(fd, data.slice(0, len)))
+	// fs.writeFile on a path truncates; the old fs.open(filename, 'a') appended,
+	// so every savegame grew the file and loads parsed the stale head
+	return ensureDir(filename)
+		.then(() => fs.writeFile(filename, data.slice(0, len)))
 		.then(() => true)
 		.catch(err => {
 			sys.print(`Could not write '${filename}' to filesystem: ${err.message}\n`);
@@ -49,8 +59,8 @@ export const writeFile = (filename: string, data: Uint8Array, len: number) =>
 
 export const writeTextFile = (filename: string, data: string) =>
 {
-	return fs.open(filename, 'a')
-		.then(fd => fs.writeFile(fd, data))
+	return ensureDir(filename)
+		.then(() => fs.writeFile(filename, data))
 		.then(() => true)
 		.catch(err => {
 			sys.print(`Could not write '${filename}' to filesystem: ${err.message}\n`);
@@ -58,8 +68,16 @@ export const writeTextFile = (filename: string, data: string) =>
 		})
 }
 
+export const deleteFile = (filename: string): Promise<void> =>
+{
+	return fs.unlink(filename)
+		.catch(err => {
+			sys.print(`Could not delete '${filename}': ${err.message}\n`);
+		})
+}
 
-export const loadFile = async function(filename: string)
+
+export const loadFileSync = function(filename: string): ArrayBuffer | null
 {
 	var src, i, j, k, search, pak, file, fd;
 	for (i = com.state.searchpaths.length - 1; i >= 0; --i)
@@ -105,7 +123,7 @@ export const loadFile = async function(filename: string)
 	if (src == null)
 	{
 		sys.print('FindFile: can\'t find ' + filename + '\n');
-		return;
+		return null;
 	}
 	var size = src.length;
 	var dest = new ArrayBuffer(size), view = new DataView(dest);
@@ -138,6 +156,39 @@ export const loadFile = async function(filename: string)
 	}
 	return dest;
 };
+
+export const listFiles = function(prefix: string): string[]
+{
+	prefix = prefix.toLowerCase();
+	var dir = prefix.substring(0, prefix.lastIndexOf('/') + 1);
+	var names: string[] = [], i, j, entries;
+	for (i = 0; i < com.state.searchpaths.length; ++i)
+	{
+		try
+		{
+			entries = fsBase.readdirSync(com.state.searchpaths[i].dir + '/' + dir);
+		}
+		catch (e)
+		{
+			continue;
+		}
+		for (j = 0; j < entries.length; ++j)
+		{
+			var name = (dir + entries[j]).toLowerCase();
+			if (name.substring(0, prefix.length) === prefix)
+				names[names.length] = name;
+		}
+	}
+	return names;
+};
+
+export const loadFile = async function(filename: string)
+{
+	return loadFileSync(filename);
+};
+
+export const saveDownloadedFile = async (_game: string, _filename: string, _data: ArrayBuffer): Promise<void> => {
+}
 
 export const loadPackFile = async (dir: string, packName: string) : Promise<{name: string, data: ArrayBuffer, type: string, contents: PackedFile[]}> => {
 	const packfile = dir + '/' + packName

@@ -1,5 +1,6 @@
 import * as sys from './sys'
 import * as con from './console'
+import * as sz from './sz'
 import * as cl from './cl'
 import * as host from './host'
 import * as sv from './sv'
@@ -13,27 +14,7 @@ import ISocket from './interfaces/net/ISocket'
 import IDatagram from './interfaces/net/IDatagram'
 import INetworkDriver from './interfaces/net/INetworkDriver'
 import { CVars } from './cvar'
-
-const NQ_NETCHAN_GAMENAME			= "QUAKE"
-const NQ_NETCHAN_VERSION			= 3
-const NQ_NETCHAN_VERSION_QEX		= 4	//the rerelease's id, used for nqish-over dtls.
-
-const NETFLAG_LENGTH_MASK				= 0x0000ffff
-const NETFLAG_DATA						= 0x00010000
-const NETFLAG_ACK						= 0x00020000
-const NETFLAG_NAK						= 0x00040000
-const NETFLAG_EOM						= 0x00080000
-const NETFLAG_UNRELIABLE				= 0x00100000
-const NETFLAG_ZLIB						= 0x00200000	//QEx - payload contains the real (full) packet
-const NETFLAG_CTL						= 0x80000000
-
-const CCREQ_CONNECT					= 0x01
-const CCREQ_SERVER_INFO				= 0x02
-const CCREQ_PLAYER_INFO				= 0x03
-const CCREQ_RULE_INFO				= 0x04
-const CCREQ_PROQUAKE_RCON			= 0x05
-
-const QW_GETCHALLENGE = "\xff\xff\xff\xffgetchallenge\n"
+import * as nqnetchan from './nqnetchan'
 
 export const activeSockets: ISocket[] = [];
 
@@ -56,7 +37,7 @@ interface NetState {
 export let state: NetState = {
 	listening: false,
 	drivers: [],
-  message: {data: new ArrayBuffer(def.max_message), cursize: 0},
+  message: sz.newDatagram(def.max_message),
 	activeconnections: 0,
 	time: 0,
 	driverlevel: 0,
@@ -71,7 +52,7 @@ export const initState = () => {
 	state = {
 		listening: false,
 		drivers: [],
-		message: {data: new ArrayBuffer(def.max_message), cursize: 0},
+		message: sz.newDatagram(def.max_message),
 		activeconnections: 0,
 		time: 0,
 		driverlevel: 0,
@@ -170,6 +151,8 @@ export const checkForResend = async function()
 			close(state.newsocket);
 			cl.cls.state = cl.ACTIVE.disconnected;
 			con.print('No Response\n');
+			if (cl.state.host !== host.getConnectUrl())
+				return;
 			await host.error('NET.CheckForResend: connect failed\n');
 		}
 	}
@@ -177,44 +160,26 @@ export const checkForResend = async function()
 	if (ret === 1)
 	{
 		state.newsocket.disconnected = false;
+
+		if (state.newsocket.protocol === 'nqnetchan') {
+			const sock = state.newsocket
+			if (!sock.ccreqSent) {
+				const ccreq = nqnetchan.buildCCREQ()
+				dfunc.sendMessage(sock, { data: ccreq, cursize: ccreq.byteLength })
+				sock.ccreqSent = true
+			}
+			for (let i = 0; i < sock.receiveMessage.length; i++) {
+				if (nqnetchan.isCCREPAccept(sock.receiveMessage[i])) {
+					sock.receiveMessage.splice(i, 1)
+					sock.canSend = true
+					cl.connect(sock)
+					return
+				}
+			}
+			return
+		}
+
 		cl.connect(state.newsocket);
-		
-		// // Send CCREQ
-		// const dgram: IDatagram = {
-		// 	data: new ArrayBuffer(def.max_message),
-		// 	cursize: 0
-		// }
-
-		// msg.writeLong(dgram, 0); // Reserve space
-		// msg.writeByte(dgram, CCREQ_CONNECT);
-		// msg.writeString(dgram, NQ_NETCHAN_GAMENAME);
-		// msg.writeByte(dgram, NQ_NETCHAN_VERSION)
-		
-		// msg.writeByte(dgram, 1); /*'mod'*/
-		// msg.writeByte(dgram, 34); /*'mod' version*/
-		// msg.writeByte(dgram, 0); /*flags*/
-		// msg.writeLong(dgram, 0); //pwd); /*password*/
-
-		// (new DataView(dgram.data)).setInt32(0, com.longSwap(NETFLAG_CTL | (dgram.data.byteLength)), true)
-		// dfunc.sendMessage(state.newsocket, dgram)
-
-		// dgram.cursize = 0
-		// msg.writeString(dgram, QW_GETCHALLENGE)
-		// dfunc.sendMessage(state.newsocket, dgram)
-		
-		// const startTime = host.state.realtime
-		// while (host.state.realtime - startTime < 2.5) {
-		// 	if (dfunc.getMessage(state.newsocket) === 1) {
-		// 		const control = com.longSwap(msg.readLong());
-		// 		const test = msg.readString();
-		// 		if (test === QW_GETCHALLENGE) {
-		// 			const challenge = msg.readString();
-		// 			con.print('Challenge: ' + challenge + '\n');
-		// 			break;
-		// 		}
-		// 	}
-		// 	await new Promise(resolve => setTimeout(resolve, 10))
-		// }
 	}
 	else if (ret === -1)
 	{
@@ -222,6 +187,10 @@ export const checkForResend = async function()
 		close(state.newsocket);
 		cl.cls.state = cl.ACTIVE.disconnected;
 		con.print('Network Error\n');
+		// A console-initiated connect drops to the console (vanilla Host_Error behavior);
+		// only the -connect launch flow ends the session so the app can show the failure.
+		if (cl.state.host !== host.getConnectUrl())
+			return;
 		await host.error('NET.CheckForResend: connect failed\n');
 	}
 };
@@ -262,21 +231,74 @@ export const getMessage = function(sock: ISocket)
 		return -1;
 	}
 	state.time = sys.floatTime();
-	var ret = state.drivers[sock.driver].getMessage(sock);
-	if (sock.driver !== 0)
+	// nqnetchan packets that don't yield a deliverable message (ACKs, partial
+	// fragments, duplicates) must not end the caller's read loop for this frame
+	// — keep consuming the socket queue until it is empty or a message is ready
+	// (vanilla Datagram_GetMessage semantics).
+	for (;;)
 	{
-		if (ret === 0)
+		var ret = state.drivers[sock.driver].getMessage(sock);
+		if (sock.driver !== 0)
 		{
-			if ((state.time - sock.lastMessageTime) > cvr.messagetimeout.value)
+			if (ret === 0)
 			{
-				close(sock);
-				return -1;
+				if ((state.time - sock.lastMessageTime) > cvr.messagetimeout.value)
+				{
+					close(sock);
+					return -1;
+				}
 			}
+			else if (ret > 0)
+				sock.lastMessageTime = state.time;
 		}
-		else if (ret > 0)
-			sock.lastMessageTime = state.time;
+		if (ret <= 0 || sock.protocol !== 'nqnetchan')
+			return ret;
+		const pkt = nqnetchan.parse(state.message.data, state.message.cursize)
+		if (pkt.type === 'ack') {
+			sock.canSend = true
+			continue
+		}
+		if (pkt.type === 'data') {
+			const driver = state.drivers[sock.driver]
+			driver.sendMessage(sock, { data: nqnetchan.buildACK(pkt.sequence), cursize: 8 })
+			if (pkt.sequence !== sock.receiveSequence) {
+				console.warn(`[nqnetchan] out-of-order DATA seq=${pkt.sequence} expected=${sock.receiveSequence}`)
+				continue
+			}
+			sock.receiveSequence++
+			// Accumulate fragments; only deliver once EOM is set
+			if (sock.fragmentBuffer) {
+				const merged = new Uint8Array(sock.fragmentBuffer.length + pkt.payload.length)
+				merged.set(sock.fragmentBuffer)
+				merged.set(pkt.payload, sock.fragmentBuffer.length)
+				sock.fragmentBuffer = merged
+			} else {
+				sock.fragmentBuffer = new Uint8Array(pkt.payload)
+			}
+			if (!pkt.eom) continue
+			const complete = sock.fragmentBuffer
+			sock.fragmentBuffer = undefined
+			if (complete.length > state.message.data.byteLength) {
+				state.message.cursize = state.message.data.byteLength
+				sz.u8(state.message).set(complete.subarray(0, state.message.data.byteLength))
+				return 1
+			}
+			state.message.cursize = complete.length
+			sz.u8(state.message).set(complete)
+			return 1
+		}
+		if (pkt.type === 'unreliable') {
+			state.message.cursize = pkt.payload.length
+			sz.u8(state.message).set(pkt.payload)
+			return 2
+		}
+		if (pkt.type === 'ctl') {
+			state.message.cursize = pkt.payload.length
+			sz.u8(state.message).set(pkt.payload)
+			return 1
+		}
+		console.warn('[nqnetchan] unknown packet type:', pkt.type, 'size:', state.message.cursize)
 	}
-	return ret;
 };
 
 export const sendMessage = function(sock: ISocket, data: IDatagram)
@@ -289,6 +311,11 @@ export const sendMessage = function(sock: ISocket, data: IDatagram)
 		return -1;
 	}
 	state.time = sys.floatTime();
+	if (sock.protocol === 'nqnetchan') {
+		const buf = nqnetchan.wrapData(data, sock.sendSequence++)
+		sock.canSend = false
+		return state.drivers[sock.driver].sendMessage(sock, { data: buf, cursize: buf.byteLength })
+	}
 	return state.drivers[sock.driver].sendMessage(sock, data);
 };
 
@@ -302,6 +329,10 @@ export const sendUnreliableMessage = function(sock: ISocket, data: IDatagram)
 		return -1;
 	}
 	state.time = sys.floatTime();
+	if (sock.protocol === 'nqnetchan') {
+		const buf = nqnetchan.wrapUnreliable(data, sock.unreliableSendSequence++)
+		return state.drivers[sock.driver].sendUnreliableMessage(sock, { data: buf, cursize: buf.byteLength })
+	}
 	return state.drivers[sock.driver].sendUnreliableMessage(sock, data);
 };
 
@@ -312,6 +343,9 @@ export const canSendMessage = function(sock: ISocket)
 	if (sock.disconnected === true)
 		return;
 	state.time = sys.floatTime();
+	// For nqnetchan, respect reliable message flow control
+	if (sock.protocol === 'nqnetchan' && !sock.canSend)
+		return false;
 	return state.drivers[sock.driver].canSendMessage(sock);
 };
 
@@ -406,7 +440,7 @@ const maxPlayers_f = function()
 		con.print('"maxplayers" is "' + sv.state.svs.maxclients + '"\n');
 		return;
 	}
-	if (sv.state.server.active === true)
+	if (sv.state.server.phase === 'active')
 	{
 		con.print('maxplayers can not be changed while a server is running.\n');
 		return;
@@ -486,6 +520,16 @@ export const init = (drivers: INetworkDriver[]) => {
 export const shutdown = function()
 {
 	state.time = sys.floatTime();
+	for (var i = 0; i < activeSockets.length; ++i) {
+		const sock = activeSockets[i]
+		if (sock.protocol === 'nqnetchan' && !sock.disconnected) {
+			// Send clc_disconnect (byte 2) so FTE cleanly removes the player.
+			// "drop" stringcmd is QW-only; NQ clients must use clc_disconnect.
+			const payload = new Uint8Array([2]) // CLC.disconnect
+			const wrapped = nqnetchan.wrapUnreliable({ data: payload.buffer, cursize: 1 }, sock.unreliableSendSequence)
+			state.drivers[sock.driver].sendMessage(sock, { data: wrapped, cursize: wrapped.byteLength })
+		}
+	}
 	for (var i = 0; i < activeSockets.length; ++i)
 		close(activeSockets[i]);
 	for (state.driverlevel = 0; state.driverlevel < state.drivers.length; ++state.driverlevel)
@@ -497,8 +541,9 @@ export const shutdown = function()
 };
 
 export const registerWithMaster = () => {
-	const webSocket = state.drivers.find(drv => drv.name === 'websocket')
-	if (webSocket) {
-		webSocket.registerWithMaster()
+	for (const driver of state.drivers) {
+		if (driver.initialized) {
+			driver.registerWithMaster()
+		}
 	}
 }

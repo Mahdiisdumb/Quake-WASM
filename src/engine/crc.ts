@@ -42,3 +42,107 @@ export const block = function(start: Uint8Array)
     crcvalue = ((crcvalue << 8) & 0xffff) ^ table[(crcvalue >> 8) ^ start[i]];
   return crcvalue;
 };
+
+// MD4 (QSS mdfour.c, Samba's implementation).
+const md4_lshift = function(x: number, s: number): number
+{
+  return ((x << s) | (x >>> (32 - s))) >>> 0;
+};
+
+const md4_block = function(st: Uint32Array, X: Uint32Array)
+{
+  var A = st[0], B = st[1], C = st[2], D = st[3];
+  const AA = A, BB = B, CC = C, DD = D;
+  const r1 = function(a: number, b: number, c: number, d: number, k: number, s: number): number {
+    return md4_lshift((a + (((b & c) | (~b & d)) >>> 0) + X[k]) >>> 0, s);
+  };
+  const r2 = function(a: number, b: number, c: number, d: number, k: number, s: number): number {
+    return md4_lshift((a + (((b & c) | (b & d) | (c & d)) >>> 0) + X[k] + 0x5A827999) >>> 0, s);
+  };
+  const r3 = function(a: number, b: number, c: number, d: number, k: number, s: number): number {
+    return md4_lshift((a + ((b ^ c ^ d) >>> 0) + X[k] + 0x6ED9EBA1) >>> 0, s);
+  };
+
+  A = r1(A,B,C,D, 0, 3); D = r1(D,A,B,C, 1, 7); C = r1(C,D,A,B, 2,11); B = r1(B,C,D,A, 3,19);
+  A = r1(A,B,C,D, 4, 3); D = r1(D,A,B,C, 5, 7); C = r1(C,D,A,B, 6,11); B = r1(B,C,D,A, 7,19);
+  A = r1(A,B,C,D, 8, 3); D = r1(D,A,B,C, 9, 7); C = r1(C,D,A,B,10,11); B = r1(B,C,D,A,11,19);
+  A = r1(A,B,C,D,12, 3); D = r1(D,A,B,C,13, 7); C = r1(C,D,A,B,14,11); B = r1(B,C,D,A,15,19);
+
+  A = r2(A,B,C,D, 0, 3); D = r2(D,A,B,C, 4, 5); C = r2(C,D,A,B, 8, 9); B = r2(B,C,D,A,12,13);
+  A = r2(A,B,C,D, 1, 3); D = r2(D,A,B,C, 5, 5); C = r2(C,D,A,B, 9, 9); B = r2(B,C,D,A,13,13);
+  A = r2(A,B,C,D, 2, 3); D = r2(D,A,B,C, 6, 5); C = r2(C,D,A,B,10, 9); B = r2(B,C,D,A,14,13);
+  A = r2(A,B,C,D, 3, 3); D = r2(D,A,B,C, 7, 5); C = r2(C,D,A,B,11, 9); B = r2(B,C,D,A,15,13);
+
+  A = r3(A,B,C,D, 0, 3); D = r3(D,A,B,C, 8, 9); C = r3(C,D,A,B, 4,11); B = r3(B,C,D,A,12,15);
+  A = r3(A,B,C,D, 2, 3); D = r3(D,A,B,C,10, 9); C = r3(C,D,A,B, 6,11); B = r3(B,C,D,A,14,15);
+  A = r3(A,B,C,D, 1, 3); D = r3(D,A,B,C, 9, 9); C = r3(C,D,A,B, 5,11); B = r3(B,C,D,A,13,15);
+  A = r3(A,B,C,D, 3, 3); D = r3(D,A,B,C,11, 9); C = r3(C,D,A,B, 7,11); B = r3(B,C,D,A,15,15);
+
+  st[0] = (A + AA) >>> 0;
+  st[1] = (B + BB) >>> 0;
+  st[2] = (C + CC) >>> 0;
+  st[3] = (D + DD) >>> 0;
+};
+
+// Little-endian byte -> word gather (mdfour.c copy64).
+const md4_copy64 = function(X: Uint32Array, src: Uint8Array, ofs: number)
+{
+  for (var i = 0; i < 16; ++i)
+    X[i] = ((src[ofs + i * 4 + 3] << 24) | (src[ofs + i * 4 + 2] << 16) |
+            (src[ofs + i * 4 + 1] << 8) | src[ofs + i * 4]) >>> 0;
+};
+
+// Com_BlockChecksum (QSS mdfour.c:237): MD4 folded to 32 bits; the csprogs identity advertised
+// as serverinfo *csprogs.
+export const blockChecksum = function(data: Uint8Array): number
+{
+  const st = blockDigestWords(data);
+  return (st[0] ^ st[1] ^ st[2] ^ st[3]) >>> 0;
+};
+
+// Raw 128-bit MD4 digest, little-endian per word (FTE hash_md4, crc.c); what digest_hex("MD4") hexes.
+export const blockDigest = function(data: Uint8Array): Uint8Array
+{
+  const st = blockDigestWords(data);
+  const out = new Uint8Array(16);
+  for (var i = 0; i < 4; ++i)
+  {
+    out[i * 4] = st[i] & 0xff;
+    out[i * 4 + 1] = (st[i] >>> 8) & 0xff;
+    out[i * 4 + 2] = (st[i] >>> 16) & 0xff;
+    out[i * 4 + 3] = (st[i] >>> 24) & 0xff;
+  }
+  return out;
+};
+
+const blockDigestWords = function(data: Uint8Array): Uint32Array
+{
+  const st = new Uint32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]);
+  const X = new Uint32Array(16);
+  var p = 0, n = data.length, totalN = 0;
+  while (n >= 64)
+  {
+    md4_copy64(X, data, p);
+    md4_block(st, X);
+    p += 64; n -= 64; totalN += 64;
+  }
+  // mdfour_tail
+  totalN += n;
+  const buf = new Uint8Array(128);
+  buf.set(data.subarray(p, p + n));
+  buf[n] = 0x80;
+  const bits = (totalN * 8) >>> 0;    // must wrap at 2^32, as C's uint32 does
+  const lenofs = (n <= 55) ? 56 : 120;
+  buf[lenofs] = bits & 0xff;
+  buf[lenofs + 1] = (bits >>> 8) & 0xff;
+  buf[lenofs + 2] = (bits >>> 16) & 0xff;
+  buf[lenofs + 3] = (bits >>> 24) & 0xff;
+  md4_copy64(X, buf, 0);
+  md4_block(st, X);
+  if (n > 55)
+  {
+    md4_copy64(X, buf, 64);
+    md4_block(st, X);
+  }
+  return st;
+};

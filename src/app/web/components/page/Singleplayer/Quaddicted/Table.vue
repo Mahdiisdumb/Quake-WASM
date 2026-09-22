@@ -4,19 +4,19 @@ table.table.table-hover.table-fixed-header(:class="props.loading ? 'loading-lg l
     tr
       th.title
         a(@click="changeSort('title')") Title
-        i.sorting.icon(v-if="model.sortBy==='title'" :class="model.sortOrder==='desc' ? 'icon-arrow-down' : 'icon-arrow-up'")
+        font-awesome-icon.sorting(v-if="model.sortBy==='title'" :icon="model.sortOrder==='desc' ? 'fa-solid fa-arrow-down' : 'fa-solid fa-arrow-up'")
       th.author
         a(@click="changeSort('author')") Author(s)
-        i.sorting.icon(v-if="model.sortBy==='author'" :class="model.sortOrder==='desc' ? 'icon-arrow-down' : 'icon-arrow-up'")
+        font-awesome-icon.sorting(v-if="model.sortBy==='author'" :icon="model.sortOrder==='desc' ? 'fa-solid fa-arrow-down' : 'fa-solid fa-arrow-up'")
       th.date
         a(@click="changeSort('date')") Released
-        i.sorting.icon(v-if="model.sortBy==='date'" :class="model.sortOrder==='desc' ? 'icon-arrow-down' : 'icon-arrow-up'")
+        font-awesome-icon.sorting(v-if="model.sortBy==='date'" :icon="model.sortOrder==='desc' ? 'fa-solid fa-arrow-down' : 'fa-solid fa-arrow-up'")
       th.rating
         a(@click="changeSort('rating')") Rating
-        i.sorting.icon(v-if="model.sortBy==='rating'" :class="model.sortOrder==='desc' ? 'icon-arrow-down' : 'icon-arrow-up'")
+        font-awesome-icon.sorting(v-if="model.sortBy==='rating'" :icon="model.sortOrder==='desc' ? 'fa-solid fa-arrow-down' : 'fa-solid fa-arrow-up'")
       th.size.ta-right
         a(@click="changeSort('size')") Size
-        i.sorting.icon(v-if="model.sortBy==='size'" :class="model.sortOrder==='desc' ? 'icon-arrow-down' : 'icon-arrow-up'")
+        font-awesome-icon.sorting(v-if="model.sortBy==='size'" :icon="model.sortOrder==='desc' ? 'fa-solid fa-arrow-down' : 'fa-solid fa-arrow-up'")
   tbody
     tr(v-for="map in sortedMaps" @click="selectMap(map)" :class="map.id === props.modelValue ? 'active' : ''" )
       td.title {{map.title}}

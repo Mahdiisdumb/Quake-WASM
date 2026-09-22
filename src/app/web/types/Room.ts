@@ -18,6 +18,7 @@ export type Player = {
     name: string
     joinTime: Timestamp
     status: 'away' | 'available' | 'in-game'
+    downloadProgress?: { loaded: number, total: number }
 }
 
 export type Room = {
@@ -29,8 +30,11 @@ export type Room = {
     players: Player[]
     maxPlayers: number,
     startMap: string,
+    sourceId?: SourceId,
+    gameDir?: string,
     createdAt: Timestamp
     gameType: GameTypes
+    skill?: number
 }
 
 export type GenericSetting = {
@@ -46,6 +50,8 @@ export type GameSettings = {
     gameType: GameTypes
     fragLimit: number
     timeLimit: number
+    skill: number
+    requiredPackages?: SourceId[]
 }
 
 export type ChatMessageContent = {
@@ -92,5 +98,6 @@ export type RoomState = {
     currentVote: {
         playerId: PlayerId,
         timestamp: number
-    }
+    },
+    lobbyExpiresAt?: number
 }

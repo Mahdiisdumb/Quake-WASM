@@ -129,6 +129,7 @@ interface State {
   configFile: string
   autoexecFile: string
   newGameType: string
+  pak1ModalOpen: boolean
 }
 const setBindInConfig = (cfg: string, nameValue: NameValue) => {
   const match = getBindInConfig(cfg, nameValue.name)
@@ -166,7 +167,8 @@ export const useGameStore = defineStore('game', {
     packages: [],
     configFile: '',
     autoexecFile: '',
-    newGameType: ''
+    newGameType: '',
+    pak1ModalOpen: false
   }),
   getters: {
     getConfigValue: (state: State) => (name: string) => {
@@ -231,8 +233,7 @@ export const useGameStore = defineStore('game', {
       this.saveConfig(setValueInConfig(this.configFile, nameValue))
     },
     loadRecommendedConfig () {
-      localStorage[configFileName] = baseCfg
-      this.setConfigFile(baseCfg)
+      this.saveConfig(baseCfg)
       this.loadModernConfig()
     },
     loadRecommendedAutoexec () {
@@ -244,8 +245,36 @@ export const useGameStore = defineStore('game', {
           this.assetMetas = allAssets
         })
     },
+    // Backfill sha256 for id1 paks saved before checksums existed, so the
+    // setup page can verify them against the official release.
+    async ensurePakChecksums () {
+      if (this.assetMetas.length === 0) await this.loadAssets()
+      const paks = this.assetMetas.filter((am: AssetMeta) =>
+        am.game === 'id1' &&
+        (am.fileName.toLowerCase() === 'pak0.pak' || am.fileName.toLowerCase() === 'pak1.pak') &&
+        !am.sha256
+      )
+      if (paks.length === 0) return
+      let updated = false
+      for (const meta of paks) {
+        const asset = await indexedDb.getAsset('id1', meta.fileName)
+        if (!asset) continue
+        const hash = await indexedDb.sha256Hex(asset.data)
+        if (!hash) return // no crypto.subtle on this origin; nothing can be hashed
+        await indexedDb.updateAssetChecksum(String(meta.assetId), hash)
+        updated = true
+      }
+      if (updated) await this.loadAssets()
+    },
     async loadPackages () {
-      this.packages = await indexedDb.getAllPackages()
+      const pkgs = await indexedDb.getAllPackages()
+      this.packages = pkgs.sort((a, b) => {
+        const aCustom = a.sourceId.startsWith('custom:')
+        const bCustom = b.sourceId.startsWith('custom:')
+        if (aCustom && !bCustom) return -1
+        if (!aCustom && bCustom) return 1
+        return 0
+      })
     },
     saveAsset ({
       game, 
@@ -258,6 +287,12 @@ export const useGameStore = defineStore('game', {
     removeAsset (assetId: string) {
       return indexedDb.removeAsset(assetId)
         .then(() => this.loadAssets())
+    },
+    openPak1Modal () { this.pak1ModalOpen = true },
+    closePak1Modal () { this.pak1ModalOpen = false },
+    async removePackage (packageId: number) {
+      await indexedDb.removePackage(packageId)
+      await Promise.all([this.loadPackages(), this.loadAssets()])
     }
   }
 })

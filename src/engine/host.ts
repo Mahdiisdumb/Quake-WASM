@@ -24,18 +24,21 @@ import * as input from './input'
 import * as cvar from './cvar'
 import * as def from './def'
 import * as protocol from './protocol'
-import * as ed from './ed'
 import * as q from './q'
 import * as vec from './vec'
 import * as sz from './sz'
 import * as tx from './texture'
 import * as mapAlpha from './mapAlpha'
 import * as fog from './fog'
+import * as sky from './sky'
+import * as save from './save'
+import * as loc from './loc'
+import * as complete from './complete'
+import * as csqc from './csqc'
 
 import IAssetStore from './interfaces/store/IAssetStore';
 import INetworkDriver from './interfaces/net/INetworkDriver';
 import { Client } from './types/Client'
-import { Edict } from './types'
 
 export type HostState = {
   timetotal: number;
@@ -45,6 +48,10 @@ export type HostState = {
   oldrealtime: number;
   initialized: boolean;
   frametime: number;
+  // QSS renderer/server isolation: server tick interval (1/72 when host_maxfps > 72, 0 = coupled)
+  netinterval: number;
+  // render time accumulated toward the next server tick
+  accumtime: number;
   client: null | Client;
   framecount: number;
   dedicated: boolean;
@@ -54,6 +61,22 @@ export type HostState = {
   noclip_anglehack: boolean;
   current_skill: number;
   isdown: boolean;
+  // perf_stats: ring buffer of wall-clock ms between successive _frame calls
+  frameTimesMs: Float64Array;
+  frameTimeCursor: number;
+  frameTimeTotal: number;
+  lastFrameTimestamp: number;
+  // Server-on-worker: when set, map/changelevel run the server in a Worker and
+  // this thread is a pure client connecting over the worker-loop transport.
+  workerServer: { sendCommand: (text: string) => void, nextCmdDone: () => Promise<void> } | null;
+  // Opt-in WASM-sim server backend (set by the app layer when sv_wasm=1). Null = the
+  // JS server runs the physics frame. See src/app/game/net/wasmServer.ts.
+  wasmServer: { frame: () => void, isReady: () => boolean } | null;
+  // App-provided async activator (loads the current map into the WASM sim + sets
+  // wasmServer). serverFrame triggers it once per map when sv_wasm=1; wasmActivating
+  // guards against re-triggering while the async load is in flight.
+  wasmServerActivate: (() => void) | null;
+  wasmActivating: boolean;
 }
 
 const emptyState = (): HostState => ({
@@ -64,6 +87,8 @@ const emptyState = (): HostState => ({
   oldrealtime: 0.0,
   initialized: false,
   frametime: 0.0,
+  netinterval: 0.0,
+  accumtime: 0.0,
   client: null,
   framecount: 0,
   dedicated: false,
@@ -72,7 +97,15 @@ const emptyState = (): HostState => ({
   startdemos: false,
   noclip_anglehack: false,
   current_skill: 0,
-  isdown: false
+  isdown: false,
+  frameTimesMs: new Float64Array(512),
+  frameTimeCursor: 0,
+  frameTimeTotal: 0,
+  lastFrameTimestamp: 0,
+  workerServer: null,
+  wasmServer: null,
+  wasmServerActivate: null,
+  wasmActivating: false
 })
 
 export let state: HostState = emptyState()
@@ -88,6 +121,17 @@ export const endGame = async function(message: string)
   else
     await cl.disconnect();
   throw 'Host.abortserver';
+};
+
+export class HostError extends Error {}
+export class HostEndGame extends Error {}
+
+export const throwError = (message: string): never => {
+  throw new HostError(message);
+};
+
+export const throwEndGame = (message: string): never => {
+  throw new HostEndGame(message);
 };
 
 const findMaxClients = function()
@@ -116,7 +160,7 @@ const findMaxClients = function()
 	{
     sv.state.svs.clients[i] = {
       num: i,
-      message: {data: new ArrayBuffer(def.max_message), cursize: 0, allowoverflow: true},
+      message: Object.assign(sz.newDatagram(def.max_message), { allowoverflow: true }),
       colors: 0,
       old_frags: 0,
       name: '',
@@ -128,6 +172,14 @@ const findMaxClients = function()
       spawned: false,
       sendsignon: false,
       reconnect: false,
+      pextknown: false,
+      protocol_pext1: 0,
+      protocol_pext2: 0,
+      csqcactive: false,
+      pendingcsqcentities_bits: null,
+      oldstats_i: null,
+      oldstats_f: null,
+      oldstats_s: null,
       lastspoke: 0,
       lockedtill: 0,
       floodprotmessage: 0
@@ -158,7 +210,7 @@ export const broadcastPrint = function(string: string)
   }
 };
 
-export const dropClient = async function(crash: boolean)
+export const dropClient = function(crash: boolean)
 {
   var client = state.client;
   if (crash !== true)
@@ -170,10 +222,11 @@ export const dropClient = async function(crash: boolean)
     }
     if ((client.edict != null) && (client.spawned === true))
     {
-      var saveSelf = pr.state.globals_int[pr.globalvars.self];
-      pr.state.globals_int[pr.globalvars.self] = client.edict.num;
-      await pr.executeProgram(pr.state.globals_int[pr.globalvars.ClientDisconnect]);
-      pr.state.globals_int[pr.globalvars.self] = saveSelf;
+      pr.switchVM(pr.vms.ssqc);
+      var saveSelf = pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.self];
+      pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.self] = client.edict.num;
+      pr.executeProgram(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.ClientDisconnect]);
+      pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.self] = saveSelf;
     }
     sys.print('Client ' + sv.getClientName(client) + ' removed\n');
   }
@@ -206,15 +259,40 @@ const writeConfiguration = function()
   com.writeTextFile('config.cfg', key.writeBindings() + cvar.writeVariables());
 };
 
-const serverFrame = async function()
+const serverFrame = function()
 {
-  pr.state.globals_float[pr.globalvars.frametime] = state.frametime;
+  pr.switchVM(pr.vms.ssqc);
+  pr.vms.ssqc.frametime = state.frametime;
+  pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.frametime] = state.frametime;
   sv.state.server.datagram.cursize = 0;
-  await sv.checkForNewClients();
-  await sv.runClients();
-  if ((sv.state.server.paused !== true) && ((sv.state.svs.maxclients >= 2) || (key.state.dest === key.KEY_DEST.game)))
-    await sv.physics();
-  await sv.sendClientMessages();
+  sv.checkForNewClients();
+  // The WASM physicsClient COMPOSES clientThink into the physics pass (usercmd -> clientThink ->
+  // PlayerPreThink). When the wasm frame will run this tick, runClients must NOT also apply it —
+  // that double-ran friction/accelerate/punchangle-decay on players every tick (both writes land
+  // in the shared zero-copy store). Decided BEFORE the activation trigger below: activation is
+  // async, so useWasm can't flip between here and the physics branch within one tick.
+  // QSS-M sv_user.c SV_RunClients gates SV_ClientThink with the SAME pause/console condition as
+  // physics (`if (!sv.paused && (svs.maxclients > 1 || key_dest == key_game)) SV_ClientThink()`),
+  // so clientThink runs ONLY on physics ticks — and on the JS path only (wasm composes its own).
+  const runPhysics = (sv.state.server.paused !== true) && ((sv.state.svs.maxclients >= 2) || (key.state.dest === key.KEY_DEST.game));
+  // The wasm sim has the NQ global/field offsets compiled in, so a progs.dat resolved against a
+  // foreign defs layout must never run on it; refusing to ACTIVATE keeps the whole frame wasm-free.
+  const nowasm = pr.vms.ssqc.foreigndefs;
+  const useWasm = !nowasm && state.wasmServer != null && state.wasmServer.isReady() && cvr.wasm != null && cvr.wasm.value !== 0;
+  sv.runClients(!runPhysics || useWasm);
+  // Opt-in WASM server backend: activate it once per map when sv_wasm=1 (async load;
+  // JS physics runs until it's ready). state.wasmServer is reset on each spawnServer.
+  if (!nowasm && cvr.wasm != null && cvr.wasm.value !== 0 && sv.state.server.phase === 'active' &&
+      state.wasmServer == null && !state.wasmActivating && state.wasmServerActivate != null)
+    state.wasmServerActivate();
+  if (runPhysics) {
+    if (useWasm)
+      state.wasmServer!.frame();   // WASM backend; useWasm re-checks the cvar so sv_wasm 1->0 falls back live
+    else
+      sv.physics();
+  }
+  sv.sendClientMessages();
+  save.checkAutosave();
 };
 
 export const remoteCommand = function(from: string, data: string, password: string)
@@ -243,7 +321,24 @@ const getConsoleCommands = function()
 
 const _frame = async function()
 {
-  Math.random();
+  vec.resetScratch();
+
+  // Frame start is outside every QC program, so nonzero depth is a stale stack from a JS exception
+  // that escaped executeProgram. Abandon it as a Host_Error longjmp would, or the next cross-VM
+  // switch trips the on-the-stack guard forever.
+  if (pr.state.depth > 0) {
+    con.dPrint('Host._frame: abandoning a stale QC stack (depth ' + pr.state.depth + ')\n');
+    pr.clearStack(pr.state);
+  }
+
+  const frameTimestamp = performance.now();
+  if (state.lastFrameTimestamp !== 0)
+  {
+    state.frameTimesMs[state.frameTimeCursor] = frameTimestamp - state.lastFrameTimestamp;
+    state.frameTimeCursor = (state.frameTimeCursor + 1) % state.frameTimesMs.length;
+    ++state.frameTimeTotal;
+  }
+  state.lastFrameTimestamp = frameTimestamp;
 
   state.realtime = sys.floatTime();
   state.frametime = state.realtime - state.oldrealtime;
@@ -267,11 +362,60 @@ const _frame = async function()
     return;
   }
 
-  await cmd.execute();
+  cmd.execute();
 
-  await cl.sendCmd();
-  if (sv.state.server.active === true)
-    await serverFrame();
+  // Everything below assumes commands completed (the old awaited-execute
+  // semantics) — an async command like map/restart tears the server down
+  // across its awaits, so stall the frame until it resolves.
+  if (cmd.state.pendingCommand != null)
+    return;
+
+  // QSS download extension: check for pending downloads before sending prespawn
+  if (cl.cls.sendprespawn && cl.cls.state === cl.ACTIVE.connected) {
+    const done = await cl.checkDownloads();
+    if (done) {
+      // Where QSS loads csprogs (host.c:768 CL_LoadCSProgs): precaches up, before prespawn goes out.
+      await csqc.load();
+      cl.cls.sendprespawn = false;
+      msg.writeByte(cl.cls.message, protocol.CLC.stringcmd);
+      msg.writeString(cl.cls.message, 'prespawn');
+    } else if (cl.cls.message.cursize === 0 && !cl.dlState.download.data) {
+      // Send NOP keepalive only when not actively downloading — during
+      // downloads, nqnetchan ACKs for incoming server packets serve as
+      // keepalive, and NOPs would block the reliable channel
+      msg.writeByte(cl.cls.message, protocol.CLC.nop);
+    }
+  }
+
+  // No client state on a dedicated server (QSS host.c gates CL_AccumulateCmd on ca_connected).
+  if (!state.dedicated)
+    cl.accumulateCmd();
+
+  // QSS renderer/server isolation: above 72fps the server steps at a fixed ~72Hz
+  // so physics dt never shrinks below vanilla's (dt-sensitive code like pusher/rider
+  // ground contact breaks otherwise); the client renders every frame and interpolates.
+  state.netinterval = (cvr.maxfps.value > 72 || cvr.maxfps.value <= 0) ? 1.0 / 72.0 : 0.0;
+  if (state.netinterval > 0)
+    state.accumtime += state.frametime;
+  if (state.netinterval === 0 || state.accumtime >= state.netinterval)
+  {
+    const realframetime = state.frametime;
+    if (state.netinterval > 0)
+    {
+      state.frametime = state.accumtime > state.netinterval ? state.accumtime : state.netinterval;
+      state.accumtime -= state.frametime;
+      if (state.frametime > 0.1)
+        state.frametime = 0.1;
+    }
+    cl.sendCmd();
+    if (sv.state.server.phase === 'active')
+      serverFrame();
+    state.frametime = realframetime;
+  }
+
+  // Client VM physics frame: after the server's, before the messages feeding it are parsed
+  // (QSS host.c:973-979).
+  csqc.physicsFrame();
 
   if (cl.cls.state === cl.ACTIVE.connected)
     await cl.readFromServer();
@@ -281,19 +425,27 @@ const _frame = async function()
   }
 
   if (!state.dedicated) {
-    if (cl.cls.signon === 4)
+    if (cl.clState.listener_defined)
     {
-      await s.update(r.state.refdef.vieworg, r.state.vpn, r.state.vright, r.state.vup);
+      // A csqc SetListener wins over the engine view for exactly one video frame (QSS host.c:997-1001).
+      cl.clState.listener_defined = false;
+      s.update(cl.clState.listener_origin, cl.clState.listener_forward, cl.clState.listener_right, cl.clState.listener_up);
+      cl.decayLights();
+    }
+    else if (cl.cls.signon === 4)
+    {
+      s.update(r.state.refdef.vieworg, r.state.vpn, r.state.vright, r.state.vup);
       cl.decayLights();
     }
     else
-      await s.update(vec.emptyV3(), vec.emptyV3(), vec.emptyV3(), vec.emptyV3());
+      s.update(vec.scratch(), vec.scratch(), vec.scratch(), vec.scratch());
     cdAudio.update();
   
     if (state.connectOnLoad) {
       const url = state.connectOnLoad
       state.connectOnLoad = null
-      await cl.establishConnection(url);
+      if (!(await cl.establishConnection(url)))
+        await error('CL.EstablishConnection: connect failed\n');
     } else if (state.startdemos === true)
     {
       cl.nextDemo();
@@ -306,13 +458,16 @@ const _frame = async function()
 
 // Commands
 
-export const quit_f = function()
+export const quit_f = async function()
 {
   if (key.state.dest !== key.KEY_DEST.console)
   {
     m.menu_Quit_f();
     return;
   }
+  // QSS Host_Quit_f: disconnect + shutdown before quitting, so CSQC_Shutdown runs on a live VM.
+  await cl.disconnect();
+  await shutdownServer(false);
   sys.quit();
 };
 
@@ -335,7 +490,7 @@ const status_f = function()
   var print;
   if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_client)
   {
-    if (sv.state.server.active !== true)
+    if (sv.state.server.phase !== 'active')
     {
       cmd.forwardToServer();
       return;
@@ -346,7 +501,7 @@ const status_f = function()
     print = clientPrint;
   print('host:    ' + net.cvr.hostname.string + '\n');
   print('version: 1.09\n');
-  print('map:     ' + pr.getString(pr.state.globals_int[pr.globalvars.mapname]) + '\n');
+  print('map:     ' + pr.getString(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.mapname], pr.vms.ssqc) + '\n');
   print('players: ' + net.state.activeconnections + ' active (' + sv.state.svs.maxclients + ' max)\n\n');
   var i, client: Client, str, frags, hours, minutes, seconds;
   for (i = 0; i < sv.state.svs.maxclients; ++i)
@@ -402,7 +557,7 @@ const god_f = function()
     cmd.forwardToServer();
     return;
   }
-  if (pr.state.globals_float[pr.globalvars.deathmatch] !== 0)
+  if (pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.deathmatch] !== 0)
     return;
   sv.state.player.v_float[pr.entvars.flags] ^= sv.FL.godmode;
   if ((sv.state.player.v_float[pr.entvars.flags] & sv.FL.godmode) === 0)
@@ -418,7 +573,7 @@ const notarget_f = function()
     cmd.forwardToServer();
     return;
   }
-  if (pr.state.globals_float[pr.globalvars.deathmatch] !== 0)
+  if (pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.deathmatch] !== 0)
     return;
   sv.state.player.v_float[pr.entvars.flags] ^= sv.FL.notarget;
   if ((sv.state.player.v_float[pr.entvars.flags] & sv.FL.notarget) === 0)
@@ -434,7 +589,7 @@ const noclip_f = function()
     cmd.forwardToServer();
     return;
   }
-  if (pr.state.globals_float[pr.globalvars.deathmatch] !== 0)
+  if (pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.deathmatch] !== 0)
     return;
   if (sv.state.player.v_float[pr.entvars.movetype] !== sv.MOVE_TYPE.noclip)
   {
@@ -448,6 +603,35 @@ const noclip_f = function()
   clientPrint('noclip OFF\n');
 };
 
+// QSS host.c Host_SetPos_f -- teleport the local player (implies noclip)
+const setpos_f = function()
+{
+  if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_client)
+  {
+    cmd.forwardToServer();
+    return;
+  }
+  if (cmd.state.argv.length !== 4)
+  {
+    clientPrint('usage: setpos x y z\n');
+    return;
+  }
+  const player = sv.state.player;
+  if (player.v_float[pr.entvars.movetype] !== sv.MOVE_TYPE.noclip)
+  {
+    state.noclip_anglehack = true;
+    player.v_float[pr.entvars.movetype] = sv.MOVE_TYPE.noclip;
+    clientPrint('noclip ON\n');
+  }
+  player.v_float[pr.entvars.velocity] = 0.0;
+  player.v_float[pr.entvars.velocity + 1] = 0.0;
+  player.v_float[pr.entvars.velocity + 2] = 0.0;
+  player.v_float[pr.entvars.origin] = q.atof(cmd.state.argv[1]);
+  player.v_float[pr.entvars.origin + 1] = q.atof(cmd.state.argv[2]);
+  player.v_float[pr.entvars.origin + 2] = q.atof(cmd.state.argv[3]);
+  sv.linkEdict(player, false);
+};
+
 const fly_f = function()
 {
   if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_client)
@@ -455,7 +639,7 @@ const fly_f = function()
     cmd.forwardToServer();
     return;
   }
-  if (pr.state.globals_float[pr.globalvars.deathmatch] !== 0)
+  if (pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.deathmatch] !== 0)
     return;
   if (sv.state.player.v_float[pr.entvars.movetype] !== sv.MOVE_TYPE.fly)
   {
@@ -474,6 +658,8 @@ const ping_f = function()
     cmd.forwardToServer();
     return;
   }
+  
+
   clientPrint('Client ping times:\n');
   var i, client: Client, total, j;
   for (i = 0; i < sv.state.svs.maxclients; ++i)
@@ -504,11 +690,33 @@ const map_f = async function()
   }
   if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_command)
     return;
-  
+
   if (!state.dedicated) {
     cl.cls.demonum = -1;
     await cl.disconnect();
   }
+
+  // Server-on-worker: the simulation runs in a Worker (see docs/server-worker.md).
+  // Forward the map to the worker to spawn there instead of spawning locally,
+  // then connect this thread's client to it over the worker-loop transport.
+  if (state.workerServer != null && !state.dedicated) {
+    key.state.dest = key.KEY_DEST.game
+    scr.beginLoadingPlaque();
+    // Wait for the worker to FULLY spawn the new map before connecting. Register the waiter
+    // BEFORE sending (so we can't miss the cmddone), send, then await it. Without this,
+    // `connect local` reaches a half-torn-down / still-loading worker server and the client
+    // spawns into it, stops receiving, and times out (CL.ReadFromServer: lost server
+    // connection) on every map->map change. Mirrors the loadgame path (save.ts).
+    const mapDone = state.workerServer.nextCmdDone();
+    state.workerServer.sendCommand(cmd.state.argv.slice(0, cmd.state.argv.length).join(' '));
+    await mapDone;
+    cl.cls.spawnparms = '';
+    for (var j = 2; j < cmd.state.argv.length; ++j)
+      cl.cls.spawnparms += cmd.state.argv[j] + ' ';
+    await cmd.executeString('connect local', cmd.CMD_SOURCE.src_command);
+    return;
+  }
+
   await shutdownServer(false);
   key.state.dest = key.KEY_DEST.game
   if (!state.dedicated) {
@@ -517,7 +725,7 @@ const map_f = async function()
   sv.state.svs.serverflags = 0;
   await sv.spawnServer(cmd.state.argv[1]);
   if (!state.dedicated) {
-    if (sv.state.server.active !== true)
+    if (sv.state.server.phase !== 'active')
       return;
     cl.cls.spawnparms = '';
     var i;
@@ -534,11 +742,13 @@ const changelevel_f = async function()
     con.print('changelevel <levelname> : continue game on a new level\n');
     return;
   }
-  if ((sv.state.server.active !== true) || (cl.cls.demoplayback === true))
+  if ((sv.state.server.phase !== 'active') || (cl.cls.demoplayback === true))
   {
     con.print('Only the server may changelevel\n');
     return;
   }
+  if ((pr.getString(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.mapname], pr.vms.ssqc) === cmd.state.argv[1]) && (await save.autoLoad()))
+    return;
   await sv.saveSpawnparms();
   await sv.spawnServer(cmd.state.argv[1]);
 };
@@ -547,11 +757,14 @@ const restart_f = async function()
 {
   if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_command)
     return
-  if ((cl.cls.demoplayback !== true) && (sv.state.server.active === true))
-    await sv.spawnServer(pr.getString(pr.state.globals_int[pr.globalvars.mapname]));
+  if ((cl.cls.demoplayback === true) || (sv.state.server.phase !== 'active'))
+    return;
+  if (await save.autoLoad())
+    return;
+  await sv.spawnServer(pr.getString(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.mapname], pr.vms.ssqc));
 };
 
-const reconnect_f = function()
+export const reconnect_f = function()
 {
   if (!state.dedicated) {
     scr.beginLoadingPlaque();
@@ -568,239 +781,12 @@ const connect_f = async function()
     cl.stopPlayback();
     await cl.disconnect();
   }
-  await cl.establishConnection(cmd.state.argv[1]);
+  if (!(await cl.establishConnection(cmd.state.argv[1])))
+  {
+    con.print('CL.EstablishConnection: connect failed\n');
+    return;
+  }
   cl.cls.signon = 0;
-};
-
-const savegameComment = function()
-{
-  var text = cl.clState.levelname.replace(/\s/gm, '_');
-  var i;
-  for (i = cl.clState.levelname.length; i <= 21; ++i)
-    text += '_';
-
-  text += 'kills:';
-  var kills = cl.clState.stats[def.STAT.monsters].toString();
-  if (kills.length === 2)
-    text += '_';
-  else if (kills.length === 1)
-    text += '__';
-  text += kills + '/';
-  kills = cl.clState.stats[def.STAT.totalmonsters].toString();
-  if (kills.length === 2)
-    text += '_';
-  else if (kills.length === 1)
-    text += '__';
-  text += kills;
-
-  return text + '____';
-};
-
-const savegame_f = async function()
-{
-  if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_command)
-    return;
-  if (sv.state.server.active !== true)
-  {
-    con.print('Not playing a local game.\n');
-    return;
-  }
-  if (cl.clState.intermission !== 0)
-  {
-    con.print('Can\'t save in intermission.\n');
-    return;
-  }
-  if (sv.state.svs.maxclients !== 1)
-  {
-    con.print('Can\'t save multiplayer games.\n');
-    return;
-  }
-  if (cmd.state.argv.length !== 2)
-  {
-    con.print('save <savename> : save a game\n');
-    return;
-  }
-  if (cmd.state.argv[1].indexOf('..') !== -1)
-  {
-    con.print('Relative pathnames are not allowed.\n');
-    return;
-  }
-  var client = sv.state.svs.clients[0];
-  if (client.active === true)
-  {
-    if (client.edict.v_float[pr.entvars.health] <= 0.0)
-    {
-      con.print('Can\'t savegame with a dead player\n');
-      return;
-    }
-  }
-  var f = ['5\n' + savegameComment() + '\n'];
-  var i;
-  for (i = 0; i <= 15; ++i)
-    f[f.length] = client.spawn_parms[i].toFixed(6) + '\n';
-  f[f.length] = state.current_skill + '\n' + pr.getString(pr.state.globals_int[pr.globalvars.mapname]) + '\n' + sv.state.server.time.toFixed(6) + '\n';
-  for (i = 0; i <= 63; ++i)
-  {
-    if (sv.state.server.lightstyles[i].length !== 0)
-      f[f.length] = sv.state.server.lightstyles[i] + '\n';
-    else
-      f[f.length] = 'm\n';
-  }
-  f[f.length] = '{\n';
-  var def, type;
-  for (i = 0; i < pr.state.globaldefs.length; ++i)
-  {
-    def = pr.state.globaldefs[i];
-    type = def.type;
-    if ((type & 0x8000) === 0)
-      continue;
-    type &= 0x7fff;
-    if ((type !== pr.ETYPE.ev_string) && (type !== pr.ETYPE.ev_float) && (type !== pr.ETYPE.ev_entity))
-      continue;
-    f[f.length] = '"' + pr.getString(def.name) + '" "' + pr.uglyValueString(type, pr.state.globals, def.ofs) + '"\n';
-  }
-  f[f.length] = '}\n';
-  var ed, j, name, v;
-  for (i = 0; i < sv.state.server.num_edicts; ++i)
-  {
-    ed = sv.state.server.edicts[i];
-    if (ed.free === true)
-    {
-      f[f.length] = '{\n}\n';
-      continue;
-    }
-    f[f.length] = '{\n';
-    for (j = 1; j < pr.state.fielddefs.length; ++j)
-    {
-      def = pr.state.fielddefs[j];
-      name = pr.getString(def.name);
-      if (name.charCodeAt(name.length - 2) === 95)
-        continue;
-      type = def.type & 0x7fff;
-      v = def.ofs;
-      if (ed.v_int[v] === 0)
-      {
-        if (type === 3)
-        {
-          if ((ed.v_int[v + 1] === 0) && (ed.v_int[v + 2] === 0))
-            continue;
-        }
-        else
-          continue;
-      }
-      f[f.length] = '"' + name + '" "' + pr.uglyValueString(type, ed.v, def.ofs) + '"\n';
-    }
-    f[f.length] = '}\n';
-  }
-  name = com.defaultExtension(cmd.state.argv[1], '.sav');
-  con.print('Saving game to ' + name + '...\n');
-  if (await com.writeTextFile(name, f.join('')) === true)
-    con.print('done.\n');
-  else
-    con.print('ERROR: couldn\'t open.\n');
-};
-
-const loadgame_f = async function()
-{
-  if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_command)
-    return;
-  if (cmd.state.argv.length !== 2)
-  {
-    con.print('load <savename> : load a game\n');
-    return;
-  }
-  cl.cls.demonum = -1;
-  var name = com.defaultExtension(cmd.state.argv[1], '.sav');
-  con.print('Loading game from ' + name + '...\n');
-  var f = await com.loadTextFile(name);
-  if (f == null)
-  {
-    con.print('ERROR: couldn\'t open.\n');
-    return;
-  }
-  var flines = f.split('\n');
-
-  var i;
-
-  var tfloat = parseFloat(flines[0]);
-  if (tfloat !== 5)
-  {
-    con.print('Savegame is version ' + tfloat + ', not 5\n');
-    return;
-  }
-
-  var spawn_parms = [];
-  for (i = 0; i <= 15; ++i)
-    spawn_parms[i] = parseFloat(flines[2 + i]);
-
-  state.current_skill = (parseFloat(flines[18]) + 0.1) >> 0;
-  cvar.setValue('skill', state.current_skill);
-
-  var time = parseFloat(flines[20]);
-  await cl.disconnect();
-  await sv.spawnServer(flines[19]);
-  if (sv.state.server.active !== true)
-  {
-    con.print('Couldn\'t load map\n');
-    return;
-  }
-  sv.state.server.paused = true;
-  sv.state.server.loadgame = true;
-
-  for (i = 0; i <= 63; ++i)
-    sv.state.server.lightstyles[i] = flines[21 + i];
-
-  var token, keyname, key, i;
-
-  if (flines[85] !== '{')
-    sys.error('First token isn\'t a brace');
-  for (i = 86; i < flines.length; ++i)
-  {
-    if (flines[i] === '}')
-    {
-      ++i;
-      break;
-    }
-    token = flines[i].split('"');
-    keyname = token[1];
-    key = ed.findGlobal(keyname);
-    if (key == null)
-    {
-      con.print('\'' + keyname + '\' is not a global\n');
-      continue;
-    }
-    if (ed.parseEpair(pr.state.globals, key, token[3]) !== true)
-      await error('Host.Loadgame_f: parse error');
-  }
-
-  flines[flines.length] = '';
-  var entnum = 0, ent: Edict, j;
-  var data = flines.slice(i).join('\n');
-  for (;;)
-  {
-    data = com.parse(data);
-    if (data == null)
-      break;
-    if (com.state.token.charCodeAt(0) !== 123)
-      sys.error('Host.Loadgame_f: found ' + com.state.token + ' when expecting {');
-    ent = sv.state.server.edicts[entnum++];
-    for (j = 0; j < pr.state.entityfields; ++j)
-      ent.v_int[j] = 0;
-    ent.free = false;
-    data = await ed.parseEdict(data, ent);
-    // @ts-ignore  the above may have mutated this object. Yay side-effects!
-    if (ent.free !== true)
-      await sv.linkEdict(ent, false);
-  }
-  sv.state.server.num_edicts = entnum;
-
-  sv.state.server.time = time;
-  var client = sv.state.svs.clients[0];
-  client.spawn_parms = [];
-  for (i = 0; i <= 15; ++i)
-    client.spawn_parms[i] = spawn_parms[i];
-  await cl.establishConnection('local');
-  reconnect_f();
 };
 
 const name_f = function()
@@ -820,6 +806,7 @@ const name_f = function()
   if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_client)
   {
     cvar.set('_cl_name', newName);
+    sys.nameChanged(newName);
     if (cl.cls.state === cl.ACTIVE.connected)
       cmd.forwardToServer();
     return;
@@ -839,6 +826,29 @@ const version_f = function()
 {
   con.print('Version 1.09\n');
   con.print(def.timedate);
+};
+
+const perf_stats_f = function()
+{
+  const n = Math.min(state.frameTimeTotal, state.frameTimesMs.length);
+  if (n === 0)
+  {
+    con.print('perf_stats: no frames recorded yet\n');
+    return;
+  }
+  let sum = 0.0;
+  let max = 0.0;
+  for (let i = 0; i < n; ++i)
+  {
+    const t = state.frameTimesMs[i];
+    sum += t;
+    if (t > max)
+      max = t;
+  }
+  con.print('frames counted: ' + n + ' (of ' + state.frameTimeTotal + ' total)\n');
+  con.print('avg frame ms:   ' + (sum / n).toFixed(3) + '\n');
+  con.print('max frame ms:   ' + max.toFixed(3) + '\n');
+  con.print('vec scratch highWater: ' + vec.state.highWater + ' / ' + vec.state.pool.length + '\n');
 };
 
 const say = function(teamonly: boolean = false)
@@ -992,9 +1002,10 @@ const kill_f = async function()
     clientPrint('Can\'t suicide -- already dead!\n');
     return;
   }
-  pr.state.globals_float[pr.globalvars.time] = sv.state.server.time;
-  pr.state.globals_int[pr.globalvars.self] = sv.state.player.num;
-  await pr.executeProgram(pr.state.globals_int[pr.globalvars.ClientKill]);
+  pr.switchVM(pr.vms.ssqc);
+  pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.time] = sv.state.server.time;
+  pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.self] = sv.state.player.num;
+  pr.executeProgram(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.ClientKill]);
 };
 
 const pause_f = function()
@@ -1053,23 +1064,24 @@ const spawn_f = async function()
   var i;
 
   var ent = client.edict;
-  if (sv.state.server.loadgame === true)
+  pr.switchVM(pr.vms.ssqc);
+  if (sv.state.server.spawnKind === 'savegame')
     sv.state.server.paused = false;
   else
   {
-    for (i = 0; i < pr.state.entityfields; ++i)
+    for (i = 0; i < pr.vms.ssqc.entityfields; ++i)
       ent.v_int[i] = 0;
     ent.v_float[pr.entvars.colormap] = ent.num;
     ent.v_float[pr.entvars.team] = (client.colors & 15) + 1;
-    ent.v_int[pr.entvars.netname] = pr.state.netnames + (client.num << 5);
+    ent.v_int[pr.entvars.netname] = pr.vms.ssqc.netnames + (client.num << 5);
     for (i = 0; i <= 15; ++i)
-      pr.state.globals_float[pr.globalvars.parms + i] = client.spawn_parms[i];
-    pr.state.globals_float[pr.globalvars.time] = sv.state.server.time;
-    pr.state.globals_int[pr.globalvars.self] = ent.num;
-    await pr.executeProgram(pr.state.globals_int[pr.globalvars.ClientConnect]);
+      pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.parms + i] = client.spawn_parms[i];
+    pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.time] = sv.state.server.time;
+    pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.self] = ent.num;
+    pr.executeProgram(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.ClientConnect]);
     if ((sys.floatTime() - client.netconnection.connecttime) <= sv.state.server.time)
       sys.print(sv.getClientName(client) + ' entered the game\n');
-    await pr.executeProgram(pr.state.globals_int[pr.globalvars.PutClientInServer]);
+    pr.executeProgram(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.PutClientInServer]);
   }
 
   var message = client.message;
@@ -1097,20 +1109,20 @@ const spawn_f = async function()
   }
   msg.writeByte(message, protocol.SVC.updatestat);
   msg.writeByte(message, def.STAT.totalsecrets);
-  msg.writeLong(message, pr.state.globals_float[pr.globalvars.total_secrets]);
+  msg.writeLong(message, pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.total_secrets]);
   msg.writeByte(message, protocol.SVC.updatestat);
   msg.writeByte(message, def.STAT.totalmonsters);
-  msg.writeLong(message, pr.state.globals_float[pr.globalvars.total_monsters]);
+  msg.writeLong(message, pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.total_monsters]);
   msg.writeByte(message, protocol.SVC.updatestat);
   msg.writeByte(message, def.STAT.secrets);
-  msg.writeLong(message, pr.state.globals_float[pr.globalvars.found_secrets]);
+  msg.writeLong(message, pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.found_secrets]);
   msg.writeByte(message, protocol.SVC.updatestat);
   msg.writeByte(message, def.STAT.monsters);
-  msg.writeLong(message, pr.state.globals_float[pr.globalvars.killed_monsters]);
+  msg.writeLong(message, pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.killed_monsters]);
   msg.writeByte(message, protocol.SVC.setangle);
-  msg.writeAngle(message, ent.v_float[pr.entvars.angles]);
-  msg.writeAngle(message, ent.v_float[pr.entvars.angles1]);
-  msg.writeAngle(message, 0.0);
+  msg.writeAngle(message, ent.v_float[pr.entvars.angles], sv.state.server.protocolFlags);
+  msg.writeAngle(message, ent.v_float[pr.entvars.angles1], sv.state.server.protocolFlags);
+  msg.writeAngle(message, 0.0, sv.state.server.protocolFlags);
   sv.writeClientdataToMessage(ent, message);
   msg.writeByte(message, protocol.SVC.signonnum);
   msg.writeByte(message, 3);
@@ -1135,13 +1147,13 @@ const kick_f = async function()
 {
   if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_client)
   {
-    if (sv.state.server.active !== true)
+    if (sv.state.server.phase !== 'active')
     {
       cmd.forwardToServer();
       return;
     }
   }
-  else if (pr.state.globals_float[pr.globalvars.deathmatch] !== 0.0)
+  else if (pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.deathmatch] !== 0.0)
     return;
   if (cmd.state.argv.length <= 1)
     return;
@@ -1226,7 +1238,7 @@ const give_f = function()
     cmd.forwardToServer();
     return;
   }
-  if (pr.state.globals_float[pr.globalvars.deathmatch] !== 0)
+  if (pr.vms.ssqc.globals_float[pr.vms.ssqc.globalvars.deathmatch] !== 0)
     return;
   if (cmd.state.argv.length <= 1)
     return;
@@ -1341,12 +1353,12 @@ const give_f = function()
 const findViewthing = function()
 {
   var i, e;
-  if (sv.state.server.active === true)
+  if (sv.state.server.phase === 'active')
   {
-    for (i = 0; i < sv.state.server.num_edicts; ++i)
+    for (i = 0; i < pr.vms.ssqc.num_edicts; ++i)
     {
-      e = sv.state.server.edicts[i];
-      if (pr.getString(e.v_int[pr.entvars.classname]) === 'viewthing')
+      e = pr.vms.ssqc.edicts[i];
+      if (pr.getString(e.v_int[pr.entvars.classname], pr.vms.ssqc) === 'viewthing')
         return e;
     }
   }
@@ -1360,7 +1372,7 @@ const viewmodel_f = async function()
   var ent = findViewthing();
   if (ent == null)
     return;
-  var m = await mod.forName(cmd.state.argv[1]);
+  var m = mod.forName(cmd.state.argv[1]);
   if (m == null)
   {
     con.print('Can\'t load ' + cmd.state.argv[1] + '\n');
@@ -1445,19 +1457,44 @@ const stopdemo_f = async function()
   await cl.disconnect();
 };
 
+// Completes the single map-name argument of map/changelevel.
+const mapArguments = function(argv: string[]): complete.Match[]
+{
+  if (argv.length !== 2)
+    return [];
+  var partial = argv[1].toLowerCase();
+  var names = com.getMapNames(), matches: complete.Match[] = [], subs: complete.Match[] = [], i, at;
+  for (i = 0; i < names.length; ++i)
+  {
+    at = names[i].indexOf(partial);
+    if (at === 0)
+      matches[matches.length] = {name: names[i], kind: 'arg'};
+    else if (at > 0)
+      subs[subs.length] = {name: names[i], kind: 'arg', at: at};
+  }
+  for (i = 0; i < subs.length; ++i)
+    matches[matches.length] = subs[i];
+  return matches;
+};
+
 const initCommands = () => {
   cmd.addCommand('status', status_f);
   cmd.addCommand('quit', quit_f);
-  cmd.addCommand('god', god_f);
-  cmd.addCommand('notarget', notarget_f);
-  cmd.addCommand('fly', fly_f);
+  // Cheat trio is csqc-interceptable in QSS (Cmd_AddCommand_ClientCommandQC, host_cmd.c:2862-2864).
+  cmd.addCommand('god', god_f, { interceptable: true });
+  cmd.addCommand('notarget', notarget_f, { interceptable: true });
+  cmd.addCommand('fly', fly_f, { interceptable: true });
   cmd.addCommand('map', map_f);
   cmd.addCommand('restart', restart_f);
   cmd.addCommand('changelevel', changelevel_f);
+  complete.addArgumentProvider('map', mapArguments);
+  complete.addArgumentProvider('changelevel', mapArguments);
   cmd.addCommand('connect', connect_f);
-  cmd.addCommand('reconnect', reconnect_f);
+  // Also a server command in QSS (host_cmd.c:2870): a stuffed `reconnect` is the engine's, not the progs'.
+  cmd.addCommand('reconnect', reconnect_f, { fromServer: true });
   cmd.addCommand('name', name_f);
   cmd.addCommand('noclip', noclip_f);
+  cmd.addCommand('setpos', setpos_f);
   cmd.addCommand('version', version_f);
   cmd.addCommand('say', say);
   cmd.addCommand('say_team', say_Team_f);
@@ -1468,10 +1505,12 @@ const initCommands = () => {
   cmd.addCommand('spawn', spawn_f);
   cmd.addCommand('begin', begin_f);
   cmd.addCommand('prespawn', preSpawn_f);
+  // The client's reply to our `cmd pext` stufftext (QSS sv_main.c:1593).
+  cmd.addCommand('pext', sv.pext_f);
+  cmd.addCommand('enablecsqc', sv.enablecsqc_f);
+  cmd.addCommand('disablecsqc', sv.disablecsqc_f);
   cmd.addCommand('kick', kick_f);
   cmd.addCommand('ping', ping_f);
-  cmd.addCommand('load', loadgame_f);
-  cmd.addCommand('save', savegame_f);
   cmd.addCommand('give', give_f);
   cmd.addCommand('startdemos', startdemos_f);
   cmd.addCommand('demos', demos_f);
@@ -1481,6 +1520,7 @@ const initCommands = () => {
   cmd.addCommand('viewnext', viewnext_f);
   cmd.addCommand('viewprev', viewprev_f);
   cmd.addCommand('mcache', mod.print);
+  cmd.addCommand('perf_stats', perf_stats_f);
 }
 
 export const error = async function(error: string)
@@ -1489,16 +1529,53 @@ export const error = async function(error: string)
     sys.error('Host.Error: recursively entered');
   }
   state.inerror = true;
+  csqc.hostError();
+  // Abandon a stack left mid-program by an escaping JS exception, as vanilla's Host_Error longjmp
+  // does; otherwise every later cross-VM switch trips the on-the-stack guard.
+  pr.clearStack(pr.vms.ssqc);
+  pr.switchVM(pr.vms.ssqc);
   if (!state.dedicated) {
     scr.endLoadingPlaque();
   }
   con.print('Host.Error: ' + error + '\n');
-  if (sv.state.server.active === true)
+  if (sv.state.server.phase === 'active')
     await shutdownServer(false);
   await cl.disconnect();
   cl.cls.demonum = -1;
   state.inerror = false;
-  throw new Error('Host.abortserver');
+  throw new Error(error);
+};
+
+// Rethrows the original HostError after cleanup so the reported message and
+// stack point at the throw site, not this handler.
+const handleHostError = async function(err: HostError): Promise<never> {
+  if (state.inerror === true) {
+    sys.error('Host.Error: recursively entered');
+  }
+  state.inerror = true;
+  csqc.hostError();
+  // Same stack abandonment as host.error above (vanilla Host_Error longjmp semantics).
+  pr.clearStack(pr.vms.ssqc);
+  pr.switchVM(pr.vms.ssqc);
+  if (!state.dedicated) {
+    scr.endLoadingPlaque();
+  }
+  con.print('Host.Error: ' + err.message + '\n');
+  if (sv.state.server.phase === 'active')
+    await shutdownServer(false);
+  await cl.disconnect();
+  cl.cls.demonum = -1;
+  state.inerror = false;
+  throw err;
+};
+
+const handleHostEndGame = async function(message: string): Promise<never> {
+  con.dPrint('Host.EndGame: ' + message + '\n');
+  if (cl.cls.demonum !== -1)
+    cl.nextDemo();
+  else
+    await cl.disconnect();
+  throw 'Host.abortserver';
 };
 
 const getCmdDeclaration = (varName: string) => {
@@ -1512,6 +1589,7 @@ const getCmdParam = (varName: string) => {
 const initLocal = () => {
   initCommands();
   cvr.framerate = cvar.registerVariable('host_framerate', '0');
+  cvr.maxfps = cvar.registerVariable('host_maxfps', '250', true);
   cvr.speeds = cvar.registerVariable('host_speeds', '0');
   cvr.ticrate = cvar.registerVariable('sys_ticrate', '0.05');
   cvr.serverprofile = cvar.registerVariable('serverprofile', '0');
@@ -1520,23 +1598,26 @@ const initLocal = () => {
   cvr.teamplay = cvar.registerVariable('teamplay', getCmdParam('teamplay') ?? '0', false, true);
   cvr.samelevel = cvar.registerVariable('samelevel', '0');
   cvr.noexit = cvar.registerVariable('noexit', '0', false, true);
-  cvr.skill = cvar.registerVariable('skill', '1');
+  cvr.skill = cvar.registerVariable('skill', getCmdParam('skill') ?? '1');
   cvr.developer = cvar.registerVariable('developer', '0');
   cvr.deathmatch = cvar.registerVariable('deathmatch', '0');
   cvr.coop = cvar.registerVariable('coop', getCmdDeclaration('coop') ? "1" : '0');
   cvr.pausable = cvar.registerVariable('pausable', '1');
   cvr.temp1 = cvar.registerVariable('temp1', '0');
+  // Inert engine-side: the rerelease QC owns these game modes and only needs them to exist
+  // (QSS-M host.c ~96-98).
+  cvr.campaign = cvar.registerVariable('campaign', '0');
+  cvr.horde = cvar.registerVariable('horde', '0');
+  cvr.sv_cheats = cvar.registerVariable('sv_cheats', '0');
   cvr.rcon_password = cvar.registerVariable('rcon_password', 'abcd');
- 
-  // server details for discovery
-  cvr.web_location = cvar.registerVariable('web_location', '');
-  cvr.web_description = cvar.registerVariable('web_description', '');
-  cvr.web_masterserver = cvar.registerVariable('web_masterserver', 'https://www.netquake.io');
-  
+  save.init();
+
   findMaxClients();
 }
 
-const getConnectUrl = () => {
+// The -connect launch address (the app's join-on-load flow); '' when the session
+// wasn't launched to join. Lets net distinguish that flow from a console connect.
+export const getConnectUrl = () => {
   const i = com.checkParm('-connect')
   return i ? com.state.argv[i + 1] : ''
 }
@@ -1545,7 +1626,6 @@ export const init = async function(
   assetStore: IAssetStore,
   netDrivers: INetworkDriver[])
 {
-  
   state = emptyState()
   state.serverId = com.uuidv4()
   state.dedicated = dedicated
@@ -1559,10 +1639,15 @@ export const init = async function(
   chase.init();
   await com.init(assetStore);
   initLocal();
+  // QSS-M Host_Init order (host.c:1811): after com.init so the loc file can come out of a -game
+  // pak, and after initLocal so `developer` exists. Server-side print builtins consume it, so it
+  // stays outside the dedicated check.
+  await loc.init();
   await w.loadWadFile('gfx.wad');
   key.init();
   con.init();
   pr.init();
+  csqc.init();
   mod.init();
   net.init(netDrivers);
   con.print(def.timedate);
@@ -1573,6 +1658,7 @@ export const init = async function(
     await scr.init();
     mapAlpha.init();
     fog.init();
+    sky.init();
     r.init();
     await s.init();
     await m.init();
@@ -1592,15 +1678,24 @@ export const init = async function(
   sys.print('========Quake Initialized=========\n');
 };
 
+const runFrame = async function() {
+  try { await _frame(); }
+  catch (e) {
+    if (e instanceof HostError) await handleHostError(e);
+    else if (e instanceof HostEndGame) await handleHostEndGame(e.message);
+    else throw e;
+  }
+};
+
 export const frame = async function()
 {
   if (cvr.serverprofile.value === 0)
   {
-    await _frame();
+    await runFrame();
     return;
   }
   var time1 = sys.floatTime();
-  await _frame();
+  await runFrame();
   state.timetotal += sys.floatTime() - time1;
   if (++state.timecount <= 999)
     return;
@@ -1627,16 +1722,16 @@ export const shutdown = function()
   writeConfiguration();
   cdAudio.stop();
   net.shutdown();
-  s.stopAllSounds();
+  s.shutdown();
   input.shutdown();
   vid.free()
 };
 
 export const shutdownServer = async function(crash: boolean = false)
 {
-  if (sv.state.server.active !== true)
+  if (sv.state.server.phase !== 'active')
     return;
-  sv.state.server.active = false;
+  sv.state.server.phase = 'inactive';
   if (cl.cls.state === cl.ACTIVE.connected)
     await cl.disconnect();
   var start = sys.floatTime(), count, i;
@@ -1660,8 +1755,8 @@ export const shutdownServer = async function(crash: boolean = false)
     if ((sys.floatTime() - start) > 3.0)
       break;
   } while (count !== 0);
-  var buf = {data: new ArrayBuffer(4), cursize: 1};
-  (new Uint8Array(buf.data))[0] = protocol.SVC.disconnect;
+  var buf = sz.newDatagram(4, 1);
+  sz.u8(buf)[0] = protocol.SVC.disconnect;
   count = await net.sendToAll(buf);
   if (count !== 0)
     con.print('Host.ShutdownServer: NET.SendToAll failed for ' + count + ' clients\n');

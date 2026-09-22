@@ -17,18 +17,21 @@ import * as q from './q'
 import * as vid from './vid'
 import * as msg from './msg'
 import * as def from './def'
-import * as batchRender from './batchRender'
 import * as s from './s'
 import * as lm from './lightmap'
 import * as tx from './texture'
 import * as mapAlpha from './mapAlpha'
 import * as fog from './fog'
-import { AliasFrame, AliasFrameGroup, Face, Leaf, Model, Node, NodeLeaf, Plane, SpriteFrame, SpriteFrameGroup, TexChain, Texture } from './types/Model'
+import * as sky from './sky'
+import * as pscript from './pscript'
+import { AliasFrame, AliasFrameGroup, BrushPrecomputeSlot, Face, Leaf, Model, Node, NodeLeaf, Plane, SpriteFrame, SpriteFrameGroup, TexChain, Texture } from './types/Model'
 import { V3, V4 } from './types/Vector'
 import { EFrags } from './types/Model'
-import { Entity } from './types/Entity'
+import { Entity, LightCache } from './types/Entity'
 import { DynamicLight } from './cl'
 import { createAttribParam } from './GL'
+import { getRenderer } from './render'
+import { SceneSetup, FrameGlobals } from './render/IRenderer'
 
 export const MAX_DLIGHTS = 32
 export const LERP = {
@@ -36,7 +39,17 @@ export const LERP = {
 	resetanim: 1 << 1,
 	resetanim2: 1 << 2,
 	resetmove: 1 << 3,
-	finish: 1 << 4
+	finish: 1 << 4,
+	// QSS LERP_EXPLICIT: poses come from the entity's snap* fields, not its update
+	// history (r_alias.c:795-836).
+	explicit: 1 << 5
+}
+
+// QSS entity_t eflags (protocol.h:500-501): viewmodel = view-relative + depth squash;
+// exteriormodel = skipped by the entity walk (gl_rmain.c:703).
+export const EFLAGS = {
+	viewmodel: 4,
+	exteriormodel: 8
 }
 
 type Refdef = {
@@ -50,22 +63,15 @@ type Refdef = {
 	viewangles: V3
 	fov_y: number
 	fov_x: number
+	// QSS r_refdef.drawworld: false skips the world/sky/particle passes. Only csqc
+	// setproperty(VF_DRAWWORLD) clears it; renderView forces it back on.
+	drawworld: boolean
+	// Opt-in for a csqc-built scene (addentities(MASK_VIEWMODEL), QSS pr_ext.c:6748).
+	drawviewmodel: boolean
 }
 
-type Particle = {
-	org: V3,
-	vel: V3,
-	color: number,
-	die: number,
-	ramp: number,
-	type: number
-}
-type EmptyParticle = {
-	die: -1
-}
 type RState = {
 	framecount: number
-	pefragtopnode: Leaf | Node | null
 	dlightvecs: WebGLBuffer,
 	warpbuffer: WebGLBuffer,
 	warprenderbuffer: WebGLBuffer,
@@ -77,6 +83,17 @@ type RState = {
 	vis_changed: boolean,
 	visframecount: number,
 	frustum: [Plane, Plane, Plane, Plane],
+	// Flat mirror of state.frustum, rebuilt each setFrustum() call: 4 planes
+	// x (nx, ny, nz, dist); frustumSignbits[k] bit-encodes which normal
+	// components of plane k are negative (same convention as Plane.signbits).
+	frustumFlat: Float32Array,
+	frustumSignbits: Uint8Array,
+	// Advanced once per markWorldFrustum() call; surfVisibleFrame stamps compare
+	// against this to tell "marked this frame" from "marked N frames ago".
+	frustumFrame: number,
+	// Explicit (idx, mask) pair stack for the iterative frustum walk; sized far
+	// past any BSP tree depth.
+	frustumWalkStack: Int32Array,
 	refdef: Refdef,
 	vup: V3,
 	vpn: V3,
@@ -87,9 +104,22 @@ type RState = {
 	warpheight: number,
 	oldwarpwidth: number,
 	oldwarpheight: number,
-	viewleaf: Leaf | null,
+	warpSupported: boolean,
+	warpDepthFormat: number,
+	warpDepthAttachment: number,
+	// leaf NUMBER (index into worldmodel.leafs / the flat leaf arrays), -1 = none.
+	// The Leaf objects are dropped on the worker-mode client; PVS/efrag/marksurface
+	// reads go through the flat leaf arrays keyed by this index.
+	viewleaf: number,
 	c_brush_verts: number,
 	c_alias_polys: number,
+	// r_speeds stage timings (ms) + chain-rebuild count for the current frame
+	rs_markms: number,
+	rs_walkms: number,
+	rs_rebuilds: number,
+	// worldmodel whose GL geometry (VBO + lightmap textures) is already built for
+	// the current GL context; lets newMap skip the rebuild on a same-map respawn
+	builtWorldmodel: Model | null,
 	skytexturenum: number
 	avertexnormals: V3[],
 	ramp1: number[],
@@ -97,24 +127,98 @@ type RState = {
 	ramp3: number[],
 	numparticles: number,
 	avelocities: V3[],
-	particles: (Particle | EmptyParticle)[],
+	particleOrg: Float32Array,
+	particleVel: Float32Array,
+	particleRamp: Float32Array,
+	particleDie: Float32Array,
+	particleColor: Uint8Array,
+	particleType: Uint8Array,
+	numActiveParticles: number,
+	particleInstanceData: ArrayBuffer,
+	particleInstanceFloats: Float32Array,
+	particleInstanceBytes: Uint8Array,
+	particleCornerBuffer: WebGLBuffer,
+	particleInstanceBuffer: WebGLBuffer,
 	tracercount: number
+	// csqc 3D polygons (FTE cl_stris): triangle-LIST vertex pool (x,y,z, u,v, r,g,b,a) plus the
+	// per-batch table grouping consecutive polys that share a pic and a twosided flag.
+	scenePolyVerts: Float32Array
+	scenePolyNumVerts: number
+	scenePolyPic: (tx.Pic | null)[]
+	scenePolyTextured: Uint8Array
+	scenePolyTwosided: Uint8Array
+	scenePolyFirst: Int32Array
+	scenePolyCount: Int32Array
+	scenePolyBatches: number
 	lightmap_modified: boolean[]
 	drawsky: boolean
 	model_vbo: WebGLBuffer
 	cl_worldmodel: Model
-	oldviewleaf: Leaf
+	oldviewleaf: number
 	mod_novis: Uint8Array
 	mod_novis_capacity: number
+	// persistent decompress target for leafPVS -- rebuilds happen every leaf crossing
+	// while moving, and a fresh vis row per rebuild was the top steady-state allocator
+	leafpvs_scratch: Uint8Array
 	fatbytes: number
 	fatpvs: Uint8Array
 	fatpvs_capacity: number;
+	fatpvs_scratch: Uint8Array
 	skyvecs: WebGLBuffer
+	// Retained copy of the classic sky-dome geometry (180 verts × vec3) so the WebGPU backend can upload
+	// its own dome vertex buffer. Only populated when the active backend is WebGPU (null under WebGL2).
+	skyvecs_data: Float32Array | null
+	cached_vis: Uint8Array
+	// Decoupled-mode (r_gpucull) efrag cache: leaf indices (leafEfrags keys) that are visible
+	// AND own an efrag chain, valid while the viewleaf/world/novis/static-count are unchanged.
+	// Cuts markEfrags' per-frame full-leaf walk + PVS decompress to a short cached loop.
+	efragCacheWorld: Model | null
+	efragCacheLeaf: number
+	efragCacheNovis: number
+	efragCacheStatics: number
+	efragCacheLeaves: Int32Array | null
+	efragCacheCount: number
+	viewAnglesRad: V3
+	viewMatrix: number[]
+	// Persistent FrameGlobals handed to getRenderer().beginScene() each frame (mutated in place, no
+	// per-frame alloc). Float32Array mirrors of the same values perspective() computes/uploads; the
+	// WebGL2 backend ignores it, the WebGPU backend uploads it to a uniform buffer. See updateFrameGlobals.
+	frameGlobals: FrameGlobals
+	// Retained copy of the world model VBO (44-byte interleaved verts) so the WebGPU backend can upload
+	// its own vertex buffer. Only populated when the active backend is WebGPU (null under WebGL2).
+	model_vbo_data: Float32Array | null
+	// WebGPU lightmap-array consolidation: retained parallel per-vertex lightmap-layer stream
+	// (4 float32 layers per vertex, same vertex count/order as model_vbo_data) so the WebGPU backend can
+	// upload its own layer vertex buffer. Only populated when the active backend is WebGPU (null under WebGL2).
+	model_lmlayer_data: Float32Array | null
+	activeDlights: Int32Array
+	numActiveDlights: number
+	// Packed per-frame dlight uniforms for the Brush fragment shader (GPU dlighting):
+	// vec4(origin.xyz, radius) and vec4(color.rgb, minlight) per light, MAX_DLIGHTS slots.
+	// numShaderDlights is 0 when flashblend or r_dynamic 0 disable surface dlighting.
+	dlightPosRadius: Float32Array
+	dlightColor: Float32Array
+	numShaderDlights: number
+	// framecount of the last dlight uniform upload — drawTextureChains runs per
+	// brush entity, but the packed arrays only change once per frame.
+	dlightUniformFrame: number
+	// Persistent hot-path temporaries, consumed immediately at their single call
+	// site — never held across calls.
+	cullMins: V3
+	cullMaxs: V3
+	// Saved main-view origin/angles while the skyroom sub-view borrows refdef (renderView).
+	skyroomSaveOrg: V3
+	skyroomSaveAng: V3
+	// setupAliasFrame() result: byte offsets of the two poses to blend between in
+	// the alias model's cmds VBO, and the blend factor. Mutated in place per draw.
+	aliasLerp: { pose1ofs: number, pose2ofs: number, blend: number }
+	// Persistent SceneSetup handed to getRenderer().beginScene() each frame (mutated in place to
+	// avoid a per-frame allocation in the render hot path).
+	sceneSetup: SceneSetup
 }
 
 export const state: RState = {
 	framecount: 0,
-	pefragtopnode: null,
 	dlightvecs: null,
 	warpbuffer: null,
 	warprenderbuffer: null,
@@ -125,12 +229,23 @@ export const state: RState = {
 	alphaskytexture: null,
 	null_texture: null,
 	visframecount: 0,
+	frustumFlat: new Float32Array(16),
+	frustumSignbits: new Uint8Array(4),
+	frustumFrame: 0,
+	frustumWalkStack: new Int32Array(2048),
 	warpwidth: 0,
 	warpheight: 0,
 	oldwarpwidth: 0,
 	oldwarpheight: 0,
+	warpSupported: true,
+	warpDepthFormat: 0,
+	warpDepthAttachment: 0,
 	c_brush_verts: 0,
 	c_alias_polys: 0,
+	rs_markms: 0,
+	rs_walkms: 0,
+	rs_rebuilds: 0,
+	builtWorldmodel: null,
 	frustum: [{
 		normal: [0, 0, 0],
 		dist: 0,
@@ -165,7 +280,9 @@ export const state: RState = {
 		vieworg: [0.0, 0.0, 0.0],
 		viewangles: [0.0, 0.0, 0.0],
 		fov_y: 0,
-		fov_x: 0
+		fov_x: 0,
+		drawworld: true,
+		drawviewmodel: true
 	},
 	perspective: [
 		0.0, 0.0, 0.0, 0.0,
@@ -174,7 +291,7 @@ export const state: RState = {
 		0.0, 0.0, -524288.0 / 65532.0, 0.0
 	],
 	dowarp: false,
-	viewleaf: null,
+	viewleaf: -1,
 	skytexturenum: 0,
 	avertexnormals: [],
 	ramp1: [],
@@ -182,19 +299,71 @@ export const state: RState = {
 	ramp3: [],
 	numparticles: 0,
 	avelocities: [],
-	particles: [],
+	particleOrg: new Float32Array(0),
+	particleVel: new Float32Array(0),
+	particleRamp: new Float32Array(0),
+	particleDie: new Float32Array(0),
+	particleColor: new Uint8Array(0),
+	particleType: new Uint8Array(0),
+	numActiveParticles: 0,
+	particleInstanceData: new ArrayBuffer(0),
+	particleInstanceFloats: new Float32Array(0),
+	particleInstanceBytes: new Uint8Array(0),
+	particleCornerBuffer: null,
+	particleInstanceBuffer: null,
 	tracercount: 0,
+	scenePolyVerts: new Float32Array(256 * 9),
+	scenePolyNumVerts: 0,
+	scenePolyPic: new Array(64).fill(null),
+	scenePolyTextured: new Uint8Array(64),
+	scenePolyTwosided: new Uint8Array(64),
+	scenePolyFirst: new Int32Array(64),
+	scenePolyCount: new Int32Array(64),
+	scenePolyBatches: 0,
 	lightmap_modified: [],
 	drawsky: false,
 	model_vbo: null,
 	cl_worldmodel: null,
-	oldviewleaf: null,
+	oldviewleaf: -1,
 	mod_novis: null,
 	mod_novis_capacity: 0,
+	leafpvs_scratch: null,
 	fatbytes: 0,
 	fatpvs: null,
 	fatpvs_capacity: 0,
-	skyvecs: null
+	fatpvs_scratch: null,
+	skyvecs: null,
+	skyvecs_data: null,
+	cached_vis: null,
+	efragCacheWorld: null,
+	efragCacheLeaf: -1,
+	efragCacheNovis: 0,
+	efragCacheStatics: -1,
+	efragCacheLeaves: null,
+	efragCacheCount: 0,
+	viewAnglesRad: [0.0, 0.0, 0.0],
+	viewMatrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+	frameGlobals: {
+		viewOrigin: new Float32Array(3),
+		viewAngles: new Float32Array(9),
+		perspective: new Float32Array(16),
+		vpn: new Float32Array(3),
+		gamma: 1.0,
+	},
+	model_vbo_data: null,
+	model_lmlayer_data: null,
+	activeDlights: new Int32Array(MAX_DLIGHTS),
+	numActiveDlights: 0,
+	dlightPosRadius: new Float32Array(MAX_DLIGHTS * 4),
+	dlightColor: new Float32Array(MAX_DLIGHTS * 4),
+	numShaderDlights: 0,
+	dlightUniformFrame: -1,
+	cullMins: [0.0, 0.0, 0.0],
+	cullMaxs: [0.0, 0.0, 0.0],
+	skyroomSaveOrg: [0.0, 0.0, 0.0],
+	skyroomSaveAng: [0.0, 0.0, 0.0],
+	aliasLerp: { pose1ofs: 0, pose2ofs: 0, blend: 1.0 },
+	sceneSetup: { x: 0, y: 0, width: 0, height: 0, dowarp: false }
 }
 
 export const cvr = {
@@ -207,43 +376,29 @@ export type Color = [number, number, number]
 
 // efrag
 
-export const splitEntityOnNode = function (node: Node | Leaf, entity: Entity, emins: V3, emaxs: V3) {
-	if (node.contents === mod.CONTENTS.solid)
-		return;
-
-	// add an efrag if the node is a leaf
-	if (node.contents < 0) {
-		const leaf = node as Leaf
-		if (!state.pefragtopnode)
-			state.pefragtopnode = leaf;
-
-		const efrags = {
-			leafnext: leaf.efrags,
-			entity
-		}
-
-		leaf.efrags = efrags
-
+// nodeC: flat child encoding (>= 0 node index, < 0 leaf as -1 - leafnum).
+// Walks nodePacked; efrags attach to the flat per-leaf leafEfrags heads.
+export const splitEntityOnNode = function (nodeC: number, entity: Entity, emins: V3, emaxs: V3) {
+	const wm = cl.clState.worldmodel;
+	if (nodeC < 0) {
+		// leaf: add an efrag unless it's the solid leaf
+		const leafnum = -1 - nodeC;
+		if (wm.leafContents[leafnum] === mod.CONTENTS.solid)
+			return;
+		wm.leafEfrags[leafnum] = { leafnext: wm.leafEfrags[leafnum], entity }
 		return;
 	}
-	const _node = node as Node
-	var sides = vec.boxOnPlaneSide(emins, emaxs, _node.plane);
-	if (sides === 3) {
-		// split on this plane
-		// if this is the first splitter of this bmodel, remember it
-		if (!state.pefragtopnode)
-			state.pefragtopnode = _node;
-	}
-
+	const base = nodeC * 16;
+	var sides = vec.boxOnPlaneSide(emins, emaxs, wm.planes[wm.nodePlane[nodeC]]);
 	if ((sides & 1) !== 0)
-		splitEntityOnNode(_node.children[0], entity, emins, emaxs);
+		splitEntityOnNode(wm.nodePackedI32[base + 13], entity, emins, emaxs);
 	if ((sides & 2) !== 0)
-		splitEntityOnNode(_node.children[1], entity, emins, emaxs);
+		splitEntityOnNode(wm.nodePackedI32[base + 14], entity, emins, emaxs);
 };
 
 const storeEfrags = (efrag: EFrags) => {
 	for(var _efrag = efrag; !!_efrag; _efrag = _efrag.leafnext) {
-		var ent = efrag.entity
+		var ent = _efrag.entity
 		if (ent.visframe !== host.state.framecount && cl.state.numvisedicts < def.max_vis_edicts) {
 			cl.state.visedicts[cl.state.numvisedicts++] = ent
 			ent.visframe = host.state.framecount
@@ -258,219 +413,212 @@ R_AnimateLight
 ==================
 */
 const animateLight = () => {
-	if (cvr.fullbright.value === 1) {
-		for (var j = 0; j < lm.MAX_LIGHTSTYLES; j++) {
-			lm.state.lightstylevalue[j] = 264;
-		}
-		return
-	}
-
 	//
 	// light animations
 	// 'm' is normal light, 'a' is no light, 'z' is double bright
-	var i = Math.floor(cl.clState.time * 10)
+	var t = cl.clState.time * 10.0;
+	var base = Math.floor(t);
+	var i = base;
+	var f = t - base;
+	if (cvr.lerplightstyles.value === 0)
+		f = 0.0;
+
 	for (var j = 0; j < lm.MAX_LIGHTSTYLES; j++) {
-		if (cl.state.lightstyle[j].length === 0) {
-			lm.state.lightstylevalue[j] = 264;
-			continue;
+		var val
+		if (cvr.fullbright.value === 1 || cl.state.lightstyle[j].length === 0) {
+			val = 264;
 		}
-
-		var k = i % cl.state.lightstyle[j].length;
-		k = cl.state.lightstyle[j].charCodeAt(k) - 97; // 'a'
-
-		lm.state.lightstylevalue[j] = k * 22;
+		else {
+			var idx = i % cl.state.lightstyle[j].length;
+			var next = idx + 1;
+			if (next === cl.state.lightstyle[j].length)
+				next = 0;
+			var k = cl.state.lightstyle[j].charCodeAt(idx) - 97; // 'a'
+			var n = cl.state.lightstyle[j].charCodeAt(next) - 97; // 'a'
+			// only interpolate abrupt changes (e.g. flickering light in e1m1) if r_lerplightstyles >= 2
+			if (cvr.lerplightstyles.value < 2 && Math.abs(n - k) >= 6)
+				n = k;
+			val = (k * 22 + (n - k) * 22 * f) | 0;
+		}
 		//johnfitz
+		if (lm.state.lightstylevalue[j] !== val) {
+			lm.state.lightstylevalue[j] = val;
+			lm.state.lightstyle_uniform_dirty = true
+		}
 	}
 }
 
-export const renderDlights = function () {
-	const gl = GL.getContext()
-	if (cvr.flashblend.value === 0)
-		return;
-	++lm.state.dlightframecount;
-	gl.enable(gl.BLEND);
-	var program = GL.useProgram('Dlight'), l, a;
-	gl.bindBuffer(gl.ARRAY_BUFFER, state.dlightvecs);
-	gl.vertexAttribPointer(program.attributeMap.aPosition.location, 3, gl.FLOAT, false, 0, 0); // TODO: is this fixed now?
-	for (var i = 0; i <= 31; ++i) {
-		l = cl.state.dlights[i];
-		if ((l.die < cl.clState.time) || (l.radius === 0.0))
-			continue;
-		if (vec.length([l.origin[0] - state.refdef.vieworg[0], l.origin[1] - state.refdef.vieworg[1], l.origin[2] - state.refdef.vieworg[2]]) < (l.radius * 0.35)) {
-			a = l.radius * 0.0003;
-			v.blend[3] += a * (1.0 - v.blend[3]);
-			a /= v.blend[3];
-			v.blend[0] = v.blend[1] * (1.0 - a) + (255.0 * a);
-			v.blend[1] = v.blend[1] * (1.0 - a) + (127.5 * a);
-			v.blend[2] *= 1.0 - a;
-			continue;
-		}
-		gl.uniform3fv(program.uniforms.uOrigin, l.origin);
-		gl.uniform1f(program.uniforms.uRadius, l.radius);
-		gl.drawArrays(gl.TRIANGLE_FAN, 0, 18);
-	}
-	gl.disable(gl.BLEND);
-};
+// renderDlights body (flashblend glow-ball fan + near-light v.blend accumulation) moved to
+// WebGLRenderer.drawFlashblendDlights (render phase1 particle/flashblend slice). renderScene calls it
+// through getRenderer(); the CPU dlight gather (gatherDlights, below) stays here.
 
-export const markLights = function (light: cl.DynamicLight, bit: number, node: Node | Leaf) {
-	if (node.contents < 0)
-		return;
-	const _node = node as Node
-	var worldmodel = cl.clState.worldmodel
-	var dist = 0, impact: V3 = [0,0,0]
-	var l, i, j, s, t;
-
-	var splitplane = _node.plane;
-	if (splitplane.type < 3)
-		dist = light.origin[splitplane.type] - splitplane.dist;
-	else
-		dist = vec.dotProductV3(light.origin, splitplane.normal) - splitplane.dist;
-
-	if (dist > light.radius) {
-		markLights(light, bit, _node.children[0]);
-		return;
-	}
-	if (dist < -light.radius) {
-		markLights(light, bit, _node.children[1]);
-		return;
-	}
-	var surf;
-	var maxdist = light.radius * light.radius;
-	for (i = 0; i < _node.numfaces; ++i) {
-		surf = cl.clState.worldmodel.faces[_node.firstface + i];
-		if ((surf.sky === true) || (surf.turbulent === true))
-			continue;
-
-		for (j = 0; j < 3; j++)
-			impact[j] = light.origin[j] - surf.plane.normal[j] * dist;
-		var texvecs = worldmodel.texinfo[surf.texinfo].vecs
-		// clamp center of light to corner and check brightness
-		l = vec.dotProductV3(impact, texvecs[0]) + texvecs[0][3] - surf.texturemins[0];
-		s = l + 0.5; if (s < 0) s = 0; else if (s > surf.extents[0]) s = surf.extents[0];
-		s = l - s;
-		l = vec.dotProductV3(impact, texvecs[1]) + texvecs[1][3] - surf.texturemins[1];
-		t = l + 0.5; if (t < 0) t = 0; else if (t > surf.extents[1]) t = surf.extents[1];
-		t = l - t;
-
-		if ((s * s + t * t + dist * dist) >= maxdist)
-			continue
-
-		if (surf.dlightframe !== lm.state.dlightframecount) {
-			surf.dlightbits[bit >> 5] = 1 << (bit & 31)
-			surf.dlightframe = lm.state.dlightframecount;
-		} else {
-			surf.dlightbits[bit >> 5] |= 1 << (bit & 31)
-		}
-	}
-	markLights(light, bit, _node.children[0]);
-	markLights(light, bit, _node.children[1]);
-};
-
-export const pushDlights = () => {
-	if (cvr.flashblend.value !== 0)
-		return;
-
-	lm.state.dlightframecount = state.framecount + 1
+export const gatherDlights = () => {
+	state.numActiveDlights = 0;
 	for (var i = 0; i < cl.state.dlights.length; ++i) {
-		var l = cl.state.dlights[i];
-		if ((l.die >= cl.clState.time) && (l.radius !== 0.0)) {
-			markLights(l, i, cl.clState.worldmodel.nodes[0])
+		var dl = cl.state.dlights[i];
+		if ((dl.die >= cl.clState.time) && (dl.radius !== 0.0))
+			state.activeDlights[state.numActiveDlights++] = i;
+	}
+
+	// Pack active dlights for the Brush fragment shader's analytic accumulation.
+	// Flashblend (glow-ball rendering) and r_dynamic 0 disable surface dlighting,
+	// matching the old CPU overlay path's behavior.
+	if (cvr.flashblend.value !== 0 || cvr.dynamic.value === 0) {
+		state.numShaderDlights = 0;
+	} else {
+		state.numShaderDlights = state.numActiveDlights;
+		for (i = 0; i < state.numActiveDlights; ++i) {
+			var dl = cl.state.dlights[state.activeDlights[i]];
+			var o = i * 4;
+			state.dlightPosRadius[o] = dl.origin[0];
+			state.dlightPosRadius[o + 1] = dl.origin[1];
+			state.dlightPosRadius[o + 2] = dl.origin[2];
+			state.dlightPosRadius[o + 3] = dl.radius;
+			state.dlightColor[o] = dl.color[0];
+			state.dlightColor[o + 1] = dl.color[1];
+			state.dlightColor[o + 2] = dl.color[2];
+			state.dlightColor[o + 3] = dl.minlight;
 		}
 	}
 };
 
-export const recursiveLightPoint = function (node: Node, start: V3, end: V3): 0 | -1 | Color {
-	if (node.contents < 0)
-		return -1;
+// nodeC is the flat child encoding: >= 0 is a node index, < 0 is a leaf
+// (-1 - leafnum). Walks nodePacked so no Node objects are needed.
+export const recursiveLightPoint = function (nodeC: number, start: V3, end: V3, cache: LightCache): 0 | -1 | 1 {
+	if (nodeC < 0)
+		return -1; // leaf: no lightmapped surface here
 
-	var normal = node.plane.normal;
-	var front = start[0] * normal[0] + start[1] * normal[1] + start[2] * normal[2] - node.plane.dist;
-	var back = end[0] * normal[0] + end[1] * normal[1] + end[2] * normal[2] - node.plane.dist;
+	const wm = cl.clState.worldmodel;
+	const pf = wm.nodePacked, pi = wm.nodePackedI32;
+	const base = nodeC * 16;
+	var n0 = pf[base + 6], n1 = pf[base + 7], n2 = pf[base + 8], dist = pf[base + 9];
+	var front = start[0] * n0 + start[1] * n1 + start[2] * n2 - dist;
+	var back = end[0] * n0 + end[1] * n1 + end[2] * n2 - dist;
 	var side = front < 0;
+	const nearC = side ? pi[base + 14] : pi[base + 13];
+	const farC = side ? pi[base + 13] : pi[base + 14];
 
 	if ((back < 0) === side)
-		return recursiveLightPoint(node.children[side === true ? 1 : 0] as Node, start, end);
+		return recursiveLightPoint(nearC, start, end, cache);
 
 	var frac = front / (front - back);
-	var mid: V3 = [
-		start[0] + (end[0] - start[0]) * frac,
-		start[1] + (end[1] - start[1]) * frac,
-		start[2] + (end[2] - start[2]) * frac
-	];
+	var mid: V3 = vec.scratch();
+	mid[0] = start[0] + (end[0] - start[0]) * frac;
+	mid[1] = start[1] + (end[1] - start[1]) * frac;
+	mid[2] = start[2] + (end[2] - start[2]) * frac;
 
-	var r = recursiveLightPoint(node.children[side === true ? 1 : 0] as Node, start, mid);
+	var r = recursiveLightPoint(nearC, start, mid, cache);
 	if (r !== 0 && r !== -1)
 		return r;
 
 	if ((back < 0) === side)
 		return -1;
 
-	var i, surf, tex, s, t, ds, dt, lightmap, size, maps;
-	for (i = 0; i < node.numfaces; ++i) {
-		surf = cl.clState.worldmodel.faces[node.firstface + i];
+	const firstface = pi[base + 11], numfaces = pi[base + 12];
+	var i, surf, tex, s, t, ds, dt;
+	for (i = 0; i < numfaces; ++i) {
+		surf = wm.faces[firstface + i];
 		if ((surf.sky === true) || (surf.turbulent === true))
 			continue;
 
-		tex = cl.clState.worldmodel.texinfo[surf.texinfo];
+		if (surf.decoupled) {
+			// lmvecs project world->luxels directly (texturemins folded into .w).
+			var lv = surf.lmvecs as Float32Array;
+			ds = mid[0] * lv[0] + mid[1] * lv[1] + mid[2] * lv[2] + lv[3];
+			dt = mid[0] * lv[4] + mid[1] * lv[5] + mid[2] * lv[6] + lv[7];
+			if ((ds < 0) || (dt < 0))
+				continue;
+			if ((ds > surf.lmwidth - 1) || (dt > surf.lmheight - 1))
+				continue;
+			if (surf.lightofs === 0)
+				return 0;
+			ds = Math.floor(ds);
+			dt = Math.floor(dt);
+		} else {
+			tex = wm.texinfo[surf.texinfo];
 
-		s = vec.dotProductV3(mid, tex.vecs[0]) + tex.vecs[0][3];
-		t = vec.dotProductV3(mid, tex.vecs[1]) + tex.vecs[1][3];
-		if ((s < surf.texturemins[0]) || (t < surf.texturemins[1]))
-			continue;
+			s = vec.dotProductV3(mid, tex.vecs[0]) + tex.vecs[0][3];
+			t = vec.dotProductV3(mid, tex.vecs[1]) + tex.vecs[1][3];
+			if ((s < wm.faceTexturemins[surf.num * 2]) || (t < wm.faceTexturemins[surf.num * 2 + 1]))
+				continue;
 
-		ds = s - surf.texturemins[0];
-		dt = t - surf.texturemins[1];
-		if ((ds > surf.extents[0]) || (dt > surf.extents[1]))
-			continue;
+			ds = s - wm.faceTexturemins[surf.num * 2];
+			dt = t - wm.faceTexturemins[surf.num * 2 + 1];
+			if ((ds > wm.faceExtents[surf.num * 2]) || (dt > wm.faceExtents[surf.num * 2 + 1]))
+				continue;
 
-		if (surf.lightofs === 0)
-			return 0;
+			if (surf.lightofs === 0)
+				return 0;
 
-		ds >>= 4;
-		dt >>= 4;
-
-		lightmap = surf.lightofs;
-		if (lightmap === 0)
-			return 0;
-
-		lightmap = surf.lightofs;
-		if (lightmap === 0)
-			return 0;
-
-		lightmap += (dt * ((surf.extents[0] >> 4) + 1) + ds) * 3;
-		r = [0, 0, 0];
-		size = ((surf.extents[0] >> 4) + 1) * ((surf.extents[1] >> 4) + 1) * 3;
-		for (maps = 0; maps < surf.styles.length; ++maps)
-		{
-				r = [
-					r[0] + cl.clState.worldmodel.lightdata[lightmap] * lm.state.lightstylevalue[surf.styles[maps]],
-					r[1] + cl.clState.worldmodel.lightdata[lightmap + 1] * lm.state.lightstylevalue[surf.styles[maps]],
-					r[2] + cl.clState.worldmodel.lightdata[lightmap + 2] * lm.state.lightstylevalue[surf.styles[maps]],
-				] 
-			lightmap += size;
+			ds >>= surf.lmshift;
+			dt >>= surf.lmshift;
 		}
-		
-		return [
-			r[0] >> 8,
-			r[1] >> 8,
-			r[2] >> 8,
-		]
+
+		cache.surf = firstface + i + 1;
+		cache.ds = ds;
+		cache.dt = dt;
+		return 1;
 	}
-	return recursiveLightPoint(node.children[side !== true ? 1 : 0] as Node, mid, end);
+	return recursiveLightPoint(farC, mid, end, cache);
 };
 
-export const lightPoint = function (p: V3): Color {
-	if (cl.clState.worldmodel.lightdata == null){
-		return [255, 255, 255];
-	}
-	
-	const r = recursiveLightPoint(cl.clState.worldmodel.nodes[0] as Node, p, [p[0], p[1], p[2] - 2048.0]);
-	
-	if (r === -1 || r === 0) {
-		return [0, 0, 0];
+export const sampleLightmap = function (surfIdx: number, ds: number, dt: number, out: Color): Color {
+	var wm = cl.clState.worldmodel;
+	var surf = wm.faces[surfIdx - 1];
+	var w = surf.decoupled ? surf.lmwidth : (wm.faceExtents[surf.num * 2] >> surf.lmshift) + 1;
+	var h = surf.decoupled ? surf.lmheight : (wm.faceExtents[surf.num * 2 + 1] >> surf.lmshift) + 1;
+	var lightmap = surf.lightofs + (dt * w + ds) * 3;
+	var size = w * h * 3;
+
+	out[0] = 0; out[1] = 0; out[2] = 0;
+	for (var maps = 0; maps < wm.faceNumStyles[surf.num]; ++maps)
+	{
+		var sv = lm.state.lightstylevalue[wm.faceStyles[surf.num * 4 + maps]];
+		out[0] += wm.lightdata[lightmap] * sv;
+		out[1] += wm.lightdata[lightmap + 1] * sv;
+		out[2] += wm.lightdata[lightmap + 2] * sv;
+		lightmap += size;
 	}
 
-	return r
+	out[0] = out[0] >> 8;
+	out[1] = out[1] >> 8;
+	out[2] = out[2] >> 8;
+	return out;
+};
+
+// retryOfs (Ironwail r_alias.c, vkQuake #550): when the first trace hits nothing, retry from p.z + retryOfs
+// (callers pass model maxs[2]*0.5) — lights models whose origin sits slightly below floor (DOTM candles).
+export const lightPoint = function (p: V3, cache: LightCache, retryOfs = 0): Color {
+	if (cl.clState.worldmodel.lightdata == null){
+		const out = vec.scratch(); out[0] = 255; out[1] = 255; out[2] = 255;
+		return out as Color;
+	}
+
+	if (cache.surf === 0 || Math.abs(cache.pos[0] - p[0]) >= 1 || Math.abs(cache.pos[1] - p[1]) >= 1 || Math.abs(cache.pos[2] - p[2]) >= 1) {
+		cache.pos[0] = p[0]; cache.pos[1] = p[1]; cache.pos[2] = p[2];
+		cache.surf = 0;
+
+		const end = vec.scratch();
+		// 8192 trace depth per Ironwail gl_rlight.c ("was 2048") — 2048 left entities unlit on tall maps
+		end[0] = p[0]; end[1] = p[1]; end[2] = p[2] - 8192.0;
+		let r = recursiveLightPoint(0, p, end, cache);
+
+		if (r !== 1 && retryOfs > 0) {
+			const start = vec.scratch();
+			start[0] = p[0]; start[1] = p[1]; start[2] = p[2] + retryOfs;
+			end[2] = start[2] - 8192.0;
+			r = recursiveLightPoint(0, start, end, cache);
+		}
+
+		if (r !== 1)
+			cache.surf = -1;
+	}
+
+	if (cache.surf > 0)
+		return sampleLightmap(cache.surf, cache.ds, cache.dt, vec.scratch() as Color);
+
+	const out = vec.scratch(); out[0] = 0; out[1] = 0; out[2] = 0;
+	return out as Color;
 };
 
 // const cullBox = function(mins, maxs)
@@ -487,110 +635,20 @@ export const lightPoint = function (p: V3): Color {
 
 export const cullBox = function (emins: V3, emaxs: V3) {
 	for (var i = 0; i < 4; i++) {
-		var p = state.frustum[i];
-		switch (p.signbits) {
-			default:
-			case 0:
-				if (p.normal[0] * emaxs[0] + p.normal[1] * emaxs[1] + p.normal[2] * emaxs[2] < p.dist)
-					return true;
-				break;
-			case 1:
-				if (p.normal[0] * emins[0] + p.normal[1] * emaxs[1] + p.normal[2] * emaxs[2] < p.dist)
-					return true;
-				break;
-			case 2:
-				if (p.normal[0] * emaxs[0] + p.normal[1] * emins[1] + p.normal[2] * emaxs[2] < p.dist)
-					return true;
-				break;
-			case 3:
-				if (p.normal[0] * emins[0] + p.normal[1] * emins[1] + p.normal[2] * emaxs[2] < p.dist)
-					return true;
-				break;
-			case 4:
-				if (p.normal[0] * emaxs[0] + p.normal[1] * emaxs[1] + p.normal[2] * emins[2] < p.dist)
-					return true;
-				break;
-			case 5:
-				if (p.normal[0] * emins[0] + p.normal[1] * emaxs[1] + p.normal[2] * emins[2] < p.dist)
-					return true;
-				break;
-			case 6:
-				if (p.normal[0] * emaxs[0] + p.normal[1] * emins[1] + p.normal[2] * emins[2] < p.dist)
-					return true;
-				break;
-			case 7:
-				if (p.normal[0] * emins[0] + p.normal[1] * emins[1] + p.normal[2] * emins[2] < p.dist)
-					return true;
-				break;
-		}
+		var o = i * 4;
+		var nx = state.frustumFlat[o], ny = state.frustumFlat[o + 1], nz = state.frustumFlat[o + 2], dist = state.frustumFlat[o + 3];
+		var sb = state.frustumSignbits[i];
+		var px = (sb & 1) !== 0 ? emins[0] : emaxs[0];
+		var py = (sb & 2) !== 0 ? emins[1] : emaxs[1];
+		var pz = (sb & 4) !== 0 ? emins[2] : emaxs[2];
+		if (nx * px + ny * py + nz * pz < dist)
+			return true;
 	}
 	return false;
 };
 
-export const drawSpriteModel = function (e: Entity) {
-	var program = GL.useProgram('Sprite', true);
-	var num = e.frame;
-	if ((num >= e.model.numframes) || (num < 0)) {
-		con.dPrint('R.DrawSpriteModel: no such frame ' + num + '\n');
-		num = 0;
-	}
-	var frame = e.model.frames[num] as SpriteFrame | SpriteFrameGroup;
-	if (frame.group === true) {
-		var fullinterval, targettime, i, time = cl.clState.time + e.syncbase;
-		num = frame.frames.length - 1;
-		fullinterval = frame.frames[num].interval;
-		targettime = time - Math.floor(time / fullinterval) * fullinterval;
-		for (i = 0; i < num; ++i) {
-			if (frame.frames[i].interval > targettime)
-				break;
-		}
-		frame = frame.frames[i];
-	}
-
-	tx.bind(program.textures.tTexture, frame.texturenum, true);
-	var r = vec.emptyV3(), u = vec.emptyV3()
-	if (e.model.oriented === true) {
-		vec.angleVectors(e.angles, null, r, u);
-	}
-	else {
-		r = state.vright;
-		u = state.vup;
-	}
-	var p = e.origin;
-	var x1 = frame.origin[0], y1 = frame.origin[1], x2 = x1 + frame.width, y2 = y1 + frame.height;
-
-	GL.streamGetSpace(6);
-	GL.streamWriteFloat3(
-		p[0] + x1 * r[0] + y1 * u[0],
-		p[1] + x1 * r[1] + y1 * u[1],
-		p[2] + x1 * r[2] + y1 * u[2]);
-	GL.streamWriteFloat2(0.0, 1.0);
-	GL.streamWriteFloat3(
-		p[0] + x1 * r[0] + y2 * u[0],
-		p[1] + x1 * r[1] + y2 * u[1],
-		p[2] + x1 * r[2] + y2 * u[2]);
-	GL.streamWriteFloat2(0.0, 0.0);
-	GL.streamWriteFloat3(
-		p[0] + x2 * r[0] + y1 * u[0],
-		p[1] + x2 * r[1] + y1 * u[1],
-		p[2] + x2 * r[2] + y1 * u[2]);
-	GL.streamWriteFloat2(1.0, 1.0);
-	GL.streamWriteFloat3(
-		p[0] + x2 * r[0] + y1 * u[0],
-		p[1] + x2 * r[1] + y1 * u[1],
-		p[2] + x2 * r[2] + y1 * u[2]);
-	GL.streamWriteFloat2(1.0, 1.0);
-	GL.streamWriteFloat3(
-		p[0] + x1 * r[0] + y2 * u[0],
-		p[1] + x1 * r[1] + y2 * u[1],
-		p[2] + x1 * r[2] + y2 * u[2]);
-	GL.streamWriteFloat2(0.0, 0.0);
-	GL.streamWriteFloat3(
-		p[0] + x2 * r[0] + y2 * u[0],
-		p[1] + x2 * r[1] + y2 * u[1],
-		p[2] + x2 * r[2] + y2 * u[2]);
-	GL.streamWriteFloat2(1.0, 0.0);
-};
+// drawSpriteModel body (billboard quad stream) moved to WebGLRenderer (render phase1
+// entity/alias/sprite slice). Called there by the drawEntities sprite sub-pass.
 
 state.avertexnormals = [
 	[-0.525731, 0.0, 0.850651],
@@ -757,231 +815,189 @@ state.avertexnormals = [
 	[-0.688191, -0.587785, -0.425325]
 ];
 
-export const drawAliasModel = function (e: Entity) {
-	const gl = GL.getContext()
-	var clmodel = e.model;
+// Persistent, load-time constant — never mutated.
+const negX: V3 = [-1.0, 0.0, 0.0];
 
-	if (cullBox(
-		[
-			e.origin[0] - clmodel.boundingradius,
-			e.origin[1] - clmodel.boundingradius,
-			e.origin[2] - clmodel.boundingradius
-		],
-		[
-			e.origin[0] + clmodel.boundingradius,
-			e.origin[1] + clmodel.boundingradius,
-			e.origin[2] + clmodel.boundingradius
-		]) === true)
+const clamp = (min: number, v: number, max: number) => v < min ? min : (v > max ? max : v)
+
+// Port of Ironwail R_SetupAliasFrame (r_alias.c:84-149): resolves this draw's pose
+// via the same frame/framegroup pick logic as before, updates the entity's pose-lerp
+// bookkeeping, and writes the resulting blend into state.aliasLerp.
+export const setupAliasFrame = function (e: Entity, clmodel: Model) {
+	var num = e.frame, i, fullinterval, targettime;
+	if ((num >= clmodel.numframes) || (num < 0)) {
+		// QSS-M R_AliasSetupFrame names the model — without it a bad-precache model is undebuggable
+		con.dPrint('R.DrawAliasModel: no such frame ' + num + ' for \'' + clmodel.name + '\'\n');
+		num = 0;
+	}
+	if ((e.lerpflags & LERP.explicit) !== 0) {
+		// QSS R_SetupAliasFrame's LERP_EXPLICIT branch (r_alias.c:795-836).
+		var frame2 = e.snapFrame2 >> 0;
+		var frac = e.snapLerpfrac;
+		if ((frame2 >= clmodel.numframes) || (frame2 < 0))
+			frame2 = 0;
+		var xlerp = state.aliasLerp;
+		var strongerNum = (frac > 0.5) ? frame2 : num;
+		var stronger = clmodel.frames[strongerNum] as AliasFrame | AliasFrameGroup;
+		if (stronger.group === true) {
+			// framegroup + two-way blend only: animate within it on its own snap clock
+			// (QSS r_alias.c:804-825)
+			var sg = stronger as AliasFrameGroup;
+			var st = (frac > 0.5) ? e.snapTime2 : e.snapTime1;
+			if (st < 0)
+				st = 0;
+			var sf = st / sg.frames[0].interval;
+			var spose = sf >> 0;
+			xlerp.blend = sf - spose;
+			var sn = sg.frames.length;
+			xlerp.pose1ofs = sg.frames[spose % sn].cmdofs;
+			xlerp.pose2ofs = sg.frames[(spose + 1) % sn].cmdofs;
+		}
+		else {
+			xlerp.blend = frac;
+			// Quirk mirrored on purpose: BOTH pose indices modulo the FIRST frame's pose
+			// count (QSS r_alias.c:831-834).
+			var mposes = (clmodel.frames[num] as AliasFrameGroup).group === true ? (clmodel.frames[num] as AliasFrameGroup).frames.length : 1;
+			var pf = clmodel.frames[num] as AliasFrame | AliasFrameGroup;
+			xlerp.pose1ofs = (pf as AliasFrameGroup).group === true
+				? (pf as AliasFrameGroup).frames[((e.snapTime1 / (pf as AliasFrameGroup).frames[0].interval) >>> 0) % mposes].cmdofs
+				: (pf as AliasFrame).cmdofs;
+			var pf2 = clmodel.frames[frame2] as AliasFrame | AliasFrameGroup;
+			xlerp.pose2ofs = (pf2 as AliasFrameGroup).group === true
+				? (pf2 as AliasFrameGroup).frames[((e.snapTime2 / (pf2 as AliasFrameGroup).frames[0].interval) >>> 0) % mposes].cmdofs
+				: (pf2 as AliasFrame).cmdofs;
+		}
 		return;
+	}
 
-	var program;
-	if ((e.colormap !== 0) && (clmodel.player === true) && (cvr.nocolors.value === 0)) {
-		program = GL.useProgram('Player');
-		var top = (cl.clState.scores[e.colormap - 1].colors & 0xf0) + 4;
-		var bottom = ((cl.clState.scores[e.colormap - 1].colors & 0xf) << 4) + 4;
-		if (top <= 127)
-			top += 7;
-		if (bottom <= 127)
-			bottom += 7;
-		top = vid.d_8to24table[top];
-		bottom = vid.d_8to24table[bottom];
-		gl.uniform3f(program.uniforms.uTop, top & 0xff, (top >> 8) & 0xff, top >> 16);
-		gl.uniform3f(program.uniforms.uBottom, bottom & 0xff, (bottom >> 8) & 0xff, bottom >> 16);
+	var time = cl.clState.time + e.syncbase;
+	var frame = clmodel.frames[num] as AliasFrame | AliasFrameGroup;
+	var isGroup = frame.group === true;
+	if (isGroup) {
+		var group = frame as AliasFrameGroup;
+		num = group.frames.length - 1;
+		fullinterval = group.frames[num].interval;
+		targettime = time - Math.floor(time / fullinterval) * fullinterval;
+		for (i = 0; i < num; ++i) {
+			if (group.frames[i].interval > targettime)
+				break;
+		}
+		frame = group.frames[i];
+		e.lerptime = group.frames[0].interval;
 	}
 	else
-		program = GL.useProgram('Alias');
-	gl.uniform3fv(program.uniforms.uOrigin, e.origin);
-	gl.uniformMatrix3fv(program.uniforms.uAngles, false, GL.rotationMatrix(e.angles[0], e.angles[1], e.angles[2]));
+		e.lerptime = 0.1;
+	var posenum = (frame as AliasFrame).cmdofs;
 
-	var ambientlight = lightPoint(e.origin);
-	
-	if (e === cl.clState.viewent)  {
-		add = 72 - (ambientlight[0] + ambientlight[1] + ambientlight[2])
-		if (add > 0) {
-			ambientlight[0] += add / 3
-			ambientlight[1] += add / 3
-			ambientlight[2] += add / 3
+	if ((e.lerpflags & LERP.resetanim) !== 0) { // kill any lerp in progress
+		e.lerpstart = 0;
+		e.previouspose = posenum;
+		e.currentpose = posenum;
+		e.lerpflags &= ~LERP.resetanim;
+	}
+	else if (e.currentpose !== posenum) { // pose changed, start new lerp
+		if ((e.lerpflags & LERP.resetanim2) !== 0) { // defer lerping one more time
+			e.lerpstart = 0;
+			e.previouspose = posenum;
+			e.currentpose = posenum;
+			e.lerpflags &= ~LERP.resetanim2;
 		}
-	}
-	var i, dl, add;
-	for (i = 0; i <= 31; ++i) {
-		dl = cl.state.dlights[i];
-		if (dl.die < cl.clState.time)
-			continue;
-		add = dl.radius - vec.length([e.origin[0] - dl.origin[0], e.origin[1] - dl.origin[1], e.origin[1] - dl.origin[1]]);
-		if (add > 0.0) {
-			ambientlight = vec.vectorMA(ambientlight, add, dl.color)
-		}
-	}
-
-	var shadelight: Color = [...ambientlight]
-
-	// // todo - full bright & overbright
-
-	ambientlight[0] = ambientlight[0] > 128.0 ? 128.0 : ambientlight[0]
-	ambientlight[1] = ambientlight[1] > 128.0 ? 128.0 : ambientlight[1]
-	ambientlight[2] = ambientlight[2] > 128.0 ? 128.0 : ambientlight[2]
-
-	shadelight[0] = ambientlight[0] + shadelight[0] > 192.0 ? 192.0 - ambientlight[0] : shadelight[0]
-	shadelight[1] = ambientlight[1] + shadelight[1] > 192.0 ? 192.0 - ambientlight[1] : shadelight[1]
-	shadelight[2] = ambientlight[2] + shadelight[2] > 192.0 ? 192.0 - ambientlight[2] : shadelight[2]
-
-	// minimum light value on players (8)
-	if ((e.num >= 1) && (e.num <= cl.clState.maxclients)) {
-		add = 24.0 - (ambientlight[0] + ambientlight[1] + ambientlight[2]);
-		if (add > 0.0) {
-			ambientlight[0] += add / 3.0
-			ambientlight[1] += add / 3.0
-			ambientlight[2] += add / 3.0
-			shadelight = [...ambientlight]
-		}
-	}
-	gl.uniform3fv(program.uniforms.uAmbientLight, vec.multiplyScaler(ambientlight, 0.0078125));
-	gl.uniform3fv(program.uniforms.uShadeLight, vec.multiplyScaler(shadelight, 0.0078125));
-
-	var forward:V3 = [0,0,0], right:V3 = [0,0,0], up:V3 = [0,0,0];
-	vec.angleVectors(e.angles, forward, right, up);
-	gl.uniform3fv(program.uniforms.uLightVec, [
-		vec.dotProductV3([-1.0, 0.0, 0.0], forward),
-		-vec.dotProductV3([-1.0, 0.0, 0.0], right),
-		vec.dotProductV3([-1.0, 0.0, 0.0], up)
-	]);
-
-	state.c_alias_polys += clmodel.numtris;
-
-	var num, fullinterval, targettime, i;
-	var time = cl.clState.time + e.syncbase;
-	num = e.frame;
-	if ((num >= clmodel.numframes) || (num < 0)) {
-		con.dPrint('R.DrawAliasModel: no such frame ' + num + '\n');
-		num = 0;
-	}
-	var frame = clmodel.frames[num] as AliasFrame | AliasFrameGroup;
-	if (frame.group === true) {
-		num = frame.frames.length - 1;
-		fullinterval = frame.frames[num].interval;
-		targettime = time - Math.floor(time / fullinterval) * fullinterval;
-		for (i = 0; i < num; ++i) {
-			if (frame.frames[i].interval > targettime)
-				break;
-		}
-		frame = frame.frames[i];
-	}
-	gl.bindBuffer(gl.ARRAY_BUFFER, clmodel.cmds);
-	gl.vertexAttribPointer(program.attributeMap.aPosition.location, 3, gl.FLOAT, false, 24, frame.cmdofs);
-	gl.vertexAttribPointer(program.attributeMap.aNormal.location, 3, gl.FLOAT, false, 24, frame.cmdofs + 12);
-	gl.vertexAttribPointer(program.attributeMap.aTexCoord.location, 2, gl.FLOAT, false, 0, 0);
-
-	num = e.skinnum;
-	if ((num >= clmodel.numskins) || (num < 0)) {
-		con.dPrint('R.DrawAliasModel: no such skin # ' + num + '\n');
-		num = 0;
-	}
-	var skin = clmodel.skins[num];
-	if (skin.group === true) {
-		num = skin.skins.length - 1;
-		fullinterval = skin.skins[num].interval;
-		targettime = time - Math.floor(time / fullinterval) * fullinterval;
-		for (i = 0; i < num; ++i) {
-			if (skin.skins[i].interval > targettime)
-				break;
-		}
-		skin = skin.skins[i];
-	}
-	tx.bind(program.textures.tTexture, skin.texturenum.texnum);
-	if ((e.colormap !== 0) && (clmodel.player === true) && (cvr.nocolors.value === 0))
-		tx.bind(program.textures.tPlayer, skin.playertexture);
-
-	gl.drawArrays(gl.TRIANGLES, 0, clmodel.numtris * 3);
-};
-
-export const drawEntitiesOnList = function (alphaPass: boolean) {
-	const gl = GL.getContext()
-
-	if (cvr.drawentities.value === 0)
-		return;
-	var i, ent, entalpha
-	for (i = 0; i < cl.state.numvisedicts; ++i) {
-		ent = cl.state.visedicts[i];
-		entalpha = pr.decodeAlpha(ent.alpha);
-		if (ent.model == null || (entalpha === 1 && alphaPass))
-			continue;
-		switch (ent.model.type) {
-			case mod.TYPE.alias:
-				drawAliasModel(ent);
-				continue;
-			case mod.TYPE.brush:
-				drawBrushModel(ent);
+		else {
+			e.lerpstart = cl.clState.time;
+			e.previouspose = e.currentpose;
+			e.currentpose = posenum;
 		}
 	}
 
-	if (!alphaPass) {
-		GL.streamFlush();
-		gl.depthMask(false);
-		gl.enable(gl.BLEND);
-		for (i = 0; i < cl.state.numvisedicts; ++i) {
-			ent = cl.state.visedicts[i];
-			if (ent.model == null)
-				continue;
-			if (ent.model.type === mod.TYPE.sprite)
-				drawSpriteModel(ent);
-		}
-		GL.streamFlush();
-		gl.disable(gl.BLEND);
-		gl.depthMask(true);
+	if (e.previouspose < 0) // never-drawn entity that skipped the resetanim paths
+		e.previouspose = e.currentpose;
+
+	var lerp = state.aliasLerp;
+	if (cvr.lerpmodels.value !== 0 && !(clmodel.nolerp && cvr.lerpmodels.value !== 2)) {
+		if ((e.lerpflags & LERP.finish) !== 0 && !isGroup)
+			lerp.blend = clamp(0, (cl.clState.time - e.lerpstart) / (e.lerpfinish - e.lerpstart), 1);
+		else
+			lerp.blend = clamp(0, (cl.clState.time - e.lerpstart) / e.lerptime, 1);
+		if (lerp.blend === 1)
+			e.previouspose = e.currentpose;
+		lerp.pose1ofs = e.previouspose;
+		lerp.pose2ofs = e.currentpose;
+	}
+	else { // don't lerp
+		lerp.blend = 1;
+		lerp.pose1ofs = posenum;
+		lerp.pose2ofs = posenum;
 	}
 };
 
-export const drawViewModel = function () {
-	const gl = GL.getContext()
-	if (cvr.drawviewmodel.value === 0)
-		return;
-	if (chase.cvr.active.value !== 0)
-		return;
-	if (cvr.drawentities.value === 0)
-		return;
-	if ((cl.clState.items & def.IT.invisibility) !== 0)
-		return;
-	if (cl.clState.stats[def.STAT.health] <= 0)
-		return;
-	if (cl.clState.viewent.model == null)
-		return;
+// Port of Ironwail R_SetupEntityTransform (r_alias.c:156-211): resolves the
+// MOVETYPE_STEP origin/angle lerp state and writes the blended transform into
+// originOut/anglesOut (vec.ts out-param convention).
+export const setupEntityTransform = function (e: Entity, originOut: V3, anglesOut: V3): V3 {
+	if ((e.lerpflags & LERP.resetmove) !== 0) { // kill any lerps in progress
+		e.movelerpstart = 0;
+		vec.copy(e.origin, e.previousorigin);
+		vec.copy(e.origin, e.currentorigin);
+		vec.copy(e.angles, e.previousangles);
+		vec.copy(e.angles, e.currentangles);
+		e.lerpflags &= ~LERP.resetmove;
+	}
+	else if (e.origin[0] !== e.currentorigin[0] || e.origin[1] !== e.currentorigin[1] || e.origin[2] !== e.currentorigin[2] ||
+		e.angles[0] !== e.currentangles[0] || e.angles[1] !== e.currentangles[1] || e.angles[2] !== e.currentangles[2]) { // origin/angles changed, start new lerp
+		e.movelerpstart = cl.clState.time;
+		vec.copy(e.currentorigin, e.previousorigin);
+		vec.copy(e.origin, e.currentorigin);
+		vec.copy(e.currentangles, e.previousangles);
+		vec.copy(e.angles, e.currentangles);
+	}
 
-	gl.depthRange(0.0, 0.3);
+	if (cvr.lerpmove.value !== 0 && e !== cl.clState.viewent && (e.lerpflags & LERP.movestep) !== 0) {
+		var blend: number;
+		if ((e.lerpflags & LERP.finish) !== 0)
+			blend = clamp(0, (cl.clState.time - e.movelerpstart) / (e.lerpfinish - e.movelerpstart), 1);
+		else
+			blend = clamp(0, (cl.clState.time - e.movelerpstart) / 0.1, 1);
 
-	var ymax = 4.0 * Math.tan(scr.cvr.fov.value * 0.82 * Math.PI / 360.0);
-	state.perspective[0] = 4.0 / (ymax * state.refdef.vrect.width / state.refdef.vrect.height);
-	state.perspective[5] = 4.0 / ymax;
-	var program = GL.useProgram('Alias');
-	gl.uniformMatrix4fv(program.uniforms.uPerspective, false, state.perspective);
+		originOut[0] = e.previousorigin[0] + (e.currentorigin[0] - e.previousorigin[0]) * blend;
+		originOut[1] = e.previousorigin[1] + (e.currentorigin[1] - e.previousorigin[1]) * blend;
+		originOut[2] = e.previousorigin[2] + (e.currentorigin[2] - e.previousorigin[2]) * blend;
 
-	drawAliasModel(cl.clState.viewent);
+		var d;
+		d = e.currentangles[0] - e.previousangles[0];
+		if (d > 180) d -= 360; else if (d < -180) d += 360;
+		anglesOut[0] = e.previousangles[0] + d * blend;
 
-	ymax = 4.0 * Math.tan(state.refdef.fov_y * Math.PI / 360.0);
-	state.perspective[0] = 4.0 / (ymax * state.refdef.vrect.width / state.refdef.vrect.height);
-	state.perspective[5] = 4.0 / ymax;
-	program = GL.useProgram('Alias');
-	gl.uniformMatrix4fv(program.uniforms.uPerspective, false, state.perspective);
+		d = e.currentangles[1] - e.previousangles[1];
+		if (d > 180) d -= 360; else if (d < -180) d += 360;
+		anglesOut[1] = e.previousangles[1] + d * blend;
 
-	gl.depthRange(0.0, 1.0);
+		d = e.currentangles[2] - e.previousangles[2];
+		if (d > 180) d -= 360; else if (d < -180) d += 360;
+		anglesOut[2] = e.previousangles[2] + d * blend;
+	}
+	else { // don't lerp
+		vec.copy(e.origin, originOut);
+		vec.copy(e.angles, anglesOut);
+	}
+	return originOut;
 };
 
-export const polyBlend = function () {
-	if (cvr.polyblend.value === 0)
-		return;
-	if (v.blend[3] === 0.0)
-		return;
-	GL.useProgram('Fill', true);
-	var vrect = state.refdef.vrect;
-	GL.streamDrawColoredQuad(vrect.x, vrect.y, vrect.width, vrect.height,
-		v.blend[0], v.blend[1], v.blend[2], v.blend[3] * 255.0);
-};
+// drawAliasModel / drawEntitiesOnList / drawViewModel bodies (the entity/alias/sprite/viewmodel
+// gl.* submission) moved to WebGLRenderer.drawEntities / drawViewModel (render phase1
+// entity/alias/sprite slice). The backend-agnostic CPU helpers they call — cullBox,
+// setupEntityTransform, setupAliasFrame, lightPoint — stay here and are exported for the backend;
+// brush-type entities still dispatch back through the exported drawBrushModel (below).
+
+// polyBlend moved to WebGLRenderer.polyBlend (render phase1 frame-skeleton slice).
 
 export const setFrustum = function () {
-	state.frustum[0].normal = vec.rotatePointAroundVector(state.vup, state.vpn, -(90.0 - state.refdef.fov_x * 0.5));
-	state.frustum[1].normal = vec.rotatePointAroundVector(state.vup, state.vpn, 90.0 - state.refdef.fov_x * 0.5);
-	state.frustum[2].normal = vec.rotatePointAroundVector(state.vright, state.vpn, 90.0 - state.refdef.fov_y * 0.5);
-	
+	vec.rotatePointAroundVector(state.vup, state.vpn, -(90.0 - state.refdef.fov_x * 0.5), state.frustum[0].normal);
+	vec.rotatePointAroundVector(state.vup, state.vpn, 90.0 - state.refdef.fov_x * 0.5, state.frustum[1].normal);
+	vec.rotatePointAroundVector(state.vright, state.vpn, 90.0 - state.refdef.fov_y * 0.5, state.frustum[2].normal);
+	// the fourth plane was missing since the original port -- everything below/above (per
+	// sign) was never culled, which also masked bad model radii on that edge
+	vec.rotatePointAroundVector(state.vright, state.vpn, -(90.0 - state.refdef.fov_y * 0.5), state.frustum[3].normal);
+
 	var i, out;
 	for (i = 0; i <= 3; ++i) {
 		out = state.frustum[i];
@@ -994,65 +1010,151 @@ export const setFrustum = function () {
 			out.signbits += 2;
 		if (out.normal[2] < 0.0)
 			out.signbits += 4;
+
+		state.frustumFlat[i * 4] = out.normal[0];
+		state.frustumFlat[i * 4 + 1] = out.normal[1];
+		state.frustumFlat[i * 4 + 2] = out.normal[2];
+		state.frustumFlat[i * 4 + 3] = out.dist;
+		state.frustumSignbits[i] = out.signbits;
 	}
 };
 
 
-export const perspective = function () {
-	const gl = GL.getContext()
-	var viewangles = [
-		state.refdef.viewangles[0] * Math.PI / 180.0,
-		(state.refdef.viewangles[1] - 90.0) * Math.PI / -180.0,
-		state.refdef.viewangles[2] * Math.PI / -180.0
-	];
+// Fill a 9-element column-major mat3 from refdef.viewangles — the view rotation both perspective()
+// (WebGL uniform broadcast) and updateFrameGlobals() (WebGPU uniform buffer) need. Single-sourced so
+// the two backends stay bit-identical. `out` is number[] (state.viewMatrix) or Float32Array (globals).
+export const computeViewMatrix = function (out: number[] | Float32Array) {
+	var viewangles = state.viewAnglesRad;
+	viewangles[0] = state.refdef.viewangles[0] * Math.PI / 180.0;
+	viewangles[1] = (state.refdef.viewangles[1] - 90.0) * Math.PI / -180.0;
+	viewangles[2] = state.refdef.viewangles[2] * Math.PI / -180.0;
 	var sp = Math.sin(viewangles[0]);
 	var cp = Math.cos(viewangles[0]);
 	var sy = Math.sin(viewangles[1]);
 	var cy = Math.cos(viewangles[1]);
 	var sr = Math.sin(viewangles[2]);
 	var cr = Math.cos(viewangles[2]);
-	var viewMatrix = [
-		cr * cy + sr * sp * sy, cp * sy, -sr * cy + cr * sp * sy,
-		cr * -sy + sr * sp * cy, cp * cy, -sr * -sy + cr * sp * cy,
-		sr * cp, -sp, cr * cp
-	];
+	out[0] = cr * cy + sr * sp * sy; out[1] = cp * sy; out[2] = -sr * cy + cr * sp * sy;
+	out[3] = cr * -sy + sr * sp * cy; out[4] = cp * cy; out[5] = -sr * -sy + cr * sp * cy;
+	out[6] = sr * cp; out[7] = -sp; out[8] = cr * cp;
+};
 
-	if (v.cvr.gamma.value < 0.2)
-		cvar.setValue('gamma', 0.2);
-	else if (v.cvr.gamma.value > 1.0)
-		cvar.setValue('gamma', 1.0);
-
-	GL.unbindProgram();
-	var i, program;
-	for (i = 0; i < GL.state.programs.length; ++i) {
-		program = GL.state.programs[i];
-		gl.useProgram(program.program);
-		if (program.uniforms.uViewOrigin != null)
-			gl.uniform3fv(program.uniforms.uViewOrigin, state.refdef.vieworg);
-		if (program.uniforms.uViewAngles != null)
-			gl.uniformMatrix3fv(program.uniforms.uViewAngles, false, viewMatrix);
-		if (program.uniforms.uPerspective != null)
-			gl.uniformMatrix4fv(program.uniforms.uPerspective, false, state.perspective);
-		if (program.uniforms.uGamma != null)
-			gl.uniform1f(program.uniforms.uGamma, v.cvr.gamma.value);
+// Rebase a view-relative (RF_VIEWMODEL) entity into world space against the current refdef; QSS
+// instead drops the view transform from the modelview (r_alias.c:1127-1133) — same product.
+// origin/angles are in the quake camera frame (x forward, y left, z up); rotation = R(view)·R(ent).
+// Writes origin in place and the column-major mat3 (scale folded) into outMat. Shared by both
+// backends so their math cannot drift.
+export const composeViewmodelTransform = function (origin: V3, angles: V3, scalefactor: number, outMat: number[] | Float32Array) {
+	var f = vec.scratch(), rt = vec.scratch(), u = vec.scratch();
+	vec.angleVectors(state.refdef.viewangles, f, rt, u);
+	var vo = state.refdef.vieworg;
+	var o0 = origin[0], o1 = origin[1], o2 = origin[2];
+	origin[0] = vo[0] + f[0] * o0 - rt[0] * o1 + u[0] * o2;
+	origin[1] = vo[1] + f[1] * o0 - rt[1] * o1 + u[1] * o2;
+	origin[2] = vo[2] + f[2] * o0 - rt[2] * o1 + u[2] * o2;
+	var E = GL.rotationMatrix(angles[0], angles[1], angles[2], scalefactor);
+	for (var j = 0; j < 3; ++j) {
+		var ex = E[3 * j], ey = E[3 * j + 1], ez = E[3 * j + 2];
+		outMat[3 * j] = f[0] * ex - rt[0] * ey + u[0] * ez;
+		outMat[3 * j + 1] = f[1] * ex - rt[1] * ey + u[1] * ez;
+		outMat[3 * j + 2] = f[2] * ex - rt[2] * ey + u[2] * ez;
 	}
 };
 
-export const setupGL = function () {
-	const gl = GL.getContext()
-	if (state.dowarp === true) {
-		gl.bindFramebuffer(gl.FRAMEBUFFER, state.warpbuffer);
-		gl.clear(gl.COLOR_BUFFER_BIT + gl.DEPTH_BUFFER_BIT);
-		gl.viewport(0, 0, state.warpwidth, state.warpheight);
-	}
-	else {
-		var vrect = state.refdef.vrect;
-		var pixelRatio = scr.state.devicePixelRatio;
-		gl.viewport((vrect.x * pixelRatio) >> 0, ((vid.state.height - vrect.height - vrect.y) * pixelRatio) >> 0, (vrect.width * pixelRatio) >> 0, (vrect.height * pixelRatio) >> 0);
-	}
-	perspective();
-	gl.enable(gl.DEPTH_TEST);
+// ---- csqc 3D (world-space) polygons: FTE's cl_stris scene-triangle list ----
+// A non-2D csqc fan is buffered, not drawn, when the QC ends it: CSQC_PolyFlush appends a
+// scenetris_t (FTE pr_csqc.c:1508-1521) that the scene consumes with the rest of the blend-sorted
+// geometry (BE_GenPolyBatches, gl_alias.c:2851-2896/3071).
+// LIFECYCLE, mirrored here: the pool is emptied only by clearscene (CL_ClearEntityLists), and
+// renderscene READS it without consuming (gl_alias.c:3074-3076) — so polys accumulate until the next
+// clearscene, every renderscene in between redraws them, and a fan buffered outside a scene is not
+// dropped but waits for the next renderscene.
+export const SCENEPOLY_FLOATS = 9
+// FTE force-flushes at 32768 verts (pr_csqc.c:1638); a buffered batch cannot flush, so cap instead.
+const SCENEPOLY_MAX_VERTS = 32768
+const SCENEPOLY_MAX_BATCHES = 64
+
+// Drop everything buffered. clearscene's half of CL_ClearEntityLists.
+export const clearScenePolygons = function () {
+	state.scenePolyNumVerts = 0;
+	state.scenePolyBatches = 0;
 };
+
+// One [x,y,z,u,v,r,g,b,a] vertex from a fan into the triangle-list pool.
+const copyScenePolyVert = function (dst: Float32Array, o: number, src: Float32Array, v: number): number {
+	dst[o] = src[v]; dst[o + 1] = src[v + 1]; dst[o + 2] = src[v + 2];
+	dst[o + 3] = src[v + 3]; dst[o + 4] = src[v + 4];
+	dst[o + 5] = src[v + 5]; dst[o + 6] = src[v + 6]; dst[o + 7] = src[v + 7]; dst[o + 8] = src[v + 8];
+	return o + SCENEPOLY_FLOATS;
+};
+
+// Buffer one world-space fan, expanded to count-2 triangles as FTE's index builder does
+// (pr_csqc.c:1671-1679). Consecutive polys with the same pic and flags extend the previous batch
+// (FTE's PF_R_PolygonBegin continuation test, pr_csqc.c:1591).
+export const scenePolygon = function (pic: tx.Pic | null, textured: boolean, twosided: boolean,
+	verts: Float32Array, count: number) {
+	if (count < 3)
+		return;
+	const tris = count - 2, add = tris * 3;
+	const need = state.scenePolyNumVerts + add;
+	if (need > SCENEPOLY_MAX_VERTS)
+		return;
+	if ((need * SCENEPOLY_FLOATS) > state.scenePolyVerts.length) {
+		// Cold path: the pool settles at the largest frame the mod ever draws and never grows again.
+		var len = state.scenePolyVerts.length;
+		while (len < (need * SCENEPOLY_FLOATS))
+			len *= 2;
+		const grown = new Float32Array(len);
+		grown.set(state.scenePolyVerts);
+		state.scenePolyVerts = grown;
+	}
+	const tex = textured ? 1 : 0, two = twosided ? 1 : 0;
+	var b = state.scenePolyBatches - 1;
+	if ((b < 0) || (state.scenePolyPic[b] !== pic) || (state.scenePolyTextured[b] !== tex)
+		|| (state.scenePolyTwosided[b] !== two)) {
+		if (state.scenePolyBatches >= SCENEPOLY_MAX_BATCHES)
+			return;
+		b = state.scenePolyBatches++;
+		state.scenePolyPic[b] = pic;
+		state.scenePolyTextured[b] = tex;
+		state.scenePolyTwosided[b] = two;
+		state.scenePolyFirst[b] = state.scenePolyNumVerts;
+		state.scenePolyCount[b] = 0;
+	}
+	const dst = state.scenePolyVerts;
+	var o = state.scenePolyNumVerts * SCENEPOLY_FLOATS;
+	for (var i = 2; i < count; ++i) {
+		o = copyScenePolyVert(dst, o, verts, 0);
+		o = copyScenePolyVert(dst, o, verts, (i - 1) * SCENEPOLY_FLOATS);
+		o = copyScenePolyVert(dst, o, verts, i * SCENEPOLY_FLOATS);
+	}
+	state.scenePolyNumVerts += add;
+	state.scenePolyCount[b] += add;
+};
+
+// Refresh state.frameGlobals from the same values perspective() uploads, for backends (WebGPU) that
+// consume the struct instead of the per-program GL broadcast. Reuses the persistent Float32Arrays —
+// no per-frame allocation. Called in renderScene before beginScene; the WebGL2 path never reads it.
+export const updateFrameGlobals = function () {
+	const fg = state.frameGlobals;
+	computeViewMatrix(fg.viewAngles);
+	var o = state.refdef.vieworg;
+	fg.viewOrigin[0] = o[0]; fg.viewOrigin[1] = o[1]; fg.viewOrigin[2] = o[2];
+	var p = state.perspective;
+	for (var i = 0; i < 16; i++) fg.perspective[i] = p[i];
+	fg.vpn[0] = state.vpn[0]; fg.vpn[1] = state.vpn[1]; fg.vpn[2] = state.vpn[2];
+	// Clamp to the usable range (and write back, so the menu slider shows the applied value).
+	// Backend-agnostic: gamma 0 would otherwise blow every shader's pow(rgb, gamma) to white.
+	if (v.cvr.gamma.value < 0.2) cvar.setValue('gamma', 0.2);
+	else if (v.cvr.gamma.value > 1.0) cvar.setValue('gamma', 1.0);
+	fg.gamma = v.cvr.gamma.value;
+};
+
+// perspective() (the WebGL per-program view/projection/gamma uniform broadcast) moved to
+// WebGLRenderer.beginScene (render phase3 slice). computeViewMatrix + state.perspective/vpn/viewMatrix
+// stay here as shared scene data; WebGPU consumes them via updateFrameGlobals/FrameGlobals.
+
+// setupGL body moved to WebGLRenderer.beginScene (render phase1 frame-skeleton slice).
 
 // let array = []
 // let lastREport = 0
@@ -1068,46 +1170,130 @@ export const setupGL = function () {
 // 	}
 // }
 export const renderScene = function () {
-	const gl = GL.getContext()
 	animateLight();
 	vec.angleVectors(state.refdef.viewangles, state.vpn, state.vright, state.vup);
 	state.viewleaf = mod.pointInLeaf(state.refdef.vieworg, cl.clState.worldmodel);
-	v.setContentsColor(state.viewleaf.contents);
+	const viewleafContents = cl.clState.worldmodel.leafContents[state.viewleaf];
+	v.setContentsColor(viewleafContents);
 	v.calcBlend();
-	state.dowarp = (cvr.waterwarp.value !== 0) && (state.viewleaf.contents <= mod.CONTENTS.water);
+	state.dowarp = (cvr.waterwarp.value !== 0) && (viewleafContents <= mod.CONTENTS.water) && (state.warpSupported !== false);
 	setFrustum();
-	setupGL();
-	markSurfaces();
-	cullSurfaces(cl.clState.worldmodel, TexChain.world)
-	gl.enable(gl.CULL_FACE);
-	drawSkyBox();
-	drawViewModel();
-	drawTextureChains(gl, cl.clState.worldmodel, null, TexChain.world);
-	drawEntitiesOnList(false);
-	drawTextureChains_water(gl, cl.clState.worldmodel, null, TexChain.world);
-	drawEntitiesOnList(true);
-	gl.disable(gl.CULL_FACE);
-	renderDlights();
-	drawParticles();
+	// beginScene ← former setupGL (warp-FBO redirect / viewport / perspective broadcast / depth
+	// enable). Mutate the persistent SceneSetup in place (no per-frame allocation in this hot path).
+	state.sceneSetup.x = state.refdef.vrect.x;
+	state.sceneSetup.y = state.refdef.vrect.y;
+	state.sceneSetup.width = state.refdef.vrect.width;
+	state.sceneSetup.height = state.refdef.vrect.height;
+	state.sceneSetup.dowarp = state.dowarp;
+	// Refresh the persistent FrameGlobals (view basis/projection) from the same values perspective()
+	// broadcasts, and hand them to the backend. WebGL2 ignores them (perspective() still runs inside
+	// its beginScene); WebGPU uploads them to its world uniform buffer.
+	updateFrameGlobals();
+	getRenderer().beginScene(state.sceneSetup, state.frameGlobals);
+	var rs_t = performance.now();
+	// Decoupled GPU-cull mode (WebGPU + r_gpucull + cull data built — checked AFTER beginScene, which
+	// builds the per-map cull data): the compute cull is the world's visibility, so skip the CPU
+	// markSurfaces chain-stamping + the markWorldFrustum walk it would duplicate. Only the efrag gather
+	// (static entities, PVS-driven) and the sky gather (cull.skyFaces in the backend) remain CPU-side.
+	// QSS gates the whole world half of the scene on r_refdef.drawworld (R_SetupView's R_MarkSurfaces,
+	// then R_RenderScene's sky/world/particle calls).
+	if (!state.refdef.drawworld) {
+		state.rs_markms = 0;
+		state.rs_walkms = 0;
+	} else if (getRenderer().gpuCullActive()) {
+		markEfrags();
+		state.rs_markms = performance.now() - rs_t;
+		state.rs_walkms = 0;
+	} else {
+		markSurfaces();
+		state.rs_markms = performance.now() - rs_t;
+		rs_t = performance.now();
+		markWorldFrustum();
+		state.rs_walkms = performance.now() - rs_t;
+	}
+	// Back-face culling brackets the opaque world/entity draws but not the billboarded particles/
+	// flashblend that follow. The toggle is WebGL GL state (WebGPU sets cull per-pipeline), so it now
+	// lives in the WebGL backend: drawSky enables CULL_FACE, drawFlashblendDlights disables it — keeping
+	// the exact same enable-before-sky / disable-before-flashblend transitions this loop used to make.
+	if (state.refdef.drawworld)
+		getRenderer().drawSky();
+	if (state.refdef.drawviewmodel)
+		getRenderer().drawViewModel(cl.clState.viewent);
+	if (state.refdef.drawworld)
+		getRenderer().drawWorldSurfaces(cl.clState.worldmodel, null, 'solid');
+	getRenderer().drawEntities(false);
+	if (state.refdef.drawworld) {
+		getRenderer().drawWorldSurfaces(cl.clState.worldmodel, null, 'litwater');
+		getRenderer().drawWorldSurfaces(cl.clState.worldmodel, null, 'turb');
+	}
+	getRenderer().drawEntities(true);
+	getRenderer().drawFlashblendDlights();
+	if (state.refdef.drawworld) {
+		runParticles();
+		getRenderer().drawClassicParticles();
+		pscript.runPScriptParticles();
+		getRenderer().drawScriptParticles();
+	}
+	// csqc 3D polygons last, with the blend-sorted soup (BE_GenPolyBatches, gl_alias.c:3071). NOT
+	// gated on drawworld: FTE gates the poly batches on RDF_DISABLEPARTICLES alone.
+	getRenderer().drawScenePolygons();
 };
 
 export const renderView = function () {
-	const gl = GL.getContext()
-	gl.finish();
+	// During a map change mod.clearAll guts the old worldmodel while the client
+	// can still be connected for a few frames (async spawnServer yields) — don't
+	// walk a gutted world; the loading plaque/console covers the screen.
+	if (!cl.clState.worldmodel || (cl.clState.worldmodel as any).nodes == null)
+		return;
+	// The engine's own 3D pass always draws world + viewmodel (QSS gl_screen.c:1181); csqc's
+	// clearscene owns these only for the scenes it builds.
+	state.refdef.drawworld = true;
+	state.refdef.drawviewmodel = true;
 	var time1;
 	if (cvr.speeds.value !== 0)
 		time1 = sys.floatTime();
 	state.c_brush_verts = 0;
 	state.c_alias_polys = 0;
-	gl.clear(gl.COLOR_BUFFER_BIT + gl.DEPTH_BUFFER_BIT);
+	state.rs_rebuilds = 0;
+	getRenderer().clearFrame(true, true);
+
+	// Skyroom (_skyroom): draw the world once from the skyroom camera into color+depth,
+	// then clear only depth so the main pass composites over it through the sky windows.
+	// Gated on a sky surface having been visible last frame (QSS gl_rmain.c:1208 R_RenderView).
+	sky.state.skyroom_drawn = false;
+	if (sky.state.skyroom_enabled && sky.state.skyVisibleLastFrame && cl.clState.worldmodel) {
+		vec.copy(state.refdef.vieworg, state.skyroomSaveOrg);
+		vec.copy(state.refdef.viewangles, state.skyroomSaveAng);
+		// vieworg = skyroom_origin + parallax * mainvieworg (QSS VectorMA, gl_rmain.c:1216);
+		// angles unchanged (spin/orientation parsed but not applied — minimal key first).
+		var sr = sky.state.skyroom_origin;
+		state.refdef.vieworg[0] = sr[0] + sr[3] * state.skyroomSaveOrg[0];
+		state.refdef.vieworg[1] = sr[1] + sr[3] * state.skyroomSaveOrg[1];
+		state.refdef.vieworg[2] = sr[2] + sr[3] * state.skyroomSaveOrg[2];
+		sky.state.skyroom_drawing = true;
+		renderScene();
+		sky.state.skyroom_drawing = false;
+		vec.copy(state.skyroomSaveOrg, state.refdef.vieworg);
+		vec.copy(state.skyroomSaveAng, state.refdef.viewangles);
+		sky.state.skyroom_drawn = true;
+		getRenderer().clearFrame(false, true); // keep skyroom color, reset depth for the main view
+	}
+
+	// reset the sky-visible accumulator; drawSkyBox sets it when a sky surface draws
+	sky.state.skyVisibleThisFrame = false;
 	renderScene();
+	// 1-frame-lagged gate for next frame; never render a skyroom from inside the void
+	sky.state.skyVisibleLastFrame = cl.clState.worldmodel.leafContents[state.viewleaf] === mod.CONTENTS.solid
+		? false : sky.state.skyVisibleThisFrame;
+	sky.state.skyroom_drawn = false;
 	if (cvr.speeds.value !== 0) {
 		var time2 = Math.floor((sys.floatTime() - time1) * 1000.0);
 		var c_brush_polys = state.c_brush_verts / 3;
 		var c_alias_polys = state.c_alias_polys;
 		var message = ((time2 >= 100) ? '' : ((time2 >= 10) ? ' ' : '  ')) + time2 + ' ms  ';
 		message += ((c_brush_polys >= 1000) ? '' : ((c_brush_polys >= 100) ? ' ' : ((c_brush_polys >= 10) ? '  ' : '   '))) + c_brush_polys + ' wpoly ';
-		message += ((c_alias_polys >= 1000) ? '' : ((c_alias_polys >= 100) ? ' ' : ((c_alias_polys >= 10) ? '  ' : '   '))) + c_alias_polys + ' epoly\n';
+		message += ((c_alias_polys >= 1000) ? '' : ((c_alias_polys >= 100) ? ' ' : ((c_alias_polys >= 10) ? '  ' : '   '))) + c_alias_polys + ' epoly ';
+		message += 'mark ' + state.rs_markms.toFixed(1) + ' walk ' + state.rs_walkms.toFixed(1) + (state.rs_rebuilds ? ' REBUILD' : '') + '\n';
 		con.print(message);
 	}
 };
@@ -1146,8 +1332,9 @@ export const initTextures = function () {
 };
 
 export const init = function () {
-	const gl = GL.getContext()
-	batchRender.init(gl)
+	// fresh GL context (first init or game-view remount): any previously built
+	// VBO/lightmap textures belong to the dead context, force a rebuild
+	state.builtWorldmodel = null
 	initTextures();
 
 	cmd.addCommand('timerefresh', timeRefresh_f);
@@ -1162,115 +1349,46 @@ export const init = function () {
 	cvr.polyblend = cvar.registerVariable('gl_polyblend', '1');
 	cvr.flashblend = cvar.registerVariable('gl_flashblend', '0');
 	cvr.nocolors = cvar.registerVariable('gl_nocolors', '0');
-	cvr.overbright = cvar.registerVariable('gl_overbright', '0');
+	cvr.overbright = cvar.registerVariable('gl_overbright', '1');
 	cvr.fullbrights = cvar.registerVariable('gl_fullbrights', '1');
-	cvr.oldskyleaf = cvar.registerVariable('oldskyleaf', '0')
+	cvr.oldskyleaf = cvar.registerVariable('r_oldskyleaf', '0')
 	cvr.flatlightstyles = cvar.registerVariable('r_flatlightstyles', '0')
+	cvr.lerplightstyles = cvar.registerVariable('r_lerplightstyles', '1', true)
+  cvr.litwater = cvar.registerVariable('r_litwater', '1')
   cvr.wateralpha = cvar.registerVariable('r_wateralpha', '1')
   cvr.lavaalpha = cvar.registerVariable('r_lavaalpha', '0')
   cvr.telealpha = cvar.registerVariable('r_telealpha', '0')
   cvr.slimealpha = cvar.registerVariable('r_slimealpha', '0')
   cvr.dynamic = cvar.registerVariable('r_dynamic', '1')
   cvr.test = cvar.registerVariable('r_test', '0')
+  cvr.lerpmodels = cvar.registerVariable('r_lerpmodels', '1')
+  cvr.lerpmove = cvar.registerVariable('r_lerpmove', '1')
+  // WebGPU-only: route world visibility+index-gathering through a GPU compute cull + one
+  // drawIndexedIndirect per texture batch (render/webgpu/gpuCull.ts). 1 (default) = the GPU compute-cull
+  // path for ALL world passes (solid + fence + lit water + turb; sky stays CPU) — skips the CPU
+  // markSurfaces chain rebuild and frustum walk entirely. 0 = the verified CPU chain path (fallback).
+  cvr.gpucull = cvar.registerVariable('r_gpucull', '1')
+  // WebGPU-only (Ironwail bmodel instancing): fold brush ENTITIES (doors/plats/func_ brushwork and
+  // external .bsp brush models) into the GPU-driven path — their triangles are baked per (texture, fence)
+  // at map load into one shared index buffer, and a frame only uploads per-entity transforms, so the CPU
+  // pays no per-face backface walk, no chain rebuild and no per-frame index upload. Entities sharing a
+  // model+frame draw as ONE instanced call. Requires r_gpucull; 0 = the verified per-face chain path.
+  cvr.gpucullents = cvar.registerVariable('r_gpucullents', '1')
+  // WebGPU-only (Ironwail-style): draw runs of consecutive same-(model, skin) opaque alias entities as
+  // ONE instanced draw, pulling vertices from the model VBO as a storage buffer. 0 = the per-entity
+  // draw path for every alias model.
+  cvr.instancedmodels = cvar.registerVariable('r_instancedmodels', '1')
+  // Ironwail/QS r_scale: render the 3D view at 1/N resolution (integer divisor, clamped 1..4) and
+  // upscale; the 2D layer (HUD/console/menu) stays native. WebGPU-only (the WebGL2 backend ignores it).
+  // For fill-rate/bandwidth-bound GPUs (iGPUs on big maps) — trades sharpness for per-pixel cost.
+  cvr.scale = cvar.registerVariable('r_scale', '1', true)
 
 	cvar.registerChangedEvent('r_novis', () => state.vis_changed = true)
 	
 	initParticles();
+	pscript.init();
 
-	GL.createProgram('Alias',
-		['uOrigin', 'uAngles', 'uViewOrigin', 'uViewAngles', 'uPerspective', 'uLightVec', 'uGamma', 'uAmbientLight', 'uShadeLight'],
-		[
-			createAttribParam('aPosition', gl.FLOAT, 3), 
-			createAttribParam('aNormal', gl.FLOAT, 3), 
-			createAttribParam('aTexCoord', gl.FLOAT, 2)
-		],
-		['tTexture']);
-
-	GL.createProgram(
-		'Brush',
-		['uUseFullbrightTex', 'uUseOverbright', 'uUseAlphaTest',
-			'uAlpha', 'uPerspective', 'uViewAngles', 'uViewOrigin',
-			'uOrigin', 'uAngles', 'uFogDensity', 'uFogColor', 'uGamma'],
-		[
-			createAttribParam('Vert', gl.FLOAT, 3, false),
-			createAttribParam('TexCoords', gl.FLOAT, 2, false),
-			createAttribParam('LMCoords', gl.FLOAT, 2, false),
-		],
-		['Tex', 'LMTex', 'FullbrightTex'])
-	GL.createProgram('Dlight',
-		['uOrigin', 'uViewOrigin', 'uViewAngles', 'uPerspective', 'uRadius', 'uGamma'],
-		[
-			createAttribParam('aPosition', gl.FLOAT, 3)
-		],
-		[]);
-	GL.createProgram('Player',
-		['uOrigin', 'uAngles', 'uViewOrigin', 'uViewAngles', 'uPerspective', 'uLightVec', 'uGamma', 'uAmbientLight', 'uShadeLight', 'uTop', 'uBottom'],
-		[
-			createAttribParam('aPosition', gl.FLOAT, 3), 
-			createAttribParam('aNormal', gl.FLOAT, 3), 
-			createAttribParam('aTexCoord', gl.FLOAT, 2)
-		],
-		['tTexture', 'tPlayer']);
-	GL.createProgram('Sprite',
-		['uViewOrigin', 'uViewAngles', 'uPerspective', 'uGamma'],
-		[
-			createAttribParam('aPosition', gl.FLOAT, 3),
-			createAttribParam('aTexCoord', gl.FLOAT, 2)
-		],
-		['tTexture']);
-	GL.createProgram('Turbulent',
-		['uOrigin', 'uAngles', 'uViewOrigin', 'uViewAngles', 'uPerspective', 'uGamma', 'uTime', 'uAlpha'],
-		[
-			createAttribParam('aPosition', gl.FLOAT, 3), 
-			createAttribParam('aTexCoord', gl.FLOAT, 2)
-		],
-		['tTexture']);
-	GL.createProgram('Warp',
-		['uOrtho', 'uTime'],
-		[
-			createAttribParam('aPosition', gl.FLOAT, 2), 
-			createAttribParam('aTexCoord', gl.FLOAT, 2)
-		],
-		['tTexture']);
-
-	state.warpbuffer = gl.createFramebuffer();
-	state.warptexture = gl.createTexture();
-	tx.bind(0, state.warptexture);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-	state.warprenderbuffer = gl.createRenderbuffer();
-	gl.bindRenderbuffer(gl.RENDERBUFFER, state.warprenderbuffer);
-	gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 0, 0);
-	gl.bindRenderbuffer(gl.RENDERBUFFER, null);
-	gl.bindFramebuffer(gl.FRAMEBUFFER, state.warpbuffer);
-	gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, state.warptexture, 0);
-	gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, state.warprenderbuffer);
-	gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-	state.dlightvecs = gl.createBuffer();
-	gl.bindBuffer(gl.ARRAY_BUFFER, state.dlightvecs);
-	gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-		0.0, -1.0, 0.0,
-		0.0, 0.0, 1.0,
-		-0.382683, 0.0, 0.92388,
-		-0.707107, 0.0, 0.707107,
-		-0.92388, 0.0, 0.382683,
-		-1.0, 0.0, 0.0,
-		-0.92388, 0.0, -0.382683,
-		-0.707107, 0.0, -0.707107,
-		-0.382683, 0.0, -0.92388,
-		0.0, 0.0, -1.0,
-		0.382683, 0.0, -0.92388,
-		0.707107, 0.0, -0.707107,
-		0.92388, 0.0, -0.382683,
-		1.0, 0.0, 0.0,
-		0.92388, 0.0, 0.382683,
-		0.707107, 0.0, 0.707107,
-		0.382683, 0.0, 0.92388,
-		0.0, 0.0, 1.0
-	]), gl.STATIC_DRAW);
+	getRenderer().initResources();
 
 	makeSky();
 };
@@ -1282,21 +1400,49 @@ export const newMap = function () {
 		lm.state.lightstylevalue[i] = 264;
 
 	clearParticles();
+	pscript.clearPScriptParticles();
+	pscript.loadWorldWeather();  // async; guards internally against map changes racing its loads
+	state.oldviewleaf = -1
+	state.cached_vis = null
+	state.efragCacheWorld = null
 	lm.init()
 	mapAlpha.parseWorldspawn()
 	fog.parseWorldspawn()
+	sky.parseWorldspawn()
 
-	for (i = 1; i < cl.clState.model_precache.length; ++i) {
-		var model = cl.clState.model_precache[i];
-		if (model.type !== mod.TYPE.brush)
-			continue;
-		if (model.name.charCodeAt(0) !== 42) {
-			lm.buildLightmaps(gl, model);
-			buildSurfaceDisplayLists(model)
+	// Same worldmodel respawned into the same GL context (savegame load,
+	// restart, same-map changelevel): its VBO + lightmap textures are still
+	// valid, so skip the geometry rebuild — on a huge map that rebuild is a
+	// transient ~344MB Float32Array (VBO) plus lightmap staging, enough to blow
+	// the heap when respawning an already-near-ceiling map. The world reuse in
+	// mod.clearAll is what keeps the model object identity across the respawn.
+	if (state.builtWorldmodel !== cl.clState.worldmodel || state.model_vbo == null) {
+		for (i = 1; i < cl.clState.model_precache.length; ++i) {
+			var model = cl.clState.model_precache[i];
+			if (model.type !== mod.TYPE.brush)
+				continue;
+			if (model.name.charCodeAt(0) !== 42) {
+				lm.buildLightmaps(gl, model);
+				buildSurfaceDisplayLists(model)
+			}
 		}
-	}
 
-	buildModelVertexBuffer(gl)
+		lm.freeStagingSlots()
+
+		// WebGPU lightmap-array consolidation: build the compact per-style layer maps now — after every
+		// model's lightmaps exist and before buildModelVertexBuffer reads them for the per-vertex layer
+		// stream. WebGPU-only (the maps are consumed only by the WebGPU backend).
+		if (getRenderer().backend === 'webgpu')
+			lm.buildLightmapArrays()
+
+		buildModelVertexBuffer(gl)
+		state.builtWorldmodel = cl.clState.worldmodel
+
+		// Force the GPU to process all queued uploads (lightmaps, VBOs) now,
+		// during loading, rather than deferring to the first 3D draw call
+		// which would cause a ~400ms stall at the start of gameplay.
+		gl.flush()
+	}
 };
 
 export const timeRefresh_f = function () {
@@ -1345,21 +1491,67 @@ export const initParticles = function () {
 	for (i = 0; i <= 161; ++i)
 		state.avelocities[i] = [Math.random() * 2.56, Math.random() * 2.56, Math.random() * 2.56];
 
+	state.particleOrg = new Float32Array(state.numparticles * 3);
+	state.particleVel = new Float32Array(state.numparticles * 3);
+	state.particleRamp = new Float32Array(state.numparticles);
+	state.particleDie = new Float32Array(state.numparticles);
+	state.particleColor = new Uint8Array(state.numparticles);
+	state.particleType = new Uint8Array(state.numparticles);
+	state.numActiveParticles = 0;
+
+	state.particleInstanceData = new ArrayBuffer(state.numparticles * 16);
+	state.particleInstanceFloats = new Float32Array(state.particleInstanceData);
+	state.particleInstanceBytes = new Uint8Array(state.particleInstanceData);
+
 	GL.createProgram('Particle',
-		['uViewOrigin', 'uViewAngles', 'uPerspective', 'uGamma'],
+		['uViewOrigin', 'uViewAngles', 'uPerspective', 'uGamma', 'uVpn', 'uFogDensity', 'uFogColor'],
 		[
+			createAttribParam('aCorner', gl.FLOAT, 2),
 			createAttribParam('aOrigin', gl.FLOAT, 3),
-			createAttribParam('aCoord', gl.FLOAT, 2), 
-			createAttribParam('aScale', gl.FLOAT, 1), 
-			createAttribParam('aColor', gl.UNSIGNED_BYTE, 3, true)
+			createAttribParam('aColor', gl.UNSIGNED_BYTE, 4, true)
 		],
 		[]);
+
+	state.particleCornerBuffer = gl.createBuffer();
+	gl.bindBuffer(gl.ARRAY_BUFFER, state.particleCornerBuffer);
+	gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0]), gl.STATIC_DRAW);
+
+	state.particleInstanceBuffer = gl.createBuffer();
+	gl.bindBuffer(gl.ARRAY_BUFFER, state.particleInstanceBuffer);
+	gl.bufferData(gl.ARRAY_BUFFER, state.particleInstanceData.byteLength, gl.DYNAMIC_DRAW);
+};
+
+// Internal slot allocator: reserves the next free particle index, or -1 if
+// the pool is full.
+const spawnParticle = function (): number {
+	if (state.numActiveParticles >= state.numparticles)
+		return -1;
+	return state.numActiveParticles++;
+};
+
+// Allocates a particle and writes all its SoA fields in one place. Returns
+// false when the pool is full (emission dropped).
+const emitParticle = (ox: number, oy: number, oz: number, vx: number, vy: number, vz: number, die: number, color: number, ramp: number, type: number): boolean => {
+	var idx = spawnParticle();
+	if (idx < 0)
+		return false;
+	var i3 = idx * 3;
+	state.particleOrg[i3] = ox;
+	state.particleOrg[i3 + 1] = oy;
+	state.particleOrg[i3 + 2] = oz;
+	state.particleVel[i3] = vx;
+	state.particleVel[i3 + 1] = vy;
+	state.particleVel[i3 + 2] = vz;
+	state.particleDie[idx] = die;
+	state.particleColor[idx] = color;
+	state.particleRamp[idx] = ramp;
+	state.particleType[idx] = type;
+	return true;
 };
 
 export const entityParticles = function (ent: Entity) {
-	var allocated = allocParticles(162), i;
-	var angle, sp, sy, cp, cy, forward = [];
-	for (i = 0; i < allocated.length; ++i) {
+	var angle, sp, sy, cp, cy;
+	for (var i = 0; i <= 161; ++i) {
 		angle = cl.clState.time * state.avelocities[i][0];
 		sp = Math.sin(angle);
 		cp = Math.cos(angle);
@@ -1367,32 +1559,22 @@ export const entityParticles = function (ent: Entity) {
 		sy = Math.sin(angle);
 		cy = Math.cos(angle);
 
-		state.particles[allocated[i]] = {
-			die: cl.clState.time + 0.01,
-			color: 0x6f,
-			ramp: 0.0,
-			type: PTYPE.explode,
-			org: [
-				ent.origin[0] + state.avertexnormals[i][0] * 64.0 + cp * cy * 16.0,
-				ent.origin[1] + state.avertexnormals[i][1] * 64.0 + cp * sy * 16.0,
-				ent.origin[2] + state.avertexnormals[i][2] * 64.0 + sp * -16.0
-			],
-			vel: [0.0, 0.0, 0.0]
-		};
+		var ox = ent.origin[0] + state.avertexnormals[i][0] * 64.0 + cp * cy * 16.0;
+		var oy = ent.origin[1] + state.avertexnormals[i][1] * 64.0 + cp * sy * 16.0;
+		var oz = ent.origin[2] + state.avertexnormals[i][2] * 64.0 + sp * -16.0;
+		if (!emitParticle(ox, oy, oz, 0.0, 0.0, 0.0, cl.clState.time + 0.01, 0x6f, 0.0, PTYPE.explode))
+			return;
 	}
 };
 
 export const clearParticles = function () {
-	var i;
-	state.particles = [];
-	for (i = 0; i < state.numparticles; ++i)
-		state.particles[i] = { die: -1.0 };
+	state.numActiveParticles = 0;
 };
 
 export const readPointFile_f = async function () {
-	if (sv.state.server.active !== true)
+	if (sv.state.server.phase !== 'active')
 		return;
-	var name = 'maps/' + pr.getString(pr.state.globals_int[pr.globalvars.mapname]) + '.pts';
+	var name = 'maps/' + pr.getString(pr.vms.ssqc.globals_int[pr.globalvars.mapname], pr.vms.ssqc) + '.pts';
 	var f = await com.loadTextFile(name);
 	if (f == null) {
 		con.print('couldn\'t open ' + name + '\n');
@@ -1400,31 +1582,23 @@ export const readPointFile_f = async function () {
 	}
 	con.print('Reading ' + name + '...\n');
 	var flines = f.split('\n');
-	var c, org, p;
+	var c, org;
 	for (c = 0; c < flines.length;) {
 		org = flines[c].split(' ');
 		if (org.length !== 3)
 			break;
 		++c;
-		p = allocParticles(1);
-		if (p.length === 0) {
+		var ox = q.atof(org[0]), oy = q.atof(org[1]), oz = q.atof(org[2]);
+		if (!emitParticle(ox, oy, oz, 0.0, 0.0, 0.0, 99999.0, -c & 15, 0, PTYPE.tracer)) {
 			con.print('Not enough free particles\n');
 			break;
 		}
-		state.particles[p[0]] = {
-			die: 99999.0,
-			color: -c & 15,
-			type: PTYPE.tracer,
-			vel: [0.0, 0.0, 0.0],
-			org: [q.atof(org[0]), q.atof(org[1]), q.atof(org[2])],
-			ramp: 0
-		};
 	}
 	con.print(c + ' points read\n');
 };
 
 export const parseParticleEffect = function () {
-	var org: V3 = [msg.readCoord(), msg.readCoord(), msg.readCoord()];
+	var org: V3 = [msg.readCoord(cl.clState.protocolFlags), msg.readCoord(cl.clState.protocolFlags), msg.readCoord(cl.clState.protocolFlags)];
 	var dir: V3 = [msg.readChar() * 0.0625, msg.readChar() * 0.0625, msg.readChar() * 0.0625];
 	var msgcount = msg.readByte();
 	var color = msg.readByte();
@@ -1435,368 +1609,275 @@ export const parseParticleEffect = function () {
 };
 
 export const particleExplosion = function (org: V3) {
-	var allocated = allocParticles(1024), i;
-	for (i = 0; i < allocated.length; ++i) {
-		state.particles[allocated[i]] = {
-			die: cl.clState.time + 5.0,
-			color: state.ramp1[0],
-			ramp: Math.floor(Math.random() * 4.0),
-			type: ((i & 1) !== 0) ? PTYPE.explode : PTYPE.explode2,
-			org: [
-				org[0] + Math.random() * 32.0 - 16.0,
-				org[1] + Math.random() * 32.0 - 16.0,
-				org[2] + Math.random() * 32.0 - 16.0
-			],
-			vel: [Math.random() * 512.0 - 256.0, Math.random() * 512.0 - 256.0, Math.random() * 512.0 - 256.0]
-		};
+	for (var i = 0; i < 1024; ++i) {
+		var ramp = Math.floor(Math.random() * 4.0);
+		var type = ((i & 1) !== 0) ? PTYPE.explode : PTYPE.explode2;
+		var ox = org[0] + Math.random() * 32.0 - 16.0;
+		var oy = org[1] + Math.random() * 32.0 - 16.0;
+		var oz = org[2] + Math.random() * 32.0 - 16.0;
+		var vx = Math.random() * 512.0 - 256.0;
+		var vy = Math.random() * 512.0 - 256.0;
+		var vz = Math.random() * 512.0 - 256.0;
+		if (!emitParticle(ox, oy, oz, vx, vy, vz, cl.clState.time + 5.0, state.ramp1[0], ramp, type))
+			return;
 	}
 };
 
 export const particleExplosion2 = function (org: V3, colorStart: number, colorLength: number) {
-	var allocated = allocParticles(512), i, colorMod = 0;
-	for (i = 0; i < allocated.length; ++i) {
-		state.particles[allocated[i]] = {
-			die: cl.clState.time + 0.3,
-			color: colorStart + (colorMod++ % colorLength),
-			type: PTYPE.blob,
-			org: [
-				org[0] + Math.random() * 32.0 - 16.0,
-				org[1] + Math.random() * 32.0 - 16.0,
-				org[2] + Math.random() * 32.0 - 16.0
-			],
-			ramp: 0,
-			vel: [Math.random() * 512.0 - 256.0, Math.random() * 512.0 - 256.0, Math.random() * 512.0 - 256.0]
-		};
+	var colorMod = 0;
+	for (var i = 0; i < 512; ++i) {
+		var color = colorStart + (colorMod++ % colorLength);
+		var ox = org[0] + Math.random() * 32.0 - 16.0;
+		var oy = org[1] + Math.random() * 32.0 - 16.0;
+		var oz = org[2] + Math.random() * 32.0 - 16.0;
+		var vx = Math.random() * 512.0 - 256.0;
+		var vy = Math.random() * 512.0 - 256.0;
+		var vz = Math.random() * 512.0 - 256.0;
+		if (!emitParticle(ox, oy, oz, vx, vy, vz, cl.clState.time + 0.3, color, 0, PTYPE.blob))
+			return;
 	}
 };
 
 export const blobExplosion = function (org: V3) {
-	var allocated = allocParticles(1024), i, p;
-	for (i = 0; i < allocated.length; ++i) {
-		p = state.particles[allocated[i]] as Particle;
-		p.die = cl.clState.time + 1.0 + Math.random() * 0.4;
+	for (var i = 0; i < 1024; ++i) {
+		var type, color;
 		if ((i & 1) !== 0) {
-			p.type = PTYPE.blob;
-			p.color = 66 + Math.floor(Math.random() * 7.0);
+			type = PTYPE.blob;
+			color = 66 + Math.floor(Math.random() * 7.0);
 		}
 		else {
-			p.type = PTYPE.blob2;
-			p.color = 150 + Math.floor(Math.random() * 7.0);
+			type = PTYPE.blob2;
+			color = 150 + Math.floor(Math.random() * 7.0);
 		}
-		p.org = [
-			org[0] + Math.random() * 32.0 - 16.0,
-			org[1] + Math.random() * 32.0 - 16.0,
-			org[2] + Math.random() * 32.0 - 16.0
-		];
-		p.vel = [Math.random() * 512.0 - 256.0, Math.random() * 512.0 - 256.0, Math.random() * 512.0 - 256.0];
+		var ox = org[0] + Math.random() * 32.0 - 16.0;
+		var oy = org[1] + Math.random() * 32.0 - 16.0;
+		var oz = org[2] + Math.random() * 32.0 - 16.0;
+		var vx = Math.random() * 512.0 - 256.0;
+		var vy = Math.random() * 512.0 - 256.0;
+		var vz = Math.random() * 512.0 - 256.0;
+		// ramp isn't used by blob/blob2 in runParticles, so 0 is safe here.
+		if (!emitParticle(ox, oy, oz, vx, vy, vz, cl.clState.time + 1.0 + Math.random() * 0.4, color, 0, type))
+			return;
 	}
 };
 
 export const runParticleEffect = function (org: V3, dir: V3, color: number, count: number) {
-	var allocated = allocParticles(count), i;
-	for (i = 0; i < allocated.length; ++i) {
-		state.particles[allocated[i]] = {
-			die: cl.clState.time + 0.6 * Math.random(),
-			color: (color & 0xf8) + Math.floor(Math.random() * 8.0),
-			type: PTYPE.slowgrav,
-			org: [
-				org[0] + Math.random() * 16.0 - 8.0,
-				org[1] + Math.random() * 16.0 - 8.0,
-				org[2] + Math.random() * 16.0 - 8.0
-			],
-			ramp: 0,
-			vel: [dir[0] * 15.0, dir[1] * 15.0, dir[2] * 15.0]
-		};
+	for (var i = 0; i < count; ++i) {
+		var ox = org[0] + Math.random() * 16.0 - 8.0;
+		var oy = org[1] + Math.random() * 16.0 - 8.0;
+		var oz = org[2] + Math.random() * 16.0 - 8.0;
+		var c = (color & 0xf8) + Math.floor(Math.random() * 8.0);
+		var die = cl.clState.time + 0.6 * Math.random();
+		if (!emitParticle(ox, oy, oz, dir[0] * 15.0, dir[1] * 15.0, dir[2] * 15.0, die, c, 0, PTYPE.slowgrav))
+			return;
 	}
 };
 
 export const lavaSplash = function (org: V3) {
-	var allocated = allocParticles(1024), i: number, j: number, k = 0, p;
 	var dir = vec.emptyV3(), vel;
-	for (i = -16; i <= 15; ++i) {
-		for (j = -16; j <= 15; ++j) {
-			if (k >= allocated.length)
-				return;
-			p = state.particles[allocated[k++]] as Particle;
-			p.die = cl.clState.time + 2.0 + Math.random() * 0.64;
-			p.color = 224 + Math.floor(Math.random() * 8.0);
-			p.type = PTYPE.slowgrav;
+	for (var i = -16; i <= 15; ++i) {
+		for (var j = -16; j <= 15; ++j) {
 			dir[0] = (j + Math.random()) * 8.0;
 			dir[1] = (i + Math.random()) * 8.0;
 			dir[2] = 256.0;
-			p.org = [org[0] + dir[0], org[1] + dir[1], org[2] + Math.random() * 64.0];
+			var ox = org[0] + dir[0];
+			var oy = org[1] + dir[1];
+			var oz = org[2] + Math.random() * 64.0;
 			vec.normalize(dir);
 			vel = 50.0 + Math.random() * 64.0;
-			p.vel = [dir[0] * vel, dir[1] * vel, dir[2] * vel];
+			var color = 224 + Math.floor(Math.random() * 8.0);
+			var die = cl.clState.time + 2.0 + Math.random() * 0.64;
+			if (!emitParticle(ox, oy, oz, dir[0] * vel, dir[1] * vel, dir[2] * vel, die, color, 0, PTYPE.slowgrav))
+				return;
 		}
 	}
 };
 
 export const teleportSplash = function (org: V3) {
-	var allocated = allocParticles(896), i, j, k, l = 0, p;
 	var dir = vec.emptyV3(), vel;
-	for (i = -16; i <= 15; i += 4) {
-		for (j = -16; j <= 15; j += 4) {
-			for (k = -24; k <= 31; k += 4) {
-				if (l >= allocated.length)
-					return;
-				p = state.particles[allocated[l++]] as Particle;
-				p.die = cl.clState.time + 0.2 + Math.random() * 0.16;
-				p.color = 7 + Math.floor(Math.random() * 8.0);
-				p.type = PTYPE.slowgrav;
+	for (var i = -16; i <= 15; i += 4) {
+		for (var j = -16; j <= 15; j += 4) {
+			for (var k = -24; k <= 31; k += 4) {
 				dir[0] = j * 8.0;
 				dir[1] = i * 8.0;
 				dir[2] = k * 8.0;
-				p.org = [
-					org[0] + i + Math.random() * 4.0,
-					org[1] + j + Math.random() * 4.0,
-					org[2] + k + Math.random() * 4.0
-				];
+				var ox = org[0] + i + Math.random() * 4.0;
+				var oy = org[1] + j + Math.random() * 4.0;
+				var oz = org[2] + k + Math.random() * 4.0;
 				vec.normalize(dir);
 				vel = 50.0 + Math.random() * 64.0;
-				p.vel = [dir[0] * vel, dir[1] * vel, dir[2] * vel];
+				var color = 7 + Math.floor(Math.random() * 8.0);
+				var die = cl.clState.time + 0.2 + Math.random() * 0.16;
+				if (!emitParticle(ox, oy, oz, dir[0] * vel, dir[1] * vel, dir[2] * vel, die, color, 0, PTYPE.slowgrav))
+					return;
 			}
 		}
 	}
 };
 
 export const rocketTrail = function (start: V3, end: V3, type: number) {
-	var _vec = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-	var len = Math.sqrt(_vec[0] * _vec[0] + _vec[1] * _vec[1] + _vec[2] * _vec[2]);
+	var dx = end[0] - start[0], dy = end[1] - start[1], dz = end[2] - start[2];
+	var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
 	if (len === 0.0)
 		return;
-	_vec = [_vec[0] / len, _vec[1] / len, _vec[2] / len];
+	dx /= len; dy /= len; dz /= len;
 
-	var allocated;
-	if (type === 4)
-		allocated = allocParticles(Math.floor(len / 6.0));
-	else
-		allocated = allocParticles(Math.floor(len / 3.0));
+	// QSS-M R_RocketTrail: while (len > 0) with len -= 3 per particle — spawns at least one
+	// particle whenever the projectile moved AT ALL. A floor(len/3) count here starved slow
+	// projectiles at high fps (a 400u/s voreball moves <3 units per 240fps frame -> zero spawns).
+	// Case 4 (slight blood) halves density via an extra len -= 3 inside the loop, as QSS-M does.
+	while (len > 0) {
+		len -= 3.0;
+		if (type === 4)
+			len -= 3.0;
+		// Peek pool capacity before the switch below: case 3/5 mutates
+		// state.tracercount, a persistent module state field, and that must
+		// not fire on an iteration whose particle gets dropped.
+		if (state.numActiveParticles >= state.numparticles)
+			return;
 
-	var i, p;
-	for (i = 0; i < allocated.length; ++i) {
-		p = state.particles[allocated[i]] as Particle;
-		p.vel = [0.0, 0.0, 0.0];
-		p.die = cl.clState.time + 2.0;
+		var die = cl.clState.time + 2.0;
+		var vx = 0.0, vy = 0.0, vz = 0.0;
+		var ox = start[0], oy = start[1], oz = start[2];
+		var ptype = PTYPE.fire, color = 0, ramp = 0;
 		switch (type) {
 			case 0:
 			case 1:
-				p.ramp = Math.floor(Math.random() * 4.0) + (type << 1);
-				p.color = state.ramp3[p.ramp];
-				p.type = PTYPE.fire;
-				p.org = [
-					start[0] + Math.random() * 6.0 - 3.0,
-					start[1] + Math.random() * 6.0 - 3.0,
-					start[2] + Math.random() * 6.0 - 3.0
-				];
+				ramp = Math.floor(Math.random() * 4.0) + (type << 1);
+				color = state.ramp3[ramp];
+				ptype = PTYPE.fire;
+				ox = start[0] + Math.random() * 6.0 - 3.0;
+				oy = start[1] + Math.random() * 6.0 - 3.0;
+				oz = start[2] + Math.random() * 6.0 - 3.0;
 				break;
 			case 2:
-				p.type = PTYPE.grav;
-				p.color = 67 + Math.floor(Math.random() * 4.0);
-				p.org = [
-					start[0] + Math.random() * 6.0 - 3.0,
-					start[1] + Math.random() * 6.0 - 3.0,
-					start[2] + Math.random() * 6.0 - 3.0
-				];
+			case 4:
+				ptype = PTYPE.grav;
+				color = 67 + Math.floor(Math.random() * 4.0);
+				ox = start[0] + Math.random() * 6.0 - 3.0;
+				oy = start[1] + Math.random() * 6.0 - 3.0;
+				oz = start[2] + Math.random() * 6.0 - 3.0;
 				break;
 			case 3:
 			case 5:
-				p.die = cl.clState.time + 0.5;
-				p.type = PTYPE.tracer;
+				die = cl.clState.time + 0.5;
+				ptype = PTYPE.tracer;
 				if (type === 3)
-					p.color = 52 + ((state.tracercount++ & 4) << 1);
+					color = 52 + ((state.tracercount++ & 4) << 1);
 				else
-					p.color = 230 + ((state.tracercount++ & 4) << 1);
-				p.org = [start[0], start[1], start[2]];
+					color = 230 + ((state.tracercount++ & 4) << 1);
 				if ((state.tracercount & 1) !== 0) {
-					p.vel[0] = 30.0 * _vec[1];
-					p.vel[2] = -30.0 * _vec[0];
+					vx = 30.0 * dy;
+					vz = -30.0 * dx;
 				}
 				else {
-					p.vel[0] = -30.0 * _vec[1];
-					p.vel[2] = 30.0 * _vec[0];
+					vx = -30.0 * dy;
+					vz = 30.0 * dx;
 				}
 				break;
-			case 4:
-				p.type = PTYPE.grav;
-				p.color = 67 + Math.floor(Math.random() * 4.0);
-				p.org = [
-					start[0] + Math.random() * 6.0 - 3.0,
-					start[1] + Math.random() * 6.0 - 3.0,
-					start[2] + Math.random() * 6.0 - 3.0
-				];
-				break;
 			case 6:
-				p.color = 152 + Math.floor(Math.random() * 4.0);
-				p.type = PTYPE.tracer;
-				p.die = cl.clState.time + 0.3;
-				p.org = [
-					start[0] + Math.random() * 16.0 - 8.0,
-					start[1] + Math.random() * 16.0 - 8.0,
-					start[2] + Math.random() * 16.0 - 8.0
-				];
+				color = 152 + Math.floor(Math.random() * 4.0);
+				ptype = PTYPE.tracer;
+				die = cl.clState.time + 0.3;
+				ox = start[0] + Math.random() * 16.0 - 8.0;
+				oy = start[1] + Math.random() * 16.0 - 8.0;
+				oz = start[2] + Math.random() * 16.0 - 8.0;
 		}
-		start[0] += _vec[0];
-		start[1] += _vec[1];
-		start[2] += _vec[2];
+		emitParticle(ox, oy, oz, vx, vy, vz, die, color, ramp, ptype);
+
+		start[0] += dx;
+		start[1] += dy;
+		start[2] += dz;
 	}
 };
 
-export const drawParticles = function () {
-	const gl = GL.getContext()
-	GL.streamFlush();
-
-	var program = GL.useProgram('Particle');
-	gl.depthMask(false);
-	gl.enable(gl.BLEND);
-
+export const runParticles = function () {
 	var frametime = cl.clState.time - cl.clState.oldtime;
 	var grav = frametime * sv.cvr.gravity.value * 0.05;
 	var dvel = frametime * 4.0;
-	var scale;
 
-	var coords = [-1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
-	for (var i = 0; i < state.numparticles; ++i) {
-		var p = state.particles[i] as Particle;
-		if (p.die < cl.clState.time)
+	var i = 0;
+	while (i < state.numActiveParticles) {
+		if (state.particleDie[i] < cl.clState.time) {
+			var last = --state.numActiveParticles;
+			if (i !== last) {
+				var i3 = i * 3, l3 = last * 3;
+				state.particleOrg[i3] = state.particleOrg[l3];
+				state.particleOrg[i3 + 1] = state.particleOrg[l3 + 1];
+				state.particleOrg[i3 + 2] = state.particleOrg[l3 + 2];
+				state.particleVel[i3] = state.particleVel[l3];
+				state.particleVel[i3 + 1] = state.particleVel[l3 + 1];
+				state.particleVel[i3 + 2] = state.particleVel[l3 + 2];
+				state.particleRamp[i] = state.particleRamp[last];
+				state.particleDie[i] = state.particleDie[last];
+				state.particleColor[i] = state.particleColor[last];
+				state.particleType[i] = state.particleType[last];
+			}
 			continue;
-
-		var color = vid.d_8to24table[p.color];
-		scale = (p.org[0] - state.refdef.vieworg[0]) * state.vpn[0]
-			+ (p.org[1] - state.refdef.vieworg[1]) * state.vpn[1]
-			+ (p.org[2] - state.refdef.vieworg[2]) * state.vpn[2];
-		if (scale < 20.0)
-			scale = 0.375;
-		else
-			scale = 0.375 + scale * 0.0015;
-
-		GL.streamGetSpace(6);
-		for (var j = 0; j < 6; ++j) {
-			GL.streamWriteFloat3(p.org[0], p.org[1], p.org[2]);
-			GL.streamWriteFloat2(coords[j * 2], coords[j * 2 + 1]);
-			GL.streamWriteFloat(scale);
-			GL.streamWriteUByte4(color & 0xff, (color >> 8) & 0xff, color >> 16, 255);
 		}
 
-		p.org[0] += p.vel[0] * frametime;
-		p.org[1] += p.vel[1] * frametime;
-		p.org[2] += p.vel[2] * frametime;
+		var i3 = i * 3;
+		state.particleOrg[i3] += state.particleVel[i3] * frametime;
+		state.particleOrg[i3 + 1] += state.particleVel[i3 + 1] * frametime;
+		state.particleOrg[i3 + 2] += state.particleVel[i3 + 2] * frametime;
 
-		switch (p.type) {
+		switch (state.particleType[i]) {
 			case PTYPE.fire:
-				p.ramp += frametime * 5.0;
-				if (p.ramp >= 6.0)
-					p.die = -1.0;
+				state.particleRamp[i] += frametime * 5.0;
+				if (state.particleRamp[i] >= 6.0)
+					state.particleDie[i] = -1.0;
 				else
-					p.color = state.ramp3[Math.floor(p.ramp)];
-				p.vel[2] += grav;
-				continue;
+					state.particleColor[i] = state.ramp3[Math.floor(state.particleRamp[i])];
+				state.particleVel[i3 + 2] += grav;
+				break;
 			case PTYPE.explode:
-				p.ramp += frametime * 10.0;
-				if (p.ramp >= 8.0)
-					p.die = -1.0;
+				state.particleRamp[i] += frametime * 10.0;
+				if (state.particleRamp[i] >= 8.0)
+					state.particleDie[i] = -1.0;
 				else
-					p.color = state.ramp1[Math.floor(p.ramp)];
-				p.vel[0] += p.vel[0] * dvel;
-				p.vel[1] += p.vel[1] * dvel;
-				p.vel[2] += p.vel[2] * dvel - grav;
-				continue;
+					state.particleColor[i] = state.ramp1[Math.floor(state.particleRamp[i])];
+				state.particleVel[i3] += state.particleVel[i3] * dvel;
+				state.particleVel[i3 + 1] += state.particleVel[i3 + 1] * dvel;
+				state.particleVel[i3 + 2] += state.particleVel[i3 + 2] * dvel - grav;
+				break;
 			case PTYPE.explode2:
-				p.ramp += frametime * 15.0;
-				if (p.ramp >= 8.0)
-					p.die = -1.0;
+				state.particleRamp[i] += frametime * 15.0;
+				if (state.particleRamp[i] >= 8.0)
+					state.particleDie[i] = -1.0;
 				else
-					p.color = state.ramp2[Math.floor(p.ramp)];
-				p.vel[0] -= p.vel[0] * frametime;
-				p.vel[1] -= p.vel[1] * frametime;
-				p.vel[2] -= p.vel[2] * frametime + grav;
-				continue;
+					state.particleColor[i] = state.ramp2[Math.floor(state.particleRamp[i])];
+				state.particleVel[i3] -= state.particleVel[i3] * frametime;
+				state.particleVel[i3 + 1] -= state.particleVel[i3 + 1] * frametime;
+				state.particleVel[i3 + 2] -= state.particleVel[i3 + 2] * frametime + grav;
+				break;
 			case PTYPE.blob:
-				p.vel[0] += p.vel[0] * dvel;
-				p.vel[1] += p.vel[1] * dvel;
-				p.vel[2] += p.vel[2] * dvel - grav;
-				continue;
+				state.particleVel[i3] += state.particleVel[i3] * dvel;
+				state.particleVel[i3 + 1] += state.particleVel[i3 + 1] * dvel;
+				state.particleVel[i3 + 2] += state.particleVel[i3 + 2] * dvel - grav;
+				break;
 			case PTYPE.blob2:
-				p.vel[0] += p.vel[0] * dvel;
-				p.vel[1] += p.vel[1] * dvel;
-				p.vel[2] -= grav;
-				continue;
+				// vanilla pt_blob2 DAMPS xy (vel -= vel*dvel) — QSS-M/Ironwail r_part.c
+				state.particleVel[i3] -= state.particleVel[i3] * dvel;
+				state.particleVel[i3 + 1] -= state.particleVel[i3 + 1] * dvel;
+				state.particleVel[i3 + 2] -= grav;
+				break;
 			case PTYPE.grav:
 			case PTYPE.slowgrav:
-				p.vel[2] -= grav;
+				state.particleVel[i3 + 2] -= grav;
+				break;
 		}
+		++i;
 	}
-
-	GL.streamFlush();
-
-	gl.disable(gl.BLEND);
-	gl.depthMask(true);
 };
 
-export const allocParticles = function (count: number) {
-	var allocated = [], i;
-	for (i = 0; i < state.numparticles; ++i) {
-		if (count === 0)
-			return allocated;
-		if (state.particles[i].die < cl.clState.time) {
-			allocated[allocated.length] = i;
-			--count;
-		}
-	}
-	return allocated;
-};
+// drawParticles body (instanced Particle draw) and its drawParticlesStream WebGL1 fallback (+ the
+// particleCoords corner table) moved to WebGLRenderer.drawClassicParticles (render phase1
+// particle/flashblend slice). renderScene calls it through getRenderer(); the particle sim/SoA pool
+// (runParticles, above) and the color-table lookups stay here.
 
 // surf
 
 state.lightmap_modified = [];
-
-const backFaceCull = (surf: Face) => {
-	var dot
-
-	switch (surf.plane.type) {
-		case def.PLANE.x:
-			dot = state.refdef.vieworg[0] - surf.plane.dist;
-			break;
-		case def.PLANE.y:
-			dot = state.refdef.vieworg[1] - surf.plane.dist;
-			break;
-		case def.PLANE.z:
-			dot = state.refdef.vieworg[2] - surf.plane.dist;
-			break;
-		default:
-			dot = vec.dotProductV3(state.refdef.vieworg, surf.plane.normal) - surf.plane.dist;
-			break;
-	}
-
-	if ((dot < 0) !== !!(surf.flags & def.SURF.planeback))
-		return true;
-
-	return false;
-}
-
-const cullSurfaces = (model: Model, chain: TexChain) => {
-	var i, s, t: Texture
-	// ericw -- instead of testing (s->visframe == r_visframecount) on all world
-	// surfaces, use the chained surfaces, which is exactly the same set of sufaces
-	for (i = 0; i < model.textures.length; i++) {
-		t = model.textures[i];
-
-		if (!t || !t.texturechains || !t.texturechains[chain])
-			continue;
-
-		for (s = t.texturechains[chain]; s; s = s.texturechain) { 
-			if (cullBox(s.mins, s.maxs) && backFaceCull(s)) 
-				s.culled = true;
-			else {
-				s.culled = false;
-				// rs_brushpolys++; //count wpolys here // TODO stats
-				const texture = model.textures[model.texinfo[s.texinfo].texture]
-				if (texture.warpimage)
-					texture.update_warp = true;
-			}
-		}
-	}
-}
 
 export const textureAnimation = function (model: Model, base: Texture, entFrame: number) {
 	var frame = 0;
@@ -1813,50 +1894,65 @@ export const textureAnimation = function (model: Model, base: Texture, entFrame:
 };
 
 const clearTextureChains = (model: Model, chain: TexChain) => {
-	// set all chains to null
-	for (var i = 0; i < model.textures.length; i++)
-		if (model.textures[i] && model.textures[i].texturechains)
-			model.textures[i].texturechains[chain] = null;
+	// set all chains to null — restricted to textures this model's own faces
+	// can reference (chainSurface only ever chains a model's own faces)
+	var used = model.usedTextures
+	for (var i = 0; i < used.length; i++) {
+		var t = model.textures[used[i]]
+		if (t && t.texturechains)
+			t.texturechains[chain] = null;
+	}
 }
 
 export const drawBrushModel = function (e: Entity) {
-	const gl = GL.getContext()
 	var clmodel = e.model;
 
 	if (clmodel.submodel === true) {
-		if (cullBox(
-			[
-				e.origin[0] + clmodel.mins[0],
-				e.origin[1] + clmodel.mins[1],
-				e.origin[2] + clmodel.mins[2]
-			],
-			[
-				e.origin[0] + clmodel.maxs[0],
-				e.origin[1] + clmodel.maxs[1],
-				e.origin[2] + clmodel.maxs[2]
-			]) === true)
+		var cullMins = state.cullMins, cullMaxs = state.cullMaxs;
+		cullMins[0] = e.origin[0] + clmodel.mins[0];
+		cullMins[1] = e.origin[1] + clmodel.mins[1];
+		cullMins[2] = e.origin[2] + clmodel.mins[2];
+		cullMaxs[0] = e.origin[0] + clmodel.maxs[0];
+		cullMaxs[1] = e.origin[1] + clmodel.maxs[1];
+		cullMaxs[2] = e.origin[2] + clmodel.maxs[2];
+		if (cullBox(cullMins, cullMaxs) === true)
 			return;
 	}
 	else {
-		if (cullBox(
-			[
-				e.origin[0] - clmodel.radius,
-				e.origin[1] - clmodel.radius,
-				e.origin[2] - clmodel.radius
-			],
-			[
-				e.origin[0] + clmodel.radius,
-				e.origin[1] + clmodel.radius,
-				e.origin[2] + clmodel.radius
-			]) === true)
+		var cullMins = state.cullMins, cullMaxs = state.cullMaxs;
+		cullMins[0] = e.origin[0] - clmodel.radius;
+		cullMins[1] = e.origin[1] - clmodel.radius;
+		cullMins[2] = e.origin[2] - clmodel.radius;
+		cullMaxs[0] = e.origin[0] + clmodel.radius;
+		cullMaxs[1] = e.origin[1] + clmodel.radius;
+		cullMaxs[2] = e.origin[2] + clmodel.radius;
+		if (cullBox(cullMins, cullMaxs) === true)
 			return;
 	}
 
+	// GPU-driven path (WebGPU r_gpucullents): the entity survived the frustum cull above, so hand it to
+	// the frame's instanced brush batch — its triangles were baked per (texture, fence) at map load, so
+	// nothing below this point runs. Returns false (falls through) for a translucent entity, a model with
+	// water/turb faces, or any backend/cvar state where the batch is off.
+	if (getRenderer().batchBrushEnt(e) === true)
+		return;
+
+	// Opaque fast path: an opaque entity (alpha == 1) whose submodel is PURE-SOLID (no water/turb faces)
+	// draws from a precomputed static index set — skip the per-frame per-face backface walk + re-chain +
+	// the 3 drawWorldSurfaces calls. Closed opaque models render identically (the extra back-faces are
+	// depth-culled overdraw). Both backends implement drawBrushEntPrecomputed (WebGPU from its texture-
+	// grouped set, WebGL from a lazily-built per-lightmap-page static buffer). Translucent entities and
+	// water/turb submodels (ineligible) fall through to the unchanged per-face path below.
+	if (clmodel.brushPrecomputeEligible === true && pr.decodeAlpha(e.alpha) === 1) {
+		getRenderer().drawBrushEntPrecomputed(e);
+		return;
+	}
+
 	clearTextureChains(clmodel, TexChain.model);
-	var modelOrg = vec.subtract(state.refdef.vieworg, e.origin)
+	var modelOrg = vec.subtract(state.refdef.vieworg, e.origin, vec.scratch())
 	if (e.angles[0] || e.angles[1] || e.angles[2]) {
-		var temp = vec.emptyV3()
-		var forward = vec.emptyV3(), right = vec.emptyV3(), up = vec.emptyV3()
+		var temp = vec.scratch()
+		var forward = vec.scratch(), right = vec.scratch(), up = vec.scratch()
 		vec.copy(modelOrg, temp)
 
 		vec.angleVectors(e.angles, forward, right, up);
@@ -1885,37 +1981,128 @@ export const drawBrushModel = function (e: Entity) {
 		}
 	}
 
-	drawTextureChains(gl, e.model, e, TexChain.model)
-	drawTextureChains_water(gl, e.model, e, TexChain.model)
+	getRenderer().drawWorldSurfaces(e.model, e, 'solid')
+	getRenderer().drawWorldSurfaces(e.model, e, 'litwater')
+	getRenderer().drawWorldSurfaces(e.model, e, 'turb')
 };
 
-export const recursiveWorldNode = function (node: NodeLeaf) {
-	if (node.contents === mod.CONTENTS.solid)
-		return;
-	if (node.contents < 0) {
-		const leaf = node as Leaf
-		if (leaf.markvisframe !== state.visframecount)
-			return;
-		leaf.visframe = state.visframecount;
-		if (leaf.skychain !== leaf.waterchain)
-			state.drawsky = true;
-		return;
+// Hierarchical frustum walk over the flat world BSP. Every face belongs to
+// exactly one interior node (nodePacked firstFace/numFaces) whose bbox
+// contains it, and that owning node is always an ancestor of any visible leaf that
+// chains the face, so nodeMarkvisframe alone (no leaf test) is a sound PVS
+// gate for stamping it. A subtree already known out of the PVS or fully
+// outside a frustum plane is skipped without testing any faces; a subtree
+// found fully inside a plane drops that plane's bit from mask so descendants
+// don't retest it. Every face owned by a node lies on that node's split
+// plane (marked front/back via surfPlaneBack), so the view-side of the
+// plane is identical for all of them and is computed once per node — only
+// the front-facing half of the node's face range gets stamped with
+// state.frustumFrame. Leaves carry no faces and are never visited.
+export const markWorldFrustum = () => {
+	// |0 keeps the counter inside int32 so it always equals the truncated
+	// values the branchless stamp stores in surfVisibleFrame (Int32Array).
+	state.frustumFrame = (state.frustumFrame + 1) | 0;
+
+	// Iterative with every array and scalar hoisted to locals: the walk visits
+	// thousands of nodes per frame, and per-visit property chains (state.*,
+	// model.*, refdef.vieworg[i]) or recursion overhead dominate its cost.
+	// Per-node fields (bbox/plane/faces/children) come from nodePacked, one
+	// interleaved 64B record per node (see Model.nodePacked), so a visited
+	// node costs 1-2 cache lines instead of touching 7 separate arrays.
+	var model = cl.clState.worldmodel;
+	var markvis = model.nodeMarkvisframe, visframe = state.visframecount;
+	var packed = model.nodePacked, packedI32 = model.nodePackedI32;
+	var planeBack = model.surfPlaneBack, visible = model.surfVisibleFrame;
+	var frustum = state.frustumFlat, signbits = state.frustumSignbits;
+	var stampFrame = state.frustumFrame;
+	var vieworg = state.refdef.vieworg;
+	var vx = vieworg[0], vy = vieworg[1], vz = vieworg[2];
+	// DFS holds at most depth+1 pending (idx, mask) pairs; typed arrays drop
+	// out-of-bounds writes silently, so an undersized stack would silently cull
+	// subtrees. Regrow from the load-time depth bound (at most once per map).
+	var need = (model.bspMaxDepth + 2) * 2;
+	if (state.frustumWalkStack.length < need)
+		state.frustumWalkStack = new Int32Array(need);
+	var stack = state.frustumWalkStack;
+
+	stack[0] = 0;
+	stack[1] = 0b1111;
+	var sp = 2;
+	while (sp > 0) {
+		sp -= 2;
+		var idx = stack[sp], mask = stack[sp + 1];
+		if (markvis[idx] !== visframe)
+			continue;
+		var base = idx * 16;
+		if (mask !== 0) {
+			var culled = false;
+			for (var i = 0; i < 4; i++) {
+				var bit = 1 << i;
+				if ((mask & bit) === 0)
+					continue;
+				var o = i * 4;
+				var nx = frustum[o], ny = frustum[o + 1], nz = frustum[o + 2], dist = frustum[o + 3];
+				var sb = signbits[i];
+				var px = (sb & 1) !== 0 ? packed[base] : packed[base + 3];
+				var py = (sb & 2) !== 0 ? packed[base + 1] : packed[base + 4];
+				var pz = (sb & 4) !== 0 ? packed[base + 2] : packed[base + 5];
+				if (nx * px + ny * py + nz * pz < dist) {
+					culled = true;
+					break;
+				}
+				var nvx = (sb & 1) !== 0 ? packed[base + 3] : packed[base];
+				var nvy = (sb & 2) !== 0 ? packed[base + 4] : packed[base + 1];
+				var nvz = (sb & 4) !== 0 ? packed[base + 5] : packed[base + 2];
+				if (nx * nvx + ny * nvy + nz * nvz >= dist)
+					mask &= ~bit;
+			}
+			if (culled)
+				continue;
+		}
+
+		var pt = packedI32[base + 10];
+		var pdist = packed[base + 9];
+		var dot = pt < 3
+			? vieworg[pt] - pdist
+			: vx * packed[base + 6] + vy * packed[base + 7] + vz * packed[base + 8] - pdist;
+		var side = dot < 0 ? 1 : 0;
+		var first = packedI32[base + 11], end = first + packedI32[base + 12];
+		// Branchless: a face is kept when planeBack === side. Each face belongs
+		// to exactly one node, so a rejected face can't have been stamped this
+		// frame by anyone else — writing 0 instead of skipping keeps the write
+		// stream unconditional (no per-face branch misprediction).
+		for (var f = first; f < end; f++)
+			visible[f] = stampFrame & ((planeBack[f] ^ side) - 1);
+
+		var c0 = packedI32[base + 13], c1 = packedI32[base + 14];
+		if (c0 >= 0) {
+			stack[sp] = c0;
+			stack[sp + 1] = mask;
+			sp += 2;
+		}
+		if (c1 >= 0) {
+			stack[sp] = c1;
+			stack[sp + 1] = mask;
+			sp += 2;
+		}
 	}
-	const _node = node as Node
-	recursiveWorldNode(_node.children[0]);
-	recursiveWorldNode(_node.children[1]);
 };
 
-const waterAlphaForSurface = (surf: Face) => {
-	if (surf.flags & def.SURF.drawlava)
+// Flags-int variant so the world draw loop never dereferences a Face object.
+export const waterAlphaForFlags = (flags: number) => {
+	if (flags & def.SURF.drawlava)
 		return mapAlpha.state.lava > 0 ? mapAlpha.state.lava : mapAlpha.state.water;
-	else if (surf.flags & def.SURF.drawtele)
+	else if (flags & def.SURF.drawtele)
 		return mapAlpha.state.tele > 0 ? mapAlpha.state.tele : mapAlpha.state.water;
-	else if (surf.flags & def.SURF.drawslime)
+	else if (flags & def.SURF.drawslime)
 		return mapAlpha.state.slime > 0 ? mapAlpha.state.slime : mapAlpha.state.water;
 	else
 		return mapAlpha.state.water;
 }
+
+const waterAlphaForSurface = (surf: Face) => waterAlphaForFlags(surf.flags)
+
+// applyWaterAlpha (water blend-state toggle) moved to WebGLRenderer (render phase1 world-surface slice).
 
 
 /*
@@ -1925,7 +2112,7 @@ GL_WaterAlphaForEntitySurface -- ericw
 Returns the water alpha to use for the entity and surface combination.
 ================
 */
-const waterAlphaForEntitySurface = (ent: Entity, surf: Face) => {
+export const waterAlphaForEntitySurface = (ent: Entity, surf: Face) => {
 	var entalpha = 1
 	if (!ent || ent.alpha == 1)
 		entalpha = waterAlphaForSurface(surf);
@@ -1934,247 +2121,32 @@ const waterAlphaForEntitySurface = (ent: Entity, surf: Face) => {
 	return entalpha;
 }
 
-/*
-================
-R_DrawTextureChains_Water -- johnfitz
-================
-*/
-const drawTextureChains_water = (gl: WebGL2RenderingContext, model: Model, ent: Entity, chain: TexChain) => {
+// r_litwater: a turb surface with real lightmap samples (mod.ts only sets
+// drawtub without drawtiled when the texinfo isn't TEX.special and lightofs
+// is valid — Ironwail gl_model.c:1384-1391). Such surfaces draw through
+// drawTextureChains_litwater instead of the classic unlit Turbulent path.
+export const isLitWaterFlags = (flags: number) => (flags & def.SURF.drawtub) !== 0 && !(flags & def.SURF.drawtiled)
 
-	const turbulentProgram = GL.useProgram('Turbulent')
+// The three world-surface submission workers (drawTextureChains solid / _litwater / _water)
+// plus their gl-submission helpers (applyWaterAlpha above, bindFullbrightTexture,
+// bindLightmapPageTextures) moved to WebGLRenderer.drawWorldSurfaces (render phase1
+// world-surface slice). The CPU water-alpha selection (waterAlphaForFlags /
+// waterAlphaForEntitySurface / isLitWaterFlags) stays here and is exported for the backend.
 
-	// Bind the buffers
-	gl.bindBuffer(gl.ARRAY_BUFFER, state.model_vbo);
-	gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null)// indices come from client memory!
-
-	gl.vertexAttribPointer(turbulentProgram.attributeMap.aPosition.location, 3, gl.FLOAT, false, def.VERTEXSIZE * 4, 0);
-	gl.vertexAttribPointer(turbulentProgram.attributeMap.aTexCoord.location, 2, gl.FLOAT, false, def.VERTEXSIZE * 4, 4 * 3);
-
-	// set uniforms
-	gl.uniform1i(turbulentProgram.uniforms.uUseOverbright, cvr.overbright.value);
-	gl.uniform1i(turbulentProgram.uniforms.uUseAlphaTest, 0);
-
-	gl.uniform3f(turbulentProgram.uniforms.uOrigin, 0.0, 0.0, 0.0);
-	gl.uniformMatrix3fv(turbulentProgram.uniforms.uAngles, false, GL.identity);
-	gl.uniform1f(turbulentProgram.uniforms.uTime, host.state.realtime % (Math.PI * 2.0))
-
-	for (var i = 0; i < model.textures.length; i++) {
-		var t = model.textures[i];
-		if (!t || !t.texturechains || !t.texturechains[chain] || !(t.texturechains[chain].flags & def.SURF.drawtub))
-			continue;
-		var animatedTexture = textureAnimation(state.cl_worldmodel, t, ent != null ? ent.frame : 0)
-		batchRender.clearBatch();
-		var bound = false;
-		var entalpha = 0
-
-
-		for (var s = t.texturechains[chain]; s; s = s.texturechain)
-			if (!s.culled) {
-				if (!bound) //only bind once we are sure we need this texture
-				{
-					tx.bind(0, animatedTexture.texturenum);
-					bound = true;
-				}
-				
-				var	newalpha = waterAlphaForEntitySurface (ent, s);
-				if (newalpha !== entalpha) {
-					if (newalpha < 1)
-					{
-						gl.depthMask(false);
-						gl.enable(gl.BLEND);
-						gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-					} else {
-						gl.depthMask(true);
-						gl.disable(gl.BLEND);
-					}
-					gl.uniform1f(turbulentProgram.uniforms.uAlpha, newalpha);
-				}
-				entalpha = newalpha
-
-				batchRender.batchSurface(gl, s);
-			}
-
-		//R_EndTransparentDrawing (entalpha);
-		batchRender.flushBatch(gl)
-
-		if (entalpha < 1)
-		{
-			gl.depthMask(true);
-			gl.disable(gl.BLEND);
-		}
-	}
-
-
-	GL.unbindProgram()
-}
-
-const drawTextureChains = (gl: WebGL2RenderingContext, model: Model, ent: Entity, chain: TexChain) => {
-	var entalpha = ent ? pr.decodeAlpha(ent.alpha) : 1
-
-	// TODO Dynamic LMs
-	// ericw -- the mh dynamic lightmap speedup: make a first pass through all
-	// surfaces we are going to draw, and rebuild any lightmaps that need it.
-	// this also chains surfaces by lightmap which is used by r_lightmap 1.
-	// the previous implementation of the speedup uploaded lightmaps one frame
-	// late which was visible under some conditions, this method avoids that.
-	lm.buildLightmapChains(model, chain);
-	lm.uploadLightmaps(gl);
-
-	// R_BeginTransparentDrawing (entalpha);
-
-	// TODO: Missing texture support.
-	// R_DrawTextureChains_NoTexture (model, chain);
-
-
-	// R_EndTransparentDrawing (entalpha);
-
-	var fullbright = null
-
-	// enable blending / disable depth writes
-	if (entalpha < 1) {
-		gl.depthMask(false);
-		gl.enable(gl.BLEND);
-	}
-
-	const brushProgram = GL.useProgram('Brush')
-	const fogColor = fog.getColor()
-	const fogDensity = fog.getDensity()
-
-	// Bind the buffers
-	gl.bindBuffer(gl.ARRAY_BUFFER, state.model_vbo);
-	gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null) // indices come from client memory!
-
-	gl.vertexAttribPointer(brushProgram.attributeMap.Vert.location, 3, gl.FLOAT, false, def.VERTEXSIZE * 4, 0);
-	gl.vertexAttribPointer(brushProgram.attributeMap.TexCoords.location, 2, gl.FLOAT, false, def.VERTEXSIZE * 4, 4 * 3);
-	gl.vertexAttribPointer(brushProgram.attributeMap.LMCoords.location, 2, gl.FLOAT, false, def.VERTEXSIZE * 4, 4 * 5);
-
-	// set uniforms
-	gl.uniform1i(brushProgram.uniforms.uUseFullbrightTex, 0);
-	gl.uniform1i(brushProgram.uniforms.uUseOverbright, cvr.overbright.value);
-	gl.uniform1i(brushProgram.uniforms.uUseAlphaTest, 0);
-	gl.uniform1f(brushProgram.uniforms.uAlpha, entalpha);
-	gl.uniform1f(brushProgram.uniforms.uFogDensity, fogDensity / 64)
-	gl.uniform4f(brushProgram.uniforms.uFogColor, fogColor[0], fogColor[1], fogColor[2], fogColor[3])
-
-	if (ent !== null) {
-		var viewMatrix = GL.rotationMatrix(ent.angles[0], ent.angles[1], ent.angles[2]);
-
-		gl.uniform3fv(brushProgram.uniforms.uOrigin, ent.origin);
-		gl.uniformMatrix3fv(brushProgram.uniforms.uAngles, false, viewMatrix);
-
-	} else {
-		gl.uniform3f(brushProgram.uniforms.uOrigin, 0.0, 0.0, 0.0);
-		gl.uniformMatrix3fv(brushProgram.uniforms.uAngles, false, GL.identity);
-	}
-
-	for (var i = 0; i < model.textures.length; i++) {
-		var t = model.textures[i];
-
-		if (!t || !t.texturechains || !t.texturechains[chain] || t.texturechains[chain].flags & (def.SURF.drawtiled | def.SURF.notexture | def.SURF.drawtub))
-			continue;
-
-		var animatedTexture = textureAnimation(model, t, ent != null ? ent.frame : 0)
-		// Enable/disable TMU 2 (fullbrights)
-		// FIXME: Move below to where we bind GL_TEXTURE0
-		// full bright is never set.
-		// if (cvr.fullbrights.value && (fullbright = animatedTexture.fullbright)) {
-		// 	tx.bind(2, fullbright);
-		// 	gl.uniform1i(brushProgram.uUseFullbrightTex, 1);
-		// }
-		// else {
-			gl.uniform1i(brushProgram.uniforms.uUseFullbrightTex, 0);
-			tx.bind(2, tx.state.null_texture)
-		//}
-
-		batchRender.clearBatch();
-
-		var bound = false;
-		var lastlightmap = 0;
-
-		for (var s = t.texturechains[chain]; !!s; s = s.texturechain)
-			if (!s.culled) {
-				if (!bound) //only bind once we are sure we need this texture
-				{
-					tx.bind(0, animatedTexture.texturenum);
-
-					if (t.texturechains[chain].flags & def.SURF.drawfence)
-						gl.uniform1i(brushProgram.uniforms.uUseAlphaTest, 1);
-
-					bound = true;
-					lastlightmap = s.lightmaptexturenum;
-				}
-
-				if (s.lightmaptexturenum !== lastlightmap)
-					batchRender.flushBatch(gl);
-
-				tx.bind(1, tx.state.lightmap_textures[s.lightmaptexturenum].texnum);
-				lastlightmap = s.lightmaptexturenum;
-				batchRender.batchSurface(gl, s);
-
-				// rs_brushpasses++; // stats
-			}
-
-		batchRender.flushBatch(gl);
-
-		if (bound && t.texturechains[chain].flags & def.SURF.drawfence)
-			gl.uniform1i(brushProgram.uniforms.useAlphaTest, 0); // Flip alpha test back off
-	}
-
-	GL.unbindProgram()
-
-	if (entalpha < 1) {
-		gl.depthMask(true);
-		gl.disable(gl.BLEND);
-	}
-}
-
-export const markLeaves = function () {
-	if ((state.oldviewleaf === state.viewleaf) && (cvr.novis.value === 0))
+// Marks the leaf, then walks nodeParent to the root, stopping at the first
+// already-marked node.
+const markAncestorsVisible = (model: Model, leafNum: number, visframecount: number) => {
+	if (leafNum >= model.leafMarkvisframe.length)
 		return;
-	++state.visframecount;
-	state.oldviewleaf = state.viewleaf;
-	var vis = (cvr.novis.value !== 0) ? mod.novis : mod.leafPVS(state.viewleaf, cl.clState.worldmodel);
-	var i, node;
-	for (i = 0; i < cl.clState.worldmodel.leafs.length; ++i) {
-		if ((vis[i >> 3] & (1 << (i & 7))) === 0)
-			continue;
-		for (node = cl.clState.worldmodel.leafs[i + 1]; node != null; node = node.parent) {
-			if (node.markvisframe === state.visframecount)
-				break;
-			node.markvisframe = state.visframecount;
-		}
+	if (model.leafMarkvisframe[leafNum] === visframecount)
+		return;
+	model.leafMarkvisframe[leafNum] = visframecount;
+	for (var n = model.leafParent[leafNum]; n >= 0; n = model.nodeParent[n]) {
+		if (model.nodeMarkvisframe[n] === visframecount)
+			break;
+		model.nodeMarkvisframe[n] = visframecount;
 	}
-	do {
-		if (cvr.novis.value !== 0)
-			break;
-		var p = [state.refdef.vieworg[0], state.refdef.vieworg[1], state.refdef.vieworg[2]];
-		var leaf;
-		if (state.viewleaf.contents <= mod.CONTENTS.water) {
-			leaf = mod.pointInLeaf([state.refdef.vieworg[0], state.refdef.vieworg[1], state.refdef.vieworg[2] + 16.0], cl.clState.worldmodel);
-			if (leaf.contents <= mod.CONTENTS.water)
-				break;
-		}
-		else {
-			leaf = mod.pointInLeaf([state.refdef.vieworg[0], state.refdef.vieworg[1], state.refdef.vieworg[2] - 16.0], cl.clState.worldmodel);
-			if (leaf.contents > mod.CONTENTS.water)
-				break;
-		}
-		if (leaf === state.viewleaf)
-			break;
-		vis = mod.leafPVS(leaf, cl.clState.worldmodel);
-		for (i = 0; i < cl.clState.worldmodel.leafs.length; ++i) {
-			if ((vis[i >> 3] & (1 << (i & 7))) === 0)
-				continue;
-			for (node = cl.clState.worldmodel.leafs[i + 1]; node != null; node = node.parent) {
-				if (node.markvisframe === state.visframecount)
-					break;
-				node.markvisframe = state.visframecount;
-			}
-		}
-	} while (false);
-	state.drawsky = false;
-	recursiveWorldNode(cl.clState.worldmodel.nodes[0]);
-};
+}
 
 const noVisPVS = (model: Model) => {
 	const pvsbytes = (model.numleafs + 7) >> 3;
@@ -2186,10 +2158,14 @@ const noVisPVS = (model: Model) => {
 	return state.mod_novis;
 }
 
-const leafPVS = (leaf: Leaf, model: Model) => {
-	if (leaf == model.leafs[0])
+const leafPVS = (leafNum: number, model: Model) => {
+	if (leafNum === 0)
 		return noVisPVS(model);
-	return mod.decompressVis(leaf.visofs, model);
+	// shared scratch: markSurfaces copies what it caches, so no caller may retain this
+	const row = mod.visRowBytes(model)
+	if (!state.leafpvs_scratch || state.leafpvs_scratch.length < row)
+		state.leafpvs_scratch = new Uint8Array(row)
+	return mod.decompressVis(model.leafVisofs[leafNum], model, state.leafpvs_scratch);
 }
 
 // The PVS must include a small area around the client to allow head bobbing
@@ -2197,30 +2173,32 @@ const leafPVS = (leaf: Leaf, model: Model) => {
 // entity that should be visible to not show up, especially when the bob
 // crosses a waterline.
 
-const addToFatPVS = (org: V3, node: NodeLeaf, worldmodel: Model) => { // johnfitz -- added worldmodel as a parameter
-
+// nodeC: flat child encoding (>= 0 node index, < 0 leaf as -1 - leafnum).
+const addToFatPVS = (org: V3, nodeC: number, worldmodel: Model) => {
+	const pf = worldmodel.nodePacked, pi = worldmodel.nodePackedI32;
 	while (1) {
 		// if this is a leaf, accumulate the pvs bits
-		if (node.contents < 0) {
-			const leaf = node as Leaf;
-			if (node.contents !== mod.CONTENTS.solid) {
-				const pvs = leafPVS(leaf, worldmodel); //johnfitz -- worldmodel as a parameter
+		if (nodeC < 0) {
+			const leafNum = -1 - nodeC;
+			if (worldmodel.leafContents[leafNum] !== mod.CONTENTS.solid) {
+				// decompress into the persistent scratch buffer — this runs every frame
+				// while near water, so a fresh allocation per leaf adds up
+				const pvs = mod.decompressVis(worldmodel.leafVisofs[leafNum], worldmodel, state.fatpvs_scratch);
 				for (var i = 0; i < state.fatbytes; i++)
 					state.fatpvs[i] |= pvs[i];
 			}
 			return;
 		}
 
-		const _node = node as Node;
-		const plane = _node.plane;
-		const d = vec.dotProductV3(org, plane.normal) - plane.dist;
+		const base = nodeC * 16;
+		const d = org[0] * pf[base + 6] + org[1] * pf[base + 7] + org[2] * pf[base + 8] - pf[base + 9];
 		if (d > 8)
-			node = _node.children[0];
+			nodeC = pi[base + 13];
 		else if (d < -8)
-			node = _node.children[1];
+			nodeC = pi[base + 14];
 		else {	// go down both
-			addToFatPVS(org, _node.children[0], worldmodel); //johnfitz -- worldmodel as a parameter
-			node = _node.children[1];
+			addToFatPVS(org, pi[base + 13], worldmodel);
+			nodeC = pi[base + 14];
 		}
 	}
 }
@@ -2232,10 +2210,35 @@ const fatPVS = (org: V3, worldmodel: Model) => //johnfitz -- added worldmodel as
 	state.fatbytes = (worldmodel.numleafs + 7) >> 3; // ericw -- was +31, assumed to be a bug/typo
 	if (!state.fatpvs || state.fatbytes > state.fatpvs_capacity) {
 		state.fatpvs_capacity = state.fatbytes;
-		state.fatpvs = new Uint8Array(new ArrayBuffer(state.fatpvs_capacity)).fill(0)
+		state.fatpvs = new Uint8Array(new ArrayBuffer(state.fatpvs_capacity))
 	}
-	addToFatPVS(org, worldmodel.nodes[0], worldmodel); //johnfitz -- worldmodel as a parameter
+	const scratchbytes = mod.visRowBytes(worldmodel)
+	if (!state.fatpvs_scratch || state.fatpvs_scratch.length < scratchbytes)
+		state.fatpvs_scratch = new Uint8Array(scratchbytes)
+	state.fatpvs.fill(0, 0, state.fatbytes)
+	addToFatPVS(org, 0, worldmodel);
 	return state.fatpvs;
+}
+
+const visEquals = (a: Uint8Array, b: Uint8Array, nbytes: number) => {
+	if (a === b)
+		return true
+	if (a.length < nbytes || b.length < nbytes)
+		return false
+	for (var i = 0; i < nbytes; i++)
+		if (a[i] !== b[i])
+			return false
+	return true
+}
+
+// Persist this frame's PVS row into state.cached_vis. Every vis source (leafPVS/fatPVS/noVisPVS) returns a
+// shared buffer that the next decompress overwrites, so this copy is what markSurfaces' reuse compare AND
+// the WebGPU compute cull's per-frame PVS upload (WebGPURenderer.encodeCull) read.
+const cacheVis = (worldmodel: Model, vis: Uint8Array) => {
+	const rowbytes = mod.visRowBytes(worldmodel);
+	if (state.cached_vis == null || state.cached_vis.length < rowbytes)
+		state.cached_vis = new Uint8Array(rowbytes);
+	state.cached_vis.set(vis.length <= rowbytes ? vis : vis.subarray(0, rowbytes));
 }
 
 const chainSurface = (model: Model, surf: Face, chain: TexChain) => {
@@ -2244,75 +2247,197 @@ const chainSurface = (model: Model, surf: Face, chain: TexChain) => {
 	texture.texturechains[chain] = surf;
 }
 
-const markSurfaces = () => {
-	var vis: Uint8Array 
+// Decoupled GPU-cull mode's slim substitute for markSurfaces: ONLY the PVS-driven efrag gather (static
+// entities — torches/flames — live in leaf efrag chains and are added to the visedict list per visible
+// leaf). No ancestor marking (only markWorldFrustum consumed it), no chain stamping/rebuild (the compute
+// cull owns world visibility). vis_changed is forced true so a later CPU frame (r_gpucull toggled off,
+// or cull-data build failure next map) rebuilds the now-stale chains instead of trusting them.
+const markEfrags = () => {
 	const worldmodel = cl.clState.worldmodel
-	// check this leaf for water portals
-	// TODO: loop through all water surfs and use distance to leaf cullbox
-	var nearwaterportal = false;
-	for (var i = 0, mark = state.viewleaf.firstmarksurface; i < state.viewleaf.nummarksurfaces; i++ , mark++)
+	var vis: Uint8Array
+	var i, nearwaterportal = false;
+	for (var i2 = 0, mark = worldmodel.leafFirstMarksurface[state.viewleaf]; i2 < worldmodel.leafNumMarksurfaces[state.viewleaf]; i2++, mark++)
 		if (worldmodel.faces[worldmodel.marksurfaces[mark]].flags & def.SURF.drawtub)
 			nearwaterportal = true;
-
-	// choose vis data
-	if (cvr.novis.value || state.viewleaf.contents === mod.CONTENTS.solid || state.viewleaf.contents === mod.CONTENTS.sky)
+	// Reuse the cached visible-efrag leaf list while it's valid (same reuse rule as
+	// markSurfaces): the leafPVS row depends only on the viewleaf, so the ~numleafs-wide
+	// bit walk + PVS decompress need not rerun every frame. nearwaterportal frames use a
+	// position-dependent fatPVS and bypass the cache; a static-entity count change means a
+	// late svc_spawnstatic linked new efrag chains.
+	const novis = cvr.novis.value
+	if (!nearwaterportal && state.efragCacheWorld === worldmodel && state.efragCacheLeaf === state.viewleaf
+			&& state.efragCacheNovis === novis && state.efragCacheStatics === cl.clState.num_statics) {
+		const list = state.efragCacheLeaves
+		for (i = 0; i < state.efragCacheCount; i++)
+			storeEfrags(worldmodel.leafEfrags[list[i]])
+		state.drawsky = true
+		state.vis_changed = true
+		return
+	}
+	const viewContents = worldmodel.leafContents[state.viewleaf];
+	if (novis || viewContents === mod.CONTENTS.solid || viewContents === mod.CONTENTS.sky)
 		vis = noVisPVS(worldmodel);
 	else if (nearwaterportal)
 		vis = fatPVS(state.refdef.vieworg, worldmodel);
 	else
 		vis = leafPVS(state.viewleaf, worldmodel);
+	// The compute cull's visibility IS this row (encodeCull uploads cached_vis), so decoupled mode must
+	// refresh it here — markSurfaces, the only other writer, does not run in this mode.
+	cacheVis(worldmodel, vis)
+	let list = state.efragCacheLeaves
+	if (list == null || list.length < worldmodel.numleafs)
+		list = state.efragCacheLeaves = new Int32Array(worldmodel.numleafs)
+	let n = 0
+	for (i = 0; i < worldmodel.numleafs; i++) {
+		if (vis[i >> 3] & (1 << (i & 7))) {
+			const ef = worldmodel.leafEfrags[i + 1];
+			if (ef) {
+				storeEfrags(ef);
+				list[n++] = i + 1
+			}
+		}
+	}
+	if (nearwaterportal) {
+		state.efragCacheWorld = null   // position-dependent PVS — never reuse
+	} else {
+		state.efragCacheWorld = worldmodel
+		state.efragCacheLeaf = state.viewleaf
+		state.efragCacheNovis = novis
+		state.efragCacheStatics = cl.clState.num_statics
+		state.efragCacheCount = n
+	}
+	state.drawsky = true
+	state.vis_changed = true
+}
+
+const markSurfaces = () => {
+	var vis: Uint8Array
+	const worldmodel = cl.clState.worldmodel
+	// A chain-mode frame retargets cached_vis at its own viewleaf, which breaks markEfrags' rule that a
+	// valid efrag cache implies cached_vis holds that leaf's row. Drop the cache so the next decoupled
+	// frame takes the full path (one PVS decompress) and re-establishes both together.
+	state.efragCacheWorld = null
+	// check this leaf for water portals
+	// TODO: loop through all water surfs and use distance to leaf cullbox
+	var nearwaterportal = false;
+	for (var i = 0, mark = worldmodel.leafFirstMarksurface[state.viewleaf]; i < worldmodel.leafNumMarksurfaces[state.viewleaf]; i++ , mark++)
+		if (worldmodel.faces[worldmodel.marksurfaces[mark]].flags & def.SURF.drawtub)
+			nearwaterportal = true;
 
 	// if surface chains don't need regenerating, just add static entities and return
-	if (state.oldviewleaf == state.viewleaf && !state.vis_changed && !nearwaterportal) {
-		for (i = 0; i < worldmodel.numleafs; i++) {
-			var leaf = worldmodel.leafs[i + 1];
-			if (vis[i>>3] & (1<<(i&7)))
-				if (leaf.efrags)
-					storeEfrags (leaf.efrags);
+	// (reuse the vis decompressed when the chains were last rebuilt — decompressing
+	// the PVS every frame allocates and burns CPU on large maps)
+	const viewContents = worldmodel.leafContents[state.viewleaf];
+	if (state.oldviewleaf == state.viewleaf && !state.vis_changed && state.cached_vis) {
+		var reuse = !nearwaterportal
+		if (!reuse && !cvr.novis.value && viewContents !== mod.CONTENTS.solid && viewContents !== mod.CONTENTS.sky) {
+			// near water the PVS is position-dependent (fatPVS), so it must be recomputed
+			// every frame — but while its bytes are unchanged the chains are still valid,
+			// and this compare is far cheaper than the re-mark + chain rebuild below
+			reuse = visEquals(fatPVS(state.refdef.vieworg, worldmodel), state.cached_vis, state.fatbytes)
 		}
-		return;
+		if (reuse) {
+			vis = state.cached_vis
+			for (i = 0; i < worldmodel.numleafs; i++) {
+				if (vis[i>>3] & (1<<(i&7))) {
+					const ef = worldmodel.leafEfrags[i + 1];
+					if (ef)
+						storeEfrags (ef);
+				}
+			}
+			return;
+		}
 	}
+
+	// choose vis data
+	if (cvr.novis.value || viewContents === mod.CONTENTS.solid || viewContents === mod.CONTENTS.sky)
+		vis = noVisPVS(worldmodel);
+	else if (nearwaterportal)
+		vis = fatPVS(state.refdef.vieworg, worldmodel);
+	else {
+		vis = leafPVS(state.viewleaf, worldmodel);
+		// The viewleaf changed but its decompressed PVS row is byte-identical to
+		// the one the chains were built from (common for adjacent leafs on large
+		// maps) — the chains are still valid, so skip the O(visible) re-mark and
+		// rebuild. The compare is ~rowbytes; the rebuild is tens of ms on 1M+
+		// face maps.
+		if (!state.vis_changed && state.cached_vis && visEquals(vis, state.cached_vis, mod.visRowBytes(worldmodel))) {
+			state.oldviewleaf = state.viewleaf
+			for (i = 0; i < worldmodel.numleafs; i++) {
+				const ef = worldmodel.leafEfrags[i + 1];
+				if ((vis[i >> 3] & (1 << (i & 7))) && ef)
+					storeEfrags(ef);
+			}
+			return;
+		}
+	}
+	cacheVis(worldmodel, vis)
 
 	state.vis_changed = false
 	state.visframecount++;
 	state.oldviewleaf = state.viewleaf
+	state.rs_rebuilds++
 
-	// iterate through leaves, marking surfaces
+	// set all chains to null
+	for (i = 0; i < worldmodel.textures.length; i++)
+		if (worldmodel.textures[i] && worldmodel.textures[i].texturechains)
+			worldmodel.textures[i].texturechains[TexChain.world] = null;
+
+	// Iterate through leaves, marking surfaces and chaining them as they're
+	// first seen (QSS-M r_world.c R_MarkSurfaces order) — the visframe stamp
+	// doubles as the dedup guard for faces shared between leafs. This replaces
+	// the old FitzQuake full node/face sweep, which cost O(all faces) per
+	// rebuild regardless of how few were visible.
 	for (i = 0; i < worldmodel.numleafs; i++) {
-		var leaf = worldmodel.leafs[i + 1];
 		if (vis[i >> 3] & (1 << (i & 7))) {
-			if (cvr.oldskyleaf.value || leaf.contents != mod.CONTENTS.sky)
-				for (var j = 0; j < leaf.nummarksurfaces; j++) {
-					const surf = worldmodel.faces[worldmodel.marksurfaces[leaf.firstmarksurface + j]]
-					surf.visframe = state.visframecount;
+			const lnum = i + 1;
+			// stamps leafMarkvisframe/nodeMarkvisframe up to the root — the
+			// hierarchical frustum walk (markWorldFrustum) relies on these to
+			// know which subtrees are in the current PVS
+			markAncestorsVisible(worldmodel, lnum, state.visframecount);
+
+			if (cvr.oldskyleaf.value || worldmodel.leafContents[lnum] != mod.CONTENTS.sky) {
+				const first = worldmodel.leafFirstMarksurface[lnum], num = worldmodel.leafNumMarksurfaces[lnum];
+				for (var j = 0; j < num; j++) {
+					const snum = worldmodel.marksurfaces[first + j]
+					if (worldmodel.surfVisframe[snum] !== state.visframecount) {
+						worldmodel.surfVisframe[snum] = state.visframecount;
+						chainSurface(worldmodel, worldmodel.faces[snum], TexChain.world);
+					}
 				}
+			}
 
 			// add static models
-			if (leaf.efrags)
-				storeEfrags (leaf.efrags);
+			const ef = worldmodel.leafEfrags[lnum];
+			if (ef)
+				storeEfrags (ef);
 		}
 	}
 
-	// set all chains to null
-	for (i = 0; i < cl.clState.worldmodel.textures.length; i++)
-		if (cl.clState.worldmodel.textures[i] && cl.clState.worldmodel.textures[i].texturechains)
-			cl.clState.worldmodel.textures[i].texturechains[TexChain.world] = null;
+	flattenWorldChains(worldmodel)
 
-	// rebuild chains
-	//iterate through surfaces one node at a time to rebuild chains
-	//need to do it this way if we want to work with tyrann's skip removal tool
-	//becuase his tool doesn't actually remove the surfaces from the bsp surfaces lump
-	//nor does it remove references to them in each leaf's marksurfaces list
-	for (i = 0; i < cl.clState.worldmodel.nodes.length; i++)
-		for (j = 0; j < cl.clState.worldmodel.nodes[i].numfaces; j++) {
-			var surf = cl.clState.worldmodel.faces[cl.clState.worldmodel.nodes[i].firstface + j]
-			if (surf.visframe === state.visframecount) {
-				chainSurface(cl.clState.worldmodel, surf, TexChain.world);
-			}
-		}
 	state.drawsky = true
 }
 
+// Mirrors the just-rebuilt TexChain.world linked lists into worldChainFaces
+// (grouped by texture, worldChainOfs/Count give each texture's range) so the
+// per-frame draw loops can stream a typed array instead of chasing pointers.
+// Only runs when markSurfaces rebuilds the chains (PVS change) — the linked
+// lists remain the source of truth.
+const flattenWorldChains = (model: Model) => {
+	var cursor = 0
+	for (var i = 0; i < model.textures.length; i++) {
+		var t = model.textures[i]
+		model.worldChainOfs[i] = cursor
+		if (t && t.texturechains)
+			for (var s = t.texturechains[TexChain.world]; s; s = s.texturechain)
+				model.worldChainFaces[cursor++] = s.num
+		model.worldChainCount[i] = cursor - model.worldChainOfs[i]
+	}
+}
+
+// reused per-vertex scratch for buildSurfaceDisplayLists (cold: runs at newMap)
+const dispVertScratch: V3 = [0, 0, 0]
 const buildSurfaceDisplayLists = (model: Model) => {
 	for (var i = 0; i < model.numfaces; i++) {
 
@@ -2320,24 +2445,18 @@ const buildSurfaceDisplayLists = (model: Model) => {
 			continue;
 
 		var fa = model.faces[i]
-		fa.polys = {
-			next: fa.polys,
-			numverts: fa.numedges,
-			verts: []
-		}
+		const S = def.POLY_VERT_STRIDE
+		const pverts = model.polyVertData
+		const pbase = model.surfVertOfs[i] * S
 
 		const texInfo = model.texinfo[fa.texinfo]
 		const texture = model.textures[texInfo.texture]
+		const lmscale = 1 << fa.lmshift // texture units per luxel (BSPX LMSHIFT; 16 = vanilla)
 
 		for (var j = 0; j < fa.numedges; j++) {
-			var lindex = model.surfedges[fa.firstedge + j];
-			var _vec, s, t
-			if (lindex > 0) {
-				_vec = model.vertexes[model.edges[lindex][0]];
-			}
-			else {
-				_vec = model.vertexes[model.edges[-lindex][1]];
-			}
+			var s, t
+			const _vec = dispVertScratch
+			mod.surfedgeVertexInto(model, model.surfedges[fa.firstedge + j], _vec);
 			//@ts-ignore
 			s = vec.dotProductV3(_vec, texInfo.vecs[0]) + texInfo.vecs[0][3];
 			s /= texture.width;
@@ -2345,32 +2464,46 @@ const buildSurfaceDisplayLists = (model: Model) => {
 			t = vec.dotProductV3(_vec, texInfo.vecs[1]) + texInfo.vecs[1][3];
 			t /= texture.height;
 
-			fa.polys.verts[j] = [0,0,0,0,0,0,0]
-
-			//@ts-ignore
-			vec.copy(_vec, fa.polys.verts[j]);
-			fa.polys.verts[j][3] = s;
-			fa.polys.verts[j][4] = t;
+			var vb = pbase + j * S
+			pverts[vb] = _vec[0]; pverts[vb + 1] = _vec[1]; pverts[vb + 2] = _vec[2];
+			pverts[vb + 3] = s;
+			pverts[vb + 4] = t;
 
 			//
 			// lightmap texture coordinates
 			//
-			//@ts-ignore
-			s = vec.dotProductV3(_vec, texInfo.vecs[0]) + texInfo.vecs[0][3];
-			s -= fa.texturemins[0];
-			s += fa.light_s * 16;
-			s += 8;
-			s /= lm.LM_BLOCK_WIDTH * 16; //fa->texinfo->texture->width;
+			if (fa.decoupled) {
+				// lmvecs give luxel coords directly (texturemins folded into .w);
+				// the classic path below reduces to this once divided by lmscale.
+				const lv = fa.lmvecs as Float32Array
+				//@ts-ignore
+				s = _vec[0] * lv[0] + _vec[1] * lv[1] + _vec[2] * lv[2] + lv[3]
+				s += fa.light_s
+				s += 0.5
+				s /= lm.LM_BLOCK_WIDTH
+				//@ts-ignore
+				t = _vec[0] * lv[4] + _vec[1] * lv[5] + _vec[2] * lv[6] + lv[7]
+				t += fa.light_t
+				t += 0.5
+				t /= lm.LM_BLOCK_HEIGHT
+			} else {
+				//@ts-ignore
+				s = vec.dotProductV3(_vec, texInfo.vecs[0]) + texInfo.vecs[0][3];
+				s -= model.faceTexturemins[i * 2];
+				s += fa.light_s * lmscale;
+				s += lmscale / 2;
+				s /= lm.LM_BLOCK_WIDTH * lmscale; //fa->texinfo->texture->width;
 
-			//@ts-ignore
-			t = vec.dotProductV3(_vec, texInfo.vecs[1]) + texInfo.vecs[1][3];
-			t -= fa.texturemins[1];
-			t += fa.light_t * 16;
-			t += 8;
-			t /= lm.LM_BLOCK_HEIGHT * 16; //fa->texinfo->texture->height;
+				//@ts-ignore
+				t = vec.dotProductV3(_vec, texInfo.vecs[1]) + texInfo.vecs[1][3];
+				t -= model.faceTexturemins[i * 2 + 1];
+				t += fa.light_t * lmscale;
+				t += lmscale / 2;
+				t /= lm.LM_BLOCK_HEIGHT * lmscale; //fa->texinfo->texture->height;
+			}
 
-			fa.polys.verts[j][5] = s;
-			fa.polys.verts[j][6] = t;
+			pverts[vb + 5] = s;
+			pverts[vb + 6] = t;
 		}
 
 		//johnfitz -- removed gl_keeptjunctions code
@@ -2378,7 +2511,26 @@ const buildSurfaceDisplayLists = (model: Model) => {
 }
 
 const buildModelVertexBuffer = (gl: WebGLRenderingContext) => {
-	var v_buffer = []
+	// Pass 1: exact vertex count. Pre-sizing the Float32Array avoids staging the
+	// whole VBO in a growing JS number[] first — on a 1.7M-face BSP2 that
+	// intermediate is a transient GB-scale allocation.
+	var total = 0
+	for (var midx = 1; midx < cl.clState.model_precache.length; ++midx) {
+		var model = cl.clState.model_precache[midx];
+		if (!model || model.name[0] == '*' || model.type != mod.TYPE.brush)
+			continue;
+		total += model.polyVertData.length / def.POLY_VERT_STRIDE
+	}
+
+	var v_buffer = new Float32Array(total * def.VERTEXSIZE)
+	// WebGPU lightmap-array consolidation: a parallel per-vertex layer stream (4 float32 layers per vertex,
+	// one per style slot) so the world shader can index its 4 lightmap texture_2d_arrays. Same vertex
+	// count/order as v_buffer. WebGPU-gated (null under WebGL2 — the WebGL path never binds it).
+	const webgpu = getRenderer().backend === 'webgpu'
+	var l_buffer: Float32Array | null = webgpu ? new Float32Array(total * 4) : null
+	const p2l1 = lm.state.lmPageToLayer[1], p2l2 = lm.state.lmPageToLayer[2], p2l3 = lm.state.lmPageToLayer[3]
+	var o = 0
+	var lo = 0
 	var v_index = 0
 
 	for (var midx = 1; midx < cl.clState.model_precache.length; ++midx) {
@@ -2389,17 +2541,148 @@ const buildModelVertexBuffer = (gl: WebGLRenderingContext) => {
 		for (var i = 0; i < model.faces.length; i++) {
 			const surf = model.faces[i]
 			surf.vbo_firstvert = v_index
-			for (var j = 0; j < surf.polys.verts.length; j++)
+			const pv = model.polyVertData, nv = surf.numedges, S = def.POLY_VERT_STRIDE
+			var b = model.surfVertOfs[i] * S
+			// Face styles now live in the model's flat SoA arrays (wasm-sim memory-model refactor); read
+			// the active-style count + the 4 style slots from there instead of the removed surf.styles[].
+			const nS = model.faceNumStyles[i]
+			const s0 = nS > 0 ? model.faceStyles[i * 4] : 64
+			const s1 = nS > 1 ? model.faceStyles[i * 4 + 1] : 64
+			const s2 = nS > 2 ? model.faceStyles[i * 4 + 2] : 64
+			const s3 = nS > 3 ? model.faceStyles[i * 4 + 3] : 64
+			// Compact lightmap layer per style slot for this surface's page (WebGPU lightmap arrays). Slot 0
+			// layer == page (dense); slots 1-3 use the sparse page→layer map (absent slot → layer 0, its
+			// weight is 0 so the black sample is discarded). Sky/tiled faces have page 0 and never sample.
+			var pg = surf.lightmaptexturenum
+			if (!(pg >= 0)) pg = 0
+			const ml0 = pg
+			const ml1 = webgpu ? (p2l1[pg] >= 0 ? p2l1[pg] : 0) : 0
+			const ml2 = webgpu ? (p2l2[pg] >= 0 ? p2l2[pg] : 0) : 0
+			const ml3 = webgpu ? (p2l3[pg] >= 0 ? p2l3[pg] : 0) : 0
+			for (var j = 0; j < nv; j++) {
 				for (var k = 0; k < 7; k++)
-					v_buffer.push(surf.polys.verts[j][k] || 0)
+					v_buffer[o++] = pv[b++]
+				// 4 lightstyle indices (slots 0-3); 64 = unused slot (GPU weight = 0)
+				v_buffer[o++] = s0
+				v_buffer[o++] = s1
+				v_buffer[o++] = s2
+				v_buffer[o++] = s3
+				if (l_buffer !== null) {
+					l_buffer[lo++] = ml0
+					l_buffer[lo++] = ml1
+					l_buffer[lo++] = ml2
+					l_buffer[lo++] = ml3
+				}
+			}
 
-			v_index += surf.polys.verts.length
+			v_index += nv
+
+			// Fill the prebuilt fan indices (ofs/count already computed at load
+			// time in mod.loadBrushModel) now that vbo_firstvert is final.
+			var idx = model.surfIndexOfs[i]
+			for (var e = 2; e < surf.numedges; e++) {
+				model.surfIndexData[idx++] = surf.vbo_firstvert
+				model.surfIndexData[idx++] = surf.vbo_firstvert + e - 1
+				model.surfIndexData[idx++] = surf.vbo_firstvert + e
+			}
 		}
 	}
 
 	state.model_vbo = gl.createBuffer();
 	gl.bindBuffer(gl.ARRAY_BUFFER, state.model_vbo);
-	gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(v_buffer), gl.STATIC_DRAW);
+	gl.bufferData(gl.ARRAY_BUFFER, v_buffer, gl.STATIC_DRAW);
+
+	// WebGPU backend: retain the interleaved verts so the WebGPU renderer can upload its own vertex
+	// buffer (lazily, keyed off this Float32Array). Additive + backend-gated; null under WebGL2.
+	state.model_vbo_data = webgpu ? v_buffer : null;
+	// WebGPU lightmap-array consolidation: retain the parallel layer stream (uploaded as a second world
+	// vertex buffer). Its identity keys the WebGPU backend's lightmap-array + layer-buffer rebuild on map change.
+	state.model_lmlayer_data = l_buffer;
+
+	// Precompute per-brush-submodel eligibility (+ the WebGPU index set) now that surfIndexData is final.
+	buildBrushPrecompute();
+}
+
+// WebGPU-only, load-time (cold path): for each inline brush submodel (*N — doors, platforms, func_
+// brushwork), build a STATIC concatenated index set of all its drawable solid/fence faces' fan indices,
+// grouped by (base texture, fence). Lets drawBrushEntPrecomputed draw an opaque instance of the submodel
+// without the per-frame per-face CPU backface walk in drawBrushModel. A submodel with ANY water/turb
+// (drawtub) face is left un-precomputed (brushPrecompute = null) so it keeps the exact per-face path
+// (its water/translucency stays correct). Sky/tiled/notexture faces are excluded — the existing solid
+// pass skips them (SOLID_SKIP) too, so the image is unchanged. Indices reference the shared world VBO.
+const PRECOMPUTE_SKIP = def.SURF.drawtiled | def.SURF.notexture | def.SURF.drawsky
+const buildBrushPrecompute = () => {
+	// Eligibility (opaque pure-solid submodel with drawable faces) is backend-agnostic and gates the
+	// fast path in drawBrushModel for both backends; the WebGPU index set is only built under WebGPU
+	// (WebGL builds its own per-lightmap-page representation lazily in the WebGL renderer).
+	const webgpu = getRenderer().backend === 'webgpu'
+	for (var midx = 1; midx < cl.clState.model_precache.length; ++midx) {
+		const model = cl.clState.model_precache[midx];
+		if (!model || model.submodel !== true || model.type !== mod.TYPE.brush)
+			continue;
+		model.brushPrecompute = null;
+		model.brushPrecomputeEligible = false;
+		const faces = model.faces, first = model.firstface, num = model.numfaces;
+		const texinfo = model.texinfo;
+		const idxOfs = model.surfIndexOfs, idxCnt = model.surfIndexCount, idxData = model.surfIndexData;
+
+		// PURE-SOLID gate: any water/turb face → keep the existing per-face path.
+		var pure = true;
+		for (var i = 0; i < num; i++) {
+			if (faces[first + i].flags & def.SURF.drawtub) { pure = false; break; }
+		}
+		if (!pure)
+			continue;
+
+		// Pass 1: group key = textureIndex<<1 | isFence; total up each group's index count.
+		const counts = new Map<number, number>();
+		var total = 0;
+		for (var i = 0; i < num; i++) {
+			const surf = faces[first + i];
+			if (surf.flags & PRECOMPUTE_SKIP)
+				continue;
+			const key = (texinfo[surf.texinfo].texture << 1) | ((surf.flags & def.SURF.drawfence) ? 1 : 0);
+			const c = idxCnt[first + i];
+			counts.set(key, (counts.get(key) || 0) + c);
+			total += c;
+		}
+		if (total === 0)
+			continue;
+
+		// This submodel is opaque pure-solid with drawable faces → both backends may use the fast path.
+		model.brushPrecomputeEligible = true;
+
+		// WebGL builds its own (texture,fence,lightmap-page)-grouped static buffer lazily at draw time;
+		// only the WebGPU texture-grouped index set is precomputed here.
+		if (!webgpu)
+			continue;
+
+		// Prefix-sum each group into a contiguous range in indexData; build the slot list + write cursors.
+		const indexData = new Uint32Array(total);
+		const slots: BrushPrecomputeSlot[] = [];
+		const groupFirst = new Map<number, number>();
+		var running = 0;
+		counts.forEach((c, key) => {
+			groupFirst.set(key, running);
+			slots.push({ textureIndex: key >> 1, isFence: (key & 1) !== 0, first: running, count: c });
+			running += c;
+		});
+
+		// Pass 2: copy each drawable face's fan indices into its group's range.
+		for (var i = 0; i < num; i++) {
+			const surf = faces[first + i];
+			if (surf.flags & PRECOMPUTE_SKIP)
+				continue;
+			const key = (texinfo[surf.texinfo].texture << 1) | ((surf.flags & def.SURF.drawfence) ? 1 : 0);
+			var cur = groupFirst.get(key);
+			const so = idxOfs[first + i], cc = idxCnt[first + i];
+			for (var e = 0; e < cc; e++)
+				indexData[cur++] = idxData[so + e];
+			groupFirst.set(key, cur);
+		}
+
+		model.brushPrecompute = { indexData, slots };
+	}
 }
 
 export const freeResources = () => {
@@ -2415,23 +2698,19 @@ export const freeResources = () => {
 	gl.deleteTexture(state.solidskytexture)
 	gl.deleteTexture(state.alphaskytexture)
 	gl.deleteTexture(state.null_texture)
+
+	if (sky.state.texture) {
+		gl.deleteTexture(sky.state.texture)
+		sky.state.texture = null
+	}
+	sky.state.name = ''
+	sky.state.generation++ // cancel any load still in flight
 }
 
 // scan
 
-export const warpScreen = function () {
-	const gl = GL.getContext()
-	GL.streamFlush();
-	gl.finish();
-	gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-	gl.bindRenderbuffer(gl.RENDERBUFFER, null);
-	var program = GL.useProgram('Warp');
-	tx.bind(program.textures.tTexture, state.warptexture);
-	gl.uniform1f(program.uniforms.uTime, host.state.realtime % (Math.PI * 2.0));
-	var vrect = state.refdef.vrect;
-	GL.streamDrawTexturedQuad(vrect.x, vrect.y, vrect.width, vrect.height, 0.0, 1.0, 1.0, 0.0);
-	GL.streamFlush();
-};
+// warpScreen (underwater warp resolve blit) moved to WebGLRenderer.endScene (render phase1
+// frame-skeleton slice).
 
 // warp
 
@@ -2473,74 +2752,29 @@ export const makeSky = function () {
 			createAttribParam('aPosition', gl.FLOAT, 3)
 		],
 		[]);
+	GL.createProgram('SkyCube',
+		['uViewOrigin', 'uViewAngles', 'uPerspective', 'uGamma', 'uSkyFog', 'uFogColor'],
+		[
+			createAttribParam('aPosition', gl.FLOAT, 3)
+		],
+		['tSky']);
 
+	const skyvecs = new Float32Array(vecs);
 	state.skyvecs = gl.createBuffer();
 	gl.bindBuffer(gl.ARRAY_BUFFER, state.skyvecs);
-	gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vecs), gl.STATIC_DRAW);
+	gl.bufferData(gl.ARRAY_BUFFER, skyvecs, gl.STATIC_DRAW);
+
+	// WebGPU backend: retain the dome verts so the WebGPU renderer can upload its own vertex buffer
+	// (keyed off this Float32Array's identity). Additive + backend-gated; null under WebGL2.
+	state.skyvecs_data = getRenderer().backend === 'webgpu' ? skyvecs : null;
 };
 
-export const drawSkyBox = function () {
-	const gl = GL.getContext()
-	if (state.drawsky !== true)
-		return;
-
-	gl.colorMask(false, false, false, false);
-	var clmodel = cl.clState.worldmodel;
-	var program = GL.useProgram('SkyChain', false);
-	gl.bindBuffer(gl.ARRAY_BUFFER,  state.model_vbo);
-	gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null)
-	gl.vertexAttribPointer(program.attributeMap.aPosition.location, 3, gl.FLOAT, false, def.VERTEXSIZE * 4, 0);
-	for (var i = 0; i < clmodel.textures.length; i++) {
-		var t = clmodel.textures[i];
-		if (!t || !t.texturechains || !t.texturechains[TexChain.world] || !(t.texturechains[TexChain.world].flags & def.SURF.drawsky))
-			continue;
-		for (var s = t.texturechains[TexChain.world]; !!s; s = s.texturechain)
-			if (!s.culled) {
-				batchRender.batchSurface(gl, s);
-			}
-	}
-	batchRender.flushBatch(gl);
-
-	gl.colorMask(true, true, true, true);
-
-	gl.depthFunc(gl.GREATER);
-	gl.depthMask(false);
-	gl.disable(gl.CULL_FACE);
-
-	program = GL.useProgram('Sky', false);
-	gl.uniform2f(program.uniforms.uTime, (host.state.realtime * 0.125) % 1.0, (host.state.realtime * 0.03125) % 1.0);
-	tx.bind(program.textures.tSolid, state.solidskytexture, false);
-	tx.bind(program.textures.tAlpha, state.alphaskytexture, false);
-	gl.bindBuffer(gl.ARRAY_BUFFER, state.skyvecs);
-	gl.vertexAttribPointer(program.attributeMap.aPosition.location, 3, gl.FLOAT, false, 12, 0);
-
-	gl.uniform3f(program.uniforms.uScale, 2.0, -2.0, 1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-	gl.uniform3f(program.uniforms.uScale, 2.0, -2.0, -1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-
-	gl.uniform3f(program.uniforms.uScale, 2.0, 2.0, 1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-	gl.uniform3f(program.uniforms.uScale, 2.0, 2.0, -1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-
-	gl.uniform3f(program.uniforms.uScale, -2.0, -2.0, 1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-	gl.uniform3f(program.uniforms.uScale, -2.0, -2.0, -1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-
-	gl.uniform3f(program.uniforms.uScale, -2.0, 2.0, 1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-	gl.uniform3f(program.uniforms.uScale, -2.0, 2.0, -1.0);
-	gl.drawArrays(gl.TRIANGLES, 0, 180);
-
-	gl.enable(gl.CULL_FACE);
-	gl.depthMask(true);
-	gl.depthFunc(gl.LESS);
-};
+// drawSkyBox body (skyroom depth-only / cubemap SkyCube / classic scrolling dome) moved to
+// WebGLRenderer.drawSky (render phase1 world-surface + sky slice).
 
 export const initSky = function (src: Uint8Array) {
 	const gl = GL.getContext()
+	const wgpu = getRenderer().backend === 'webgpu';
 	var i, j, p;
 	var trans = new ArrayBuffer(65536);
 	var trans32 = new Uint32Array(trans);
@@ -2553,18 +2787,35 @@ export const initSky = function (src: Uint8Array) {
 		tx.bind(0, state.solidskytexture, false);
 		gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 128, 128, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(trans));
 		gl.generateMipmap(gl.TEXTURE_2D);
+	}
+	// WebGPU backend: retain the expanded RGBA (a fresh copy — `trans` is reused for the alpha layer
+	// below) on the sky-texture handle so the WebGPU renderer can upload its own GPUTexture. The handle
+	// is stable across maps (created once in r.init) but the content differs per map; the WebGPU cache
+	// keys off this Uint8Array's identity, so a new map's fresh copy invalidates it. Backend-gated —
+	// under WebGL2 these fields stay undefined (pixel-identical).
+	if (wgpu) {
+		(state.solidskytexture as any).rgba = new Uint8Array(trans).slice();
+		(state.solidskytexture as any).rgbaW = 128;
+		(state.solidskytexture as any).rgbaH = 128;
+	}
 
-		for (i = 0; i < 128; ++i) {
-			for (j = 0; j < 128; ++j) {
-				p = (i << 8) + j;
-				if (src[p] !== 0)
-					trans32[(i << 7) + j] = com.state.littleLong(vid.d_8to24table[src[p]] + 0xff000000);
-				else
-					trans32[(i << 7) + j] = 0;
-			}
+	for (i = 0; i < 128; ++i) {
+		for (j = 0; j < 128; ++j) {
+			p = (i << 8) + j;
+			if (src[p] !== 0)
+				trans32[(i << 7) + j] = com.state.littleLong(vid.d_8to24table[src[p]] + 0xff000000);
+			else
+				trans32[(i << 7) + j] = 0;
 		}
+	}
+	if (gl) {
 		tx.bind(0, state.alphaskytexture, false);
 		gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 128, 128, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(trans));
 		gl.generateMipmap(gl.TEXTURE_2D);
+	}
+	if (wgpu) {
+		(state.alphaskytexture as any).rgba = new Uint8Array(trans).slice();
+		(state.alphaskytexture as any).rgbaW = 128;
+		(state.alphaskytexture as any).rgbaH = 128;
 	}
 }

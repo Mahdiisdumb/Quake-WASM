@@ -9,7 +9,9 @@ export type CVar = {
   string: string,
   archive: boolean,
   server: boolean,
-  value: number
+  value: number,
+  // Value the variable was registered with, kept for completion hints.
+  defaultString: string
 }
 
 export type CVars = Record<string, CVar>
@@ -34,7 +36,9 @@ export const findVar = function(name: string)
   }
 };
 
-const create = function (name: string, value: string) {
+// Cvar_Create: the variable if it already exists, a new one at `value` if not, null when a
+// command owns the name (QSS cvar.c Cvar_Create).
+export const create = function (name: string, value: string) {
   const found = findVar(name)
   if (found)
     return found
@@ -73,7 +77,7 @@ export const set = function(name: string, value: string)
         events[j](value)
       }
     }
-    if ((v.server === true) && (changed === true) && (sv.state.server.active === true))
+    if ((v.server === true) && (changed === true) && (sv.state.server.phase === 'active'))
       host.broadcastPrint('"' + v.name + '" changed to "' + v.string + '"\n');
     return;
   }
@@ -117,7 +121,8 @@ export const registerVariable = function(name: string, value: string, archive: a
     string: value,
     archive: archive,
     server: server,
-    value: q.atof(value)
+    value: q.atof(value),
+    defaultString: value
   };
   return vars[vars.length - 1];
 };

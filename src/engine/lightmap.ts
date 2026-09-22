@@ -1,17 +1,17 @@
-import {loadLightmapTexture, bind, state as txState} from './texture'
-import * as cl from './cl'
-import * as vec from './vec'
+// GPU lightstyles: lightstyle animation is performed in the Brush fragment shader by blending
+// up to 4 raw per-style lightmap layers (written once at map load). Dynamic lights are computed
+// analytically in the Brush fragment shader (see fshBrush) from per-frame uniforms — no CPU overlay.
+import {loadLightmapTextureSlot, createBlackTexture, bind, state as textureState} from './texture'
 import * as def from './def'
-import * as GL from './GL'
-import * as texture from './texture'
 import * as con from './console'
-import {cvr} from './r'
-import { Face, Model, TexChain } from './types/Model'
-import { V3 } from './types/Vector'
+import { Face, Model } from './types/Model'
 
 export const LM_BLOCK_WIDTH = 256
 export const LM_BLOCK_HEIGHT = 256
-export const MAXLIGHTMAPS = 512
+// Max 256x256 lightmap atlas pages. Huge modern maps (Immortal Lock) exceed the
+// classic count. Only pages the map actually uses get GL textures (buildLightmaps
+// breaks at the first unused page); the cap just sizes the bookkeeping array.
+export const MAXLIGHTMAPS = 2048
 export const MAX_LIGHTSTYLES = 64
 
 // const cvr = {
@@ -22,42 +22,53 @@ export const MAX_LIGHTSTYLES = 64
 // 	oldskyleaf: {value: 0}
 // }
 
+type LightmapPageEntry = {
+	slots: (Uint8Array | null)[]
+}
+
 export type LightmapState = {
-	lightmap_modified: boolean[],
-	lightmap_rectchange: {l: number, t: number, w: number, h: number}[],
 	lightstylevalue: Uint32Array,
-	blocklights: Uint32Array,
-	lightmap_bytes: number,
-	lightmaps: Uint8Array,
+	lightstyle_uniform: Float32Array,
+	lightstyle_uniform_dirty: boolean,
 	allocated: number[][],
-	dlightframecount: number,
-	last_lightmap_allocated: number
+	last_lightmap_allocated: number,
+	lightmap_pages: LightmapPageEntry[],
+	// WebGPU lightmap-array consolidation: compact per-style layer maps built by
+	// buildLightmapArrays after the per-model buildLightmaps loop. lmNumPages = used 256x256 pages;
+	// lmLayerCount[m] = populated layers in style-slot m's texture_2d_array; lmPageToLayer[m][page] =
+	// that page's compact layer in slot m (-1 if slot m is absent on the page). Slot 0 is dense (layer ==
+	// page); slots 1-3 are sparse. WebGPU-only (left at their empty defaults under WebGL2).
+	lmNumPages: number,
+	lmLayerCount: Int32Array,
+	lmPageToLayer: Int32Array[]
 }
 
 export const state: LightmapState = {
-    lightmap_modified: [],
-    lightmap_rectchange: [],
     lightstylevalue: new Uint32Array(new ArrayBuffer(256 * 4)),
-    blocklights: new Uint32Array(new ArrayBuffer(3 * LM_BLOCK_HEIGHT * LM_BLOCK_WIDTH)),
-    lightmap_bytes: 4,
-    lightmaps: new Uint8Array(new ArrayBuffer(4 * MAXLIGHTMAPS * LM_BLOCK_HEIGHT * LM_BLOCK_WIDTH)),
+    lightstyle_uniform: new Float32Array(65), // index 64 is always 0 (unused slot)
+    lightstyle_uniform_dirty: true,
   allocated: Array.apply(null, new Array(MAXLIGHTMAPS)).map((): number[] => []),
-  dlightframecount: 0,
-  last_lightmap_allocated: 0
+  last_lightmap_allocated: 0,
+  lightmap_pages: [],
+  lmNumPages: 0,
+  lmLayerCount: new Int32Array(4),
+  lmPageToLayer: []
 }
 
-export const init = () => {	
+export const init = () => {
 	for (var i=0 ; i<256 ; i++)
-		state.lightstylevalue[i] = 264;	
+		state.lightstylevalue[i] = 264;
 
-	state.lightmap_modified = Array.apply(null, new Array(MAXLIGHTMAPS)).map(() => false)
-	state.lightmap_rectchange = Array.apply(null, new Array(MAXLIGHTMAPS)).map(() => ({l:0, t:0, w:0, h:0}))
-
-	state.allocated = Array.apply(null, new Array(MAXLIGHTMAPS)).map(() => 
+	state.allocated = Array.apply(null, new Array(MAXLIGHTMAPS)).map(() =>
 		Array.apply(null, new Array(LM_BLOCK_WIDTH)).map(() => 0))
 	state.last_lightmap_allocated = 0;
 
-	state.dlightframecount = 0; // no dlightcache
+	state.lightmap_pages = []
+	state.lightstyle_uniform_dirty = true
+
+	state.lmNumPages = 0
+	state.lmLayerCount = new Int32Array(4)
+	state.lmPageToLayer = []
 }
 
 /*
@@ -65,12 +76,19 @@ export const init = () => {
 AllocBlock -- returns a texture number and the position inside it
 ========================
 */
-const allocBlock = (surf: Face) => {
+const allocBlock = (model: Model, surf: Face) => {
 	var	i, j;
 	var	best, best2;
 	var	texnum;
-	var w = (surf.extents[0]>>4)+1;
-	var h = (surf.extents[1]>>4)+1;
+	var w = surf.decoupled ? surf.lmwidth : (model.faceExtents[surf.num * 2]>>surf.lmshift)+1;
+	var h = surf.decoupled ? surf.lmheight : (model.faceExtents[surf.num * 2 + 1]>>surf.lmshift)+1;
+	// 1-luxel gutter on every side: slot textures hold RAW per-style layers, so a
+	// GL_LINEAR tap at a rect edge otherwise reads a neighboring face's layer — which
+	// can belong to a DIFFERENT style (e.g. an off switchable's baked glow) but gets
+	// weighted by THIS face's style, leaking light along face borders. Edge-replicated
+	// padding (writeStyleLayers) keeps bilinear taps inside the face's own data.
+	// (QSS-M needs no gutter: it uploads CPU-combined, already style-weighted lightmaps.)
+	var pw = w + 2, ph = h + 2;
 
 	// ericw -- rather than searching starting at lightmap 0 every time,
 	// start at the last lightmap we allocated a surface in.
@@ -81,29 +99,30 @@ const allocBlock = (surf: Face) => {
 	{
 		best = LM_BLOCK_HEIGHT;
 
-		for (i=0 ; i<LM_BLOCK_WIDTH-w ; i++)
+		for (i=0 ; i<LM_BLOCK_WIDTH-pw ; i++)
 		{
 			best2 = 0;
 
-			for (j=0 ; j<w ; j++)
+			for (j=0 ; j<pw ; j++)
 			{
 				if (state.allocated[texnum][i+j] >= best)
 					break;
 				if (state.allocated[texnum][i+j] > best2)
 					best2 = state.allocated[texnum][i+j];
 			}
-			if (j == w)
-			{	// this is a valid spot
-				surf.light_s = i;
-				surf.light_t = best = best2;
+			if (j == pw)
+			{	// this is a valid spot; light_s/light_t are the inner (unpadded) origin
+				surf.light_s = i + 1;
+				best = best2;
+				surf.light_t = best + 1;
 			}
 		}
 
-		if (best + h > LM_BLOCK_HEIGHT)
+		if (best + ph > LM_BLOCK_HEIGHT)
 			continue;
 
-		for (i=0 ; i<w ; i++)
-			state.allocated[texnum][surf.light_s + i] = best + h;
+		for (i=0 ; i<pw ; i++)
+			state.allocated[texnum][surf.light_s - 1 + i] = best + ph;
 
 		return texnum;
 	}
@@ -112,141 +131,125 @@ const allocBlock = (surf: Face) => {
 }
 
 export const createSurfaceLightmap = (model: Model, surf: Face) => {
-	surf.lightmaptexturenum = allocBlock (surf);
-
-	var bufOfs = surf.lightmaptexturenum * state.lightmap_bytes * LM_BLOCK_WIDTH * LM_BLOCK_HEIGHT;
-	bufOfs += (surf.light_t * LM_BLOCK_WIDTH + surf.light_s) * state.lightmap_bytes;
-	buildLightMap (model, surf, bufOfs, LM_BLOCK_WIDTH * state.lightmap_bytes);
+	surf.lightmaptexturenum = allocBlock (model, surf);
+	model.surfLightmapPage[surf.num] = surf.lightmaptexturenum;
+	writeStyleLayers (model, surf);
 }
 
-export const addDynamicLights = (blocklights: Uint32Array, model: Model, surf: Face) => {
-	//johnfitz
+// Write the raw (unscaled) per-style lightmap samples into per-page/per-slot staging buffers.
+// Called at map load for every lightmapped surface; staging is later uploaded as GL textures.
+const writeStyleLayers = (model: Model, surf: Face) => {
+	const page = surf.lightmaptexturenum
+	const smax = surf.decoupled ? surf.lmwidth : (model.faceExtents[surf.num * 2] >> surf.lmshift) + 1
+	const tmax = surf.decoupled ? surf.lmheight : (model.faceExtents[surf.num * 2 + 1] >> surf.lmshift) + 1
+	const size = smax * tmax
 
-	var smax = (surf.extents[0] >> 4) + 1;
-	var tmax = (surf.extents[1] >> 4) + 1;
-	var tex = model.texinfo[surf.texinfo];
-	var impact: V3 = vec.emptyV3(), local = []
-	var sd, td, brightness, blidx = 0;
+	if (!state.lightmap_pages[page])
+		state.lightmap_pages[page] = { slots: [] }
 
-	for (var i = 0; i < cl.state.dlights.length; i++)
-	{
-		if (! (surf.dlightbits[i >> 5] & (1 << (i & 31))))
-			continue;		// not lit by this light
+	const pageEntry = state.lightmap_pages[page]
 
-		var rad = cl.state.dlights[i].radius;
-		var dist = vec.dotProductV3(cl.state.dlights[i].origin, surf.plane.normal) -
-				surf.plane.dist;
-
-		rad -= Math.abs(dist);
-
-		var minlight = cl.state.dlights[i].minlight;
-		if (rad < minlight)
-			continue;
-
-		minlight = rad - minlight;
-
-		for (var j=0 ; j<3 ; j++)
-		{
-			impact[j] = cl.state.dlights[i].origin[j] -
-					surf.plane.normal[j] * dist;
+	if (!model || !model.lightdata) {
+		// Full bright: write 255s into slot 0 so the GPU path can light this surface.
+		// Unlit BSPs carry all-255 style bytes (numStyles 0), which the vertex buffer maps
+		// to the zero-weight slot 64 — force style 0 so the slot-0 data gets a live weight.
+		model.faceStyles[surf.num * 4] = 0
+		if (model.faceNumStyles[surf.num] === 0) model.faceNumStyles[surf.num] = 1
+		if (!pageEntry.slots[0])
+			pageEntry.slots[0] = new Uint8Array(LM_BLOCK_WIDTH * LM_BLOCK_HEIGHT * 4)
+		const staging = pageEntry.slots[0]
+		// -1..max loops cover the 1-luxel gutter allocBlock reserved around the rect
+		for (var t = -1; t <= tmax; t++) {
+			for (var s = -1; s <= smax; s++) {
+				const dstIdx = ((surf.light_t + t) * LM_BLOCK_WIDTH + (surf.light_s + s)) * 4
+				staging[dstIdx] = 255
+				staging[dstIdx + 1] = 255
+				staging[dstIdx + 2] = 255
+				staging[dstIdx + 3] = 255
+			}
 		}
+		return
+	}
 
-		local[0] = vec.dotProductV3(impact, tex.vecs[0]) + tex.vecs[0][3];
-		local[1] = vec.dotProductV3(impact, tex.vecs[1]) + tex.vecs[1][3];
+	if (surf.lightofs < 0)
+		return // No lightmap data for this surface — leave staging black
 
-		local[0] -= surf.texturemins[0];
-		local[1] -= surf.texturemins[1];
+	for (var m = 0; m < model.faceNumStyles[surf.num]; m++) {
+		if (!pageEntry.slots[m])
+			pageEntry.slots[m] = new Uint8Array(LM_BLOCK_WIDTH * LM_BLOCK_HEIGHT * 4)
+		const staging = pageEntry.slots[m]
+		const srcBase = surf.lightofs + m * size * 3
 
-		//johnfitz -- lit support via lordhavoc
-		var bl = blocklights;
-		var cred = 256 // cl.state.dlights[i].color[0] * 256.0;
-		var cgreen = 256 // cl.state.dlights[i].color[1] * 256.0;
-		var cblue = 256 // cl.state.dlights[i].color[2] * 256.0;
-
-		//johnfitz
-		for (var t = 0; t < tmax; t++)
-		{
-			td = local[1] - (t << 4);
-			if (td < 0)
-				td = -td;
-			td = Math.floor(td)
-
-			for (var s = 0 ; s < smax ; s++)
-			{
-				sd = local[0] - (s << 4);
-				if (sd < 0)
-					sd = -sd;
-				sd = Math.floor(sd)
-				if (sd > td)
-					dist = sd + (td>>1);
-				else
-					dist = td + (sd>>1);
-				if (dist < minlight)
-				//johnfitz -- lit support via lordhavoc
-				{
-					brightness = rad - dist;
-					bl[blidx++] += Math.floor(brightness * cred);
-					bl[blidx++] += Math.floor(brightness * cgreen);
-					bl[blidx++] += Math.floor(brightness * cblue);
-				} else {
-					blidx += 3
-				}
-				//johnfitz
+		// -1..max loops fill the 1-luxel gutter by replicating the edge samples
+		for (var t = -1; t <= tmax; t++) {
+			const st = t < 0 ? 0 : (t >= tmax ? tmax - 1 : t)
+			for (var s = -1; s <= smax; s++) {
+				const ss = s < 0 ? 0 : (s >= smax ? smax - 1 : s)
+				const srcIdx = srcBase + (st * smax + ss) * 3
+				const dstIdx = ((surf.light_t + t) * LM_BLOCK_WIDTH + (surf.light_s + s)) * 4
+				staging[dstIdx] = model.lightdata[srcIdx]
+				staging[dstIdx + 1] = model.lightdata[srcIdx + 1]
+				staging[dstIdx + 2] = model.lightdata[srcIdx + 2]
+				staging[dstIdx + 3] = 255
 			}
 		}
 	}
 }
+
+// Upload a finished page's slot textures and drop its staging. A page is final
+// once allocBlock's frontier (last_lightmap_allocated) has moved past it.
+const uploadPageSlots = (gl: WebGLRenderingContext, page: number) => {
+	const pageEntry = state.lightmap_pages[page]
+	if (!pageEntry) return
+	for (var slot = 0; slot < pageEntry.slots.length; slot++) {
+		const slotData = pageEntry.slots[slot]
+		if (slotData)
+			loadLightmapTextureSlot(gl, page, slot, `lightmap#${page}_s${slot}`, LM_BLOCK_WIDTH, LM_BLOCK_HEIGHT, slotData)
+	}
+	pageEntry.slots = []
+}
+
+// GPU lightstyles: write raw per-style layers into per-page/per-slot staging at load time,
+// then create GL textures for each slot. Dynamic lights are computed analytically in the
+// Brush fragment shader (see fshBrush) — no per-frame lightmap texture updates needed.
 export const buildLightmaps = (gl: WebGLRenderingContext, model: Model) => {
 
-	//johnfitz -- null out array (the gltexture objects themselves were already freed by Mod_ClearAll)
-	
-	// for (var i=0; i < MAXLIGHTMAPS; i++)
-	// 	txState.lightmap_textures[i] = null;
+	// Upload-and-free each page as the allocation frontier passes it: staging
+	// for a huge map would otherwise hold every page's slot buffers (256KB per
+	// slot x hundreds of pages) simultaneously until the loop below.
+	var flushed = state.last_lightmap_allocated
 
-	//johnfitz
+	for (var i=0 ; i<model.numfaces ; i++)
+	{
+		if (model.faces[i].flags & def.SURF.drawtiled)
+			continue;
+		createSurfaceLightmap (model, model.faces[i]);
+		while (flushed < state.last_lightmap_allocated)
+			uploadPageSlots(gl, flushed++)
+	}
 
-	state.lightmap_bytes = 4 // hardcoded for gl.RGBA
-
-	// for (j=1 ; j<MAX_MODELS ; j++)
-	// {
-	// 	m = cl.model_precache[j];
-	// 	if (!m)
-	// 		break;
-	// 	if (m->name[0] == '*')
-	// 		continue;
-	//	r_pcurrentvertbase = model.vertexes; // bs 
-	//	currentmodel = m;
-		for (var i=0 ; i<model.numfaces ; i++)
-		{
-			//johnfitz -- rewritten to use SURF_DRAWTILED instead of the sky/water flags
-			if (model.faces[i].flags & def.SURF.drawtiled)
-				continue;
-			createSurfaceLightmap (model, model.faces[i]);
-			//johnfitz
-		}
-	//}
-
-	//
-	// upload all lightmaps that were filled
-	//
+	// Create per-slot GL textures for every used page
 	for (i = 0; i<MAXLIGHTMAPS; i++)
 	{
 		if (!state.allocated[i][0])
 			break;		// no more used
-		state.lightmap_modified[i] = false;
-		state.lightmap_rectchange[i].l = LM_BLOCK_WIDTH;
-		state.lightmap_rectchange[i].t = LM_BLOCK_HEIGHT;
-		state.lightmap_rectchange[i].w = 0;
-		state.lightmap_rectchange[i].h = 0;
 
-		//johnfitz -- use texture manager
-		const name = `lightmap#${i}`
-		const lightmapSize = LM_BLOCK_WIDTH * LM_BLOCK_HEIGHT * state.lightmap_bytes
-		const data = state.lightmaps.subarray(lightmapSize * i, lightmapSize * i + lightmapSize)
-
-		loadLightmapTexture(gl, i, name, LM_BLOCK_WIDTH, LM_BLOCK_HEIGHT, data)
-		//johnfitz
+		const pageEntry = state.lightmap_pages[i]
+		if (pageEntry) {
+			for (var slot = 0; slot < pageEntry.slots.length; slot++) {
+				const slotData = pageEntry.slots[slot]
+				if (slotData) {
+					const slotName = `lightmap#${i}_s${slot}`
+					loadLightmapTextureSlot(gl, i, slot, slotName, LM_BLOCK_WIDTH, LM_BLOCK_HEIGHT, slotData)
+				}
+			}
+			if (i < state.last_lightmap_allocated)
+				pageEntry.slots = []
+		}
 	}
+
+	// Create the shared black fallback texture (used for missing style slots)
+	createBlackTexture(gl)
 
 	//johnfitz -- warn about exceeding old limits
 	if (i >= 64)
@@ -254,185 +257,49 @@ export const buildLightmaps = (gl: WebGLRenderingContext, model: Model) => {
 	//johnfitz
 }
 
-const buildLightMap = (model: Model, surf: Face, buffofs: number, stride: number) => {
-	surf.cached_dlight = surf.dlightframe === state.dlightframecount
 
-	const smax = (surf.extents[0]>>4)+1;
-	const tmax = (surf.extents[1]>>4)+1;
-	const size = smax * tmax;
-
-	var blockidx = 0
-	var buffidx = surf.lightofs
-
-	if (model && model.lightdata)
-	{
-		state.blocklights.fill(0, 0, size * 3)
-		// add all the lightmaps
-		if (buffidx > -1)
-		{
-			for (var maps = 0; maps < surf.styles.length && surf.styles[maps] !== 255;
-				 maps++)
-			{
-				const scale = state.lightstylevalue[surf.styles[maps]];
-				surf.cached_light[maps] = scale;	// 8.8 fraction
-
-				blockidx = 0
-				//johnfitz -- lit support via lordhavoc
-
-				for (var i = 0; i < size; i++)
-				{
-					state.blocklights[blockidx++] += model.lightdata[buffidx++] * scale
-					state.blocklights[blockidx++] += model.lightdata[buffidx++] * scale
-					state.blocklights[blockidx++] += model.lightdata[buffidx++] * scale
-				}
-
-				//johnfitz
-			}
+// WebGPU lightmap-array consolidation: pack the used lightmap pages into 4 per-style
+// texture_2d_array layer maps so the world draw can bind ALL lightmaps once and batch by texture (no
+// per-page draw flush). Must run AFTER the per-model buildLightmaps loop (so texture.state
+// .lightmap_style_textures is fully populated) and BEFORE r.buildModelVertexBuffer (which reads these
+// maps to emit the per-vertex layer stream). WebGPU-only — the WebGL path never calls this.
+export const buildLightmapArrays = () => {
+	let numPages = 0
+	for (let i = 0; i < MAXLIGHTMAPS; i++) {
+		if (!state.allocated[i][0]) break   // same used-page frontier as buildLightmaps
+		numPages = i + 1
+	}
+	const counts = new Int32Array(4)
+	const pageToLayer: Int32Array[] = [
+		new Int32Array(numPages), new Int32Array(numPages), new Int32Array(numPages), new Int32Array(numPages),
+	]
+	// Slot 0 is populated for every page → dense: compact layer == page.
+	for (let page = 0; page < numPages; page++) pageToLayer[0][page] = page
+	counts[0] = numPages
+	// Slots 1-3 are sparse: assign a compact layer only to pages whose slot m exists (-1 otherwise),
+	// bounding each array to actual usage (matches the current sparse per-style memory).
+	const lmtex = textureState.lightmap_style_textures
+	for (let m = 1; m < 4; m++) {
+		let layer = 0
+		for (let page = 0; page < numPages; page++) {
+			const slots = lmtex[page]
+			pageToLayer[m][page] = (slots != null && slots[m] != null) ? layer++ : -1
 		}
-
-		// add all the dynamic lights
-		if (surf.dlightframe === state.dlightframecount)
-			addDynamicLights (state.blocklights, model, surf);
+		counts[m] = layer
 	}
-	else
-	{
-		// set to full bright if no light data
-		state.blocklights.fill(255 * 255)
-	}
-
-	// case GL_RGBA:
-	stride -= smax * 4;
-	blockidx = 0
-	
-	buffidx = buffofs
-	var r, g, b
-	for (var i=0 ; i<tmax ; i++, buffidx += stride)
-	{
-		for (var j=0 ; j<smax ; j++)
-		{
-			if (0)//cvr.gl_overbright.value)
-			{
-				r = state.blocklights[blockidx++] >> 8;
-				g = state.blocklights[blockidx++] >> 8;
-				b = state.blocklights[blockidx++] >> 8;
-			}
-			else
-			{
-				r = state.blocklights[blockidx++] >> 7;
-				g = state.blocklights[blockidx++] >> 7;
-				b = state.blocklights[blockidx++] >> 7;
-			}
-			state.lightmaps[buffidx++] 	= (r > 255)? 255 : r;
-			state.lightmaps[buffidx++] 	= (g > 255)? 255 : g;
-			state.lightmaps[buffidx++] 	= (b > 255)? 255 : b;
-			state.lightmaps[buffidx++] 	= 255;
-		}
-	}
+	state.lmNumPages = numPages
+	state.lmLayerCount = counts
+	state.lmPageToLayer = pageToLayer
 }
 
 
-const renderDynamicLightmaps = (model: Model, surf: Face) => {
-	if (surf.flags & def.SURF.drawtiled) //johnfitz -- not a lightmapped surface
-		return;
-
-	var doDynamic = false
-
-	// check for lightmap modification
-	for (var maps=0; maps < surf.styles.length && surf.styles[maps] !== 255; maps++)
-		if (state.lightstylevalue[surf.styles[maps]] !== surf.cached_light[maps]){
-			doDynamic= true
-			break
-		}
-
-	if (doDynamic 
-		|| surf.dlightframe === state.dlightframecount	// dynamic this frame
-		|| surf.cached_dlight)			// dynamic previously
-	{
-		if (cvr.dynamic.value)
-		{
-			state.lightmap_modified[surf.lightmaptexturenum] = true;
-			var theRect = state.lightmap_rectchange[surf.lightmaptexturenum];
-			if (surf.light_t < theRect.t) {
-				if (theRect.h)
-					theRect.h += theRect.t - surf.light_t;
-				theRect.t = surf.light_t;
-			}
-			if (surf.light_s < theRect.l) {
-				if (theRect.w)
-					theRect.w += theRect.l - surf.light_s;
-				theRect.l = surf.light_s;
-			}
-			var smax = (surf.extents[0]>>4)+1;
-			var tmax = (surf.extents[1]>>4)+1;
-			if ((theRect.w + theRect.l) < (surf.light_s + smax))
-				theRect.w = (surf.light_s-theRect.l)+smax;
-			if ((theRect.h + theRect.t) < (surf.light_t + tmax))
-				theRect.h = (surf.light_t-theRect.t)+tmax;
-			var bufOfs = surf.lightmaptexturenum * state.lightmap_bytes * LM_BLOCK_WIDTH * LM_BLOCK_HEIGHT;
-			bufOfs += surf.light_t * LM_BLOCK_WIDTH * state.lightmap_bytes + surf.light_s * state.lightmap_bytes;
-			buildLightMap (model, surf, bufOfs, LM_BLOCK_WIDTH * state.lightmap_bytes);
-		}
+// Free the per-style staging buffers once every model's lightmaps are uploaded.
+// Must not run between per-model buildLightmaps calls: models can share a page,
+// and a fresh zeroed staging buffer would wipe earlier surfaces on re-upload.
+export const freeStagingSlots = () => {
+	for (const pageEntry of state.lightmap_pages) {
+		if (pageEntry)
+			pageEntry.slots = []
 	}
 }
-
-
-export const buildLightmapChains = (model: Model, chain: TexChain) => {
-	var i = 0, t, s
-	for (var i = 0; i < model.textures.length; i++)
-	{
-		t = model.textures[i];
-
-		if (!t || !t.texturechains[chain])
-			continue;
-
-		for (s = t.texturechains[chain]; s; s = s.texturechain)
-			if (!s.culled)
-				renderDynamicLightmaps (model, s);
-	}
-}
-
-// Dynamic lights
-const uploadLightmap = (gl: WebGLRenderingContext, lmapIdx: number) => {
-
-	if (!state.lightmap_modified[lmapIdx])
-		return;
-
-	state.lightmap_modified[lmapIdx] = false
-	
-	const theRect = state.lightmap_rectchange[lmapIdx]
-
-	const offset =  (lmapIdx * LM_BLOCK_HEIGHT + theRect.t) * LM_BLOCK_WIDTH * 4
-	const length = LM_BLOCK_WIDTH * theRect.h * 4
-	const data = state.lightmaps.subarray(offset)
-
-	gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, theRect.t, LM_BLOCK_WIDTH, theRect.h, gl.RGBA, gl.UNSIGNED_BYTE, data);
-	theRect.l = LM_BLOCK_WIDTH;
-	theRect.t = LM_BLOCK_HEIGHT;
-	theRect.h = 0;
-	theRect.w = 0;
-
-	// rs_dynamiclightmaps++; // stats
-}
-
-export const uploadLightmaps = (gl: WebGLRenderingContext) => {
-	for (var i = 0; i < MAXLIGHTMAPS; i++)
-	{
-		if (!state.lightmap_modified[i])
-			continue;
-
-		texture.bind(0, texture.state.lightmap_textures[i].texnum);
-		uploadLightmap(gl, i);
-	}
-}
-// const uploadLightmaps = (gl: WebGLRenderingContext) => {
-// 	for (var lmapIdx = 0; lmapIdx < MAXLIGHTMAPS; lmapIdx++)
-// 	{
-// 		if (!state.lightmap_modified[lmapIdx])
-// 			continue;
-
-// 		bind (gl, 0, txState.lightmap_textures[lmapIdx].texnum);
-// 		uploadLightmap(gl, lmapIdx);
-// 	}
-// }
-
 

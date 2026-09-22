@@ -10,10 +10,6 @@ var swaptestview = new Uint8Array(swaptest);
 swaptestview[0] = 1;
 swaptestview[1] = 0;
 
-export const getStack = () => {
-  var err = new Error();
-  return err.stack || 'NO STACK';
-}
 export type ComState = {
   standard_quake: boolean
   argv: string[]
@@ -26,8 +22,7 @@ export type ComState = {
   gamedir: SearchPath[],
   cmdline: string
   littleLong: (i: number) => number,
-  bigendien: boolean,
-  inAsync: string
+  bigendien: boolean
 }
 export let state: ComState = {
   standard_quake: true,
@@ -41,8 +36,7 @@ export let state: ComState = {
   gamedir: [],
   cmdline: '',
   littleLong: (function(l) {return l;}),
-  bigendien: ((new Uint16Array(swaptest))[0] !== 1),
-  inAsync: ''
+  bigendien: ((new Uint16Array(swaptest))[0] !== 1)
 }
 
 export const longSwap = (l: number) => {
@@ -128,6 +122,43 @@ const path_f = function()
   }
 };
 
+// b_* are the ammo-box bsp models that live in maps/, not levels (same skip as QuakeSpasm's ExtraMaps).
+const bspPath = /^maps\/(?!b_)[^/]+\.bsp$/;
+
+// Extensionless names of every maps/*.bsp reachable from the searchpaths, paks and loose files alike.
+export const getMapNames = function(): string[]
+{
+  var names = new Set<string>();
+  var i, j, k;
+  for (i = 0; i < state.searchpaths.length; ++i)
+  {
+    var packs = state.searchpaths[i].packs;
+    for (j = 0; j < packs.length; ++j)
+    {
+      var contents = packs[j].contents;
+      for (k = 0; k < contents.length; ++k)
+      {
+        if (bspPath.test(contents[k].name) === true)
+          names.add(contents[k].name.substring(5).replace(/\.bsp$/, ''));
+      }
+    }
+  }
+  var loose = state.assetStore.listFiles != null ? state.assetStore.listFiles('maps/') : [];
+  for (i = 0; i < loose.length; ++i)
+  {
+    if (bspPath.test(loose[i]) === true)
+      names.add(loose[i].substring(5).replace(/\.bsp$/, ''));
+  }
+  return Array.from(names).sort();
+};
+
+const maps_f = function()
+{
+  var names = getMapNames(), i;
+  for (i = 0; i < names.length; ++i)
+    con.print(names[i] + '\n');
+};
+
 const getGamePacks = async (game: string): Promise<PakData[]> => {
   var i = 0, packs = [], pak
   for (;;)
@@ -187,6 +218,9 @@ const initFilesystem = async function()
     }
   }
   state.gamedir = [state.searchpaths[state.searchpaths.length - 1]];
+
+  if (state.assetStore.preloadResidentFiles)
+    await state.assetStore.preloadResidentFiles();
 };
 
 export const checkParm = function(parm: string)
@@ -233,9 +267,21 @@ export const loadFile = (fileName: string): Promise<ArrayBuffer> => {
   return state.assetStore.loadFile(fileName.replace(/^\//, ''))
 }
 
+export const evictFile = (fileName: string): void => {
+  state.assetStore.evictResidentFile?.(fileName.replace(/^\//, ''))
+}
+
+export const loadFileSync = (fileName: string): ArrayBuffer | null => {
+  return state.assetStore.loadFileSync(fileName.replace(/^\//, ''))
+}
+
 export const writeTextFile = function(filename: string, data: string)
 {
   return state.assetStore.writeTextFile(filename, data)
+};
+export const eraseFile = function(filename: string)
+{
+  return state.assetStore.deleteFile(filename)
 };
 export const writeFile = (filename: string, data: Uint8Array, len: number) => {
   return state.assetStore.writeTextFile(filename, Buffer.from(data.subarray(0, len)).toString('base64'))
@@ -361,6 +407,7 @@ export const init = async function(assetStore: IAssetStore)
   cvr.game = cvar.registerVariable('game', 'id1', false, true);
 
   cmd.addCommand('path', path_f);
+  cmd.addCommand('maps', maps_f);
 
   await initFilesystem();
   await checkRegistered();

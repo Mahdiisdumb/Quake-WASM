@@ -1,3 +1,5 @@
+export type SocketProtocol = 'nqnetchan' | 'default'
+
 export default interface ISocket {
   connecttime: number,
   lastMessageTime: number,
@@ -5,6 +7,9 @@ export default interface ISocket {
   address: string,
   disconnected: boolean,
   canSend: boolean,
+  protocol?: SocketProtocol,
+  ccreqSent?: boolean,
+  fragmentBuffer?: Uint8Array,
   sendNext: boolean,
   receiveMessage: any,
   receiveMessageLength: number,

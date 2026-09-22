@@ -25,6 +25,8 @@ const rating =  computed(() => {
 </script>
 
 <style lang="scss">
+@import '../../../../scss/tokens';
+
 .rating {
   position: relative;
   max-width: fit-content;
@@ -37,10 +39,9 @@ const rating =  computed(() => {
   margin: 0 auto;
   position: relative;
   padding: 0;
-  text-shadow: 0px 1px 0 #e2e2e2;
-  
+
   &-top {
-    color: #8f4e28;
+    color: $palette-yellow;
     padding: 0;
     position: absolute;
     z-index: 1;
@@ -50,7 +51,7 @@ const rating =  computed(() => {
     overflow: hidden;
   }
   &-bottom {
-    color: #e0e0e0;
+    color: $palette-border;
     padding: 0;
     display: block;
     z-index: 0;

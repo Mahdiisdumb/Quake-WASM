@@ -4,22 +4,30 @@
     PakLoader(@done="pakUploaded")
   template(v-else)
     h4#progress Starting Quake...
-    canvas#mainwindow
+    canvas#mainwindow(:class="{ 'awaiting-capture': showCaptureHint }")
+    .capture-hint(v-if="showCaptureHint")
+      span.capture-hint-pill Click to capture mouse
     #loading(style="display: none; position: fixed;")
       img(alt="Loading")
       .loading-message(style="color: burlywood; font-family: monospace; font-weight:bold;background: RGBA(0,0,0,.2); padding: 3px 10px; margin-left: -7px;")
+    TouchControls(v-if="isTouchDevice && model.gameSys" :gameSys="model.gameSys")
+    button.fullscreen-btn(v-if="isTouchDevice && showFullscreenBtn" @click="enterFullscreen") {{ fullscreenLabel }}
 
 </template>
 
 <script lang="ts" setup>
-import {reactive, onMounted, onBeforeUnmount,  computed, watch} from 'vue'
+import {reactive, ref, onMounted, onBeforeUnmount, computed, watch} from 'vue'
 import GameInit from '../../../../game'
+import { dispose } from '../../../../game/sys'
+import * as save from '../../../../../engine/save'
 import PakLoader from './PakLoader.vue'
+import TouchControls from './TouchControls.vue'
+
+const isTouchDevice = navigator.maxTouchPoints > 0 && window.matchMedia('(pointer: coarse)').matches
 import { useGameStore } from '../../../stores/game';
 import { useRoute } from 'vue-router';
 import { usePlayerStore } from '../../../stores/player';
 import { useRoomStore } from '../../../stores/room';
-import type { AssetMeta } from '../../../../../shared/types/Store';
 
 const player = usePlayerStore()
 const room = useRoomStore()
@@ -34,7 +42,7 @@ const props = withDefaults(defineProps<{
 }>(), {quitRequest: false})
 
 const model = reactive<{
-  gameSys: any, 
+  gameSys: any,
   showRequiresPak: boolean,
   uploadResolve: (value: unknown) => void
 }>({
@@ -43,7 +51,6 @@ const model = reactive<{
   uploadResolve: () => null
 })
 
-const allAssetMetas = computed<AssetMeta[]>(() => gameStore.assetMetas)
 const args = computed(() => {
   const params = route.query
   return Object.keys(params)
@@ -51,16 +58,58 @@ const args = computed(() => {
     .join(' ')
 })
 
-const pak1 = computed(() => allAssetMetas.value.filter(assetMeta => 
-  assetMeta.game === 'id1' && assetMeta.fileName.toLowerCase() === 'pak1.pak') )
-
 const pakUploaded = () => {
   model.showRequiresPak = false
   model.uploadResolve(undefined)
 }
 
+const showFullscreenBtn = ref(true)
+const fullscreenLabel = ref('⛶ Fullscreen')
+
+// Pointer lock hides the cursor itself, so the canvas carries no cursor rule of its own; whenever the
+// lock is not held the cursor is visible and this hint says what to do with it.
+const pointerLocked = ref(false)
+const showCaptureHint = computed(() => !isTouchDevice && !!model.gameSys && !pointerLocked.value)
+
+const onPointerLockChange = () => {
+  const locked = (document as any).pointerLockElement ?? (document as any).webkitPointerLockElement
+  pointerLocked.value = !!locked && locked.id === 'mainwindow'
+}
+
+async function enterFullscreen() {
+  const el = document.documentElement as any
+  const rfs = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen
+  if (!rfs) {
+    fullscreenLabel.value = '✗ Not supported'
+    return
+  }
+  try {
+    await rfs.call(el)
+    showFullscreenBtn.value = false
+  } catch (e: any) {
+    fullscreenLabel.value = `✗ ${e?.message ?? 'Failed'}`
+  }
+}
+
+const onFullscreenChange = () => {
+  showFullscreenBtn.value = !document.fullscreenElement
+}
+
 onMounted(async () => {
   console.log('init game')
+  document.addEventListener('pointerlockchange', onPointerLockChange)
+  document.addEventListener('webkitpointerlockchange', onPointerLockChange)
+  // DEV ONLY (import.meta.hot is undefined in production builds): engine files have no HMR accept
+  // handlers, so any engine edit makes Vite fall back to a FULL page reload — which trips the game's
+  // window.onbeforeunload quit guard (sys.ts) and pops Chrome's "Leave site?" dialog on every edit.
+  // Detach the guard just before Vite's programmatic reload; real navigation keeps the prompt.
+  if (import.meta.hot) {
+    import.meta.hot.on('vite:beforeFullReload', () => { window.onbeforeunload = null })
+  }
+  // Background savegame serialization (Ironwail Host_BackgroundSave design): only wired up
+  // here in the browser bundle -- src/engine and src/app/game compile under the dedicated
+  // server's CommonJS tsconfig, which forbids `new Worker(new URL(..., import.meta.url))`.
+  save.state.createSaveWorker = () => new Worker(new URL('../../../../../engine/saveWorker.ts', import.meta.url), { type: 'module' })
   model.gameSys = await GameInit(args.value, {
     // hooks
     quit: (reason?: string) => {
@@ -69,12 +118,37 @@ onMounted(async () => {
     startRequestPak: resolve => {
       model.showRequiresPak = true;
       model.uploadResolve = resolve
+    },
+    nameChanged: (name: string) => {
+      if (gameStore.getAutoexecValue('name') !== name) {
+        gameStore.setAutoexecValue({ name: 'name', value: name })
+      }
     }
   }, {
     playerId: player.playerId,
     isHost: !!room.isHost,
     socket: room.serverConnection
   })
+
+  // Quit requested while GameInit was still loading.
+  if (props.quitRequest) {
+    model.gameSys.quit()
+  }
+
+  if (isTouchDevice) {
+    document.addEventListener('fullscreenchange', onFullscreenChange)
+  }
+})
+
+onBeforeUnmount(() => {
+  // Stop the engine with the component; silent teardown, no quit hook.
+  void dispose()
+  document.removeEventListener('pointerlockchange', onPointerLockChange)
+  document.removeEventListener('webkitpointerlockchange', onPointerLockChange)
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
+  if (document.fullscreenElement) {
+    document.exitFullscreen()
+  }
 })
 
 watch(props, () => {
@@ -91,20 +165,62 @@ watch(props, () => {
   bottom: 0;
   left: 0;
   right: 0;
+  overflow: hidden;
 }
 
-#lateregistered {
-  margin-top: 2rem;
-  display: flex;
-  flex-direction: column;
-  align-items:center;
-  justify-content: center;
-  .uploader {
-    width: 80%;
-  }
-}
 #progress {
-  margin-top: 2rem;
+  position: absolute;
+  top: 2rem;
+  left: 0;
+  right: 0;
   text-align: center;
+  pointer-events: none;
+  z-index: 1;
+}
+
+#mainwindow.awaiting-capture {
+  cursor: pointer;
+}
+
+.capture-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 24px;
+  // The canvas owns the lock request (input.ts binds it to onmousedown), so the click has to reach it.
+  pointer-events: none;
+}
+
+.capture-hint-pill {
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 14px;
+  padding: 6px 12px;
+}
+
+.fullscreen-btn {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 14px;
+  padding: 0 12px;
+  height: 44px;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
 </style>

@@ -25,6 +25,12 @@ export const loadWadFile = async function(filename: string)
 	}
 };
 
+// Lump presence test for callers that must not take getLumpName's fatal error on a miss.
+export const hasLumpName = function(name: string)
+{
+	return lumps[name] != null;
+};
+
 export const getLumpName = function(name: string)
 {
 	var lump = lumps[name];

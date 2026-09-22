@@ -12,22 +12,26 @@ export type Sound = {
     cache: SoundCache
     data: ArrayBuffer,
     type: string
+    loading?: Promise<boolean>
+    // memoized load/parse failure — cleared on flushCache, so one attempt per map
+    failed?: boolean
 }
 
 export type Nodes = {
     state: 'end' | 'playing' | 'idle',
 	source: AudioBufferSourceNode,
+	// ambient path: one centered gain; positional path: per-ear gains into a merger
 	gain: GainNode,
-	merger1: ChannelMergerNode,
-	splitter: ChannelSplitterNode,
-	gain0: GainNode,
-	gain1: GainNode,
-	merger2: ChannelMergerNode
+	gainL: GainNode,
+	gainR: GainNode,
+	merger: ChannelMergerNode,
+	// whether the output reaches masterGain — statics detach while inaudible
+	connected: boolean
 }
 
 export type Channel = {
-	sfx: Sound, 
-	end: number, 
+	sfx: Sound,
+	end: number,
     pos: number
 	master_vol: number
     leftvol: number

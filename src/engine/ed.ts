@@ -1,25 +1,16 @@
 import * as con from './console'
 import * as pr from './pr'
 import * as sv from './sv'
+import * as pf from './pf'
 import * as sys from './sys'
 import * as q from './q'
 import * as com from './com'
 import * as host from './host'
-import * as def from './def'
 import * as cmd from './cmd'
 import * as vec from './vec'
 import type  { V3 } from './types/Vector.js'
 import type  { Edict } from './types/Edict.js'
 import { Entity } from './types'
-
-type EdState = {
-  getEvCache: Record<string, pr.Definition>
-
-}
-
-export const state: EdState = {
-  getEvCache: {}
-}
 
 export const clearEdict = function (e: Edict) {
   var i;
@@ -30,16 +21,16 @@ export const clearEdict = function (e: Edict) {
 
 export const alloc = function () {
   var i, e;
-  for (i = sv.state.svs.maxclients + 1; i < sv.state.server.num_edicts; ++i) {
-    e = sv.state.server.edicts[i];
-    if ((e.free === true) && ((e.freetime < 2.0) || ((sv.state.server.time - e.freetime) > 0.5))) {
+  for (i = pr.state.reserved_edicts + 1; i < pr.state.num_edicts; ++i) {
+    e = pr.state.edicts[i];
+    if ((e.free === true) && ((e.freetime < 2.0) || ((pr.state.time - e.freetime) > 0.5))) {
       clearEdict(e);
       return e;
     }
   }
-  if (i === def.max_edicts)
+  if (pr.state.num_edicts >= pr.state.max_edicts)
     sys.error('ED.Alloc: no free edicts');
-  e = sv.state.server.edicts[sv.state.server.num_edicts++];
+  e = sv.ensureEdict(pr.state.num_edicts++); // lazily grows past the pre-allocated base
   clearEdict(e);
   return e;
 };
@@ -57,8 +48,9 @@ export const free = function (ed: Edict) {
   setVector(ed, pr.entvars.angles, vec.origin);
   ed.v_float[pr.entvars.nextthink] = -1.0;
   ed.v_float[pr.entvars.solid] = 0.0;
-  ed.freetime = sv.state.server.time;
+  ed.freetime = pr.state.time;
 	ed.alpha = 0;
+	ed.onladder = false;
 };
 
 export const globalAtOfs = function (ofs: number) {
@@ -80,29 +72,39 @@ export const fieldAtOfs = function (ofs: number) {
 };
 
 export const findField = function (name: string) {
-  var def, i;
-  for (i = 0; i < pr.state.fielddefs.length; ++i) {
-    def = pr.state.fielddefs[i];
-    if (pr.getString(def.name) === name)
-      return def;
+  const c = pr.state.fieldCache;
+  if (c.src !== pr.state.fielddefs) {
+    c.src = pr.state.fielddefs; c.map = new Map();
+    for (var i = 0; i < pr.state.fielddefs.length; ++i) {
+      const nm = pr.getString(pr.state.fielddefs[i].name);
+      if (!c.map.has(nm)) c.map.set(nm, pr.state.fielddefs[i]); // first match wins, as before
+    }
   }
+  return c.map.get(name);
 };
 
 export const findGlobal = function (name: string) {
-  var def, i;
-  for (i = 0; i < pr.state.globaldefs.length; ++i) {
-    def = pr.state.globaldefs[i];
-    if (pr.getString(def.name) === name)
-      return def;
+  const c = pr.state.globalCache;
+  if (c.src !== pr.state.globaldefs) {
+    c.src = pr.state.globaldefs; c.map = new Map();
+    for (var i = 0; i < pr.state.globaldefs.length; ++i) {
+      const nm = pr.getString(pr.state.globaldefs[i].name);
+      if (!c.map.has(nm)) c.map.set(nm, pr.state.globaldefs[i]);
+    }
   }
+  return c.map.get(name);
 };
 
 export const findFunction = function (name: string) {
-  var i;
-  for (i = 0; i < pr.state.functions.length; ++i) {
-    if (pr.getString(pr.state.functions[i].name) === name)
-      return i;
+  const c = pr.state.functionCache;
+  if (c.src !== pr.state.functions) {
+    c.src = pr.state.functions; c.map = new Map();
+    for (var i = 0; i < pr.state.functions.length; ++i) {
+      const nm = pr.getString(pr.state.functions[i].name);
+      if (!c.map.has(nm)) c.map.set(nm, i);
+    }
   }
+  return c.map.get(name);
 };
 
 export const print = function (ed: Edict) {
@@ -128,33 +130,36 @@ export const print = function (ed: Edict) {
     }
     for (; name.length <= 14;)
       name += ' ';
-    con.print(name + pr.valueString(d.type, ed.v, v) + '\n');
+    // Pass the edict's backing buffer + ABSOLUTE word offset (v_int carries the byteOffset)
+    // so this reads the right field whether storage is standalone or a slice of the WASM sim's
+    // shared linear memory — `ed.v` is that whole memory in the shared case, not this edict.
+    con.print(name + pr.valueString(d.type, ed.v_int.buffer as ArrayBuffer, (ed.v_int.byteOffset >> 2) + v) + '\n');
   }
 };
 
 export const printEdicts = function () {
-  if (sv.state.server.active !== true)
+  if (sv.state.server.phase !== 'active')
     return;
-  con.print(sv.state.server.num_edicts + ' entities\n');
+  con.print(pr.state.num_edicts + ' entities\n');
   var i;
-  for (i = 0; i < sv.state.server.num_edicts; ++i)
-    print(sv.state.server.edicts[i]);
+  for (i = 0; i < pr.state.num_edicts; ++i)
+    print(pr.state.edicts[i]);
 };
 
 export const printEdict_f = function () {
-  if (sv.state.server.active !== true)
+  if (sv.state.server.phase !== 'active')
     return;
   var i = q.atoi(cmd.state.argv[1]);
-  if ((i >= 0) && (i < sv.state.server.num_edicts))
-    print(sv.state.server.edicts[i]);
+  if ((i >= 0) && (i < pr.state.num_edicts))
+    print(pr.state.edicts[i]);
 };
 
 export const count = function () {
-  if (sv.state.server.active !== true)
+  if (sv.state.server.phase !== 'active')
     return;
   var i, ent, active = 0, models = 0, solid = 0, step = 0;
-  for (i = 0; i < sv.state.server.num_edicts; ++i) {
-    ent = sv.state.server.edicts[i];
+  for (i = 0; i < pr.state.num_edicts; ++i) {
+    ent = pr.state.edicts[i];
     if (ent.free === true)
       continue;
     ++active;
@@ -165,7 +170,7 @@ export const count = function () {
     if (ent.v_float[pr.entvars.movetype] === sv.MOVE_TYPE.step)
       ++step;
   }
-  var num_edicts = sv.state.server.num_edicts;
+  var num_edicts = pr.state.num_edicts;
   con.print('num_edicts:' + (num_edicts <= 9 ? '  ' : (num_edicts <= 99 ? ' ' : '')) + num_edicts + '\n');
   con.print('active    :' + (active <= 9 ? '  ' : (active <= 99 ? ' ' : '')) + active + '\n');
   con.print('view      :' + (models <= 9 ? '  ' : (models <= 99 ? ' ' : '')) + models + '\n');
@@ -193,7 +198,7 @@ export const parseGlobals = async function (data: string) {
       continue;
     }
     if (parseEpair(pr.state.globals, key, com.state.token) !== true)
-      await host.error('parseGlobals: parse error');
+      host.throwError('parseGlobals: parse error');
   }
 };
 
@@ -252,7 +257,7 @@ export const parseEpair = function (base: ArrayBuffer, key: pr.Definition, s: st
 
 export const parseEdict = async function (data: string, ent: Edict) {
   var i, init, anglehack, keyname, n, key;
-  if (ent !== sv.state.server.edicts[0]) {
+  if (ent !== pr.state.edicts[0]) {
     for (i = 0; i < pr.state.entityfields; ++i)
       ent.v_int[i] = 0;
   }
@@ -298,16 +303,37 @@ export const parseEdict = async function (data: string, ent: Edict) {
     if (anglehack == true)
       com.state.token = '0 ' + com.state.token + ' 0';
     if (parseEpair(ent.v, key, com.state.token) !== true)
-      await host.error('parseEdict: parse error');
+      host.throwError('parseEdict: parse error');
   }
   if (init !== true)
     ent.free = true;
   return data;
 };
 
+// Port of QSS-M PR_spawnfunc_misc_model (pr_cmds.c:1850): resolve mdl->model, random
+// yaw if negative (AD mimic), precache, then makestatic so it renders as a static prop.
+const spawnMiscModel = (ent: Edict) => {
+  if (!ent.v_int[pr.entvars.model]) {
+    const mdl = findField('mdl');
+    if (mdl != null && ent.v_int[mdl.ofs])
+      ent.v_int[pr.entvars.model] = ent.v_int[mdl.ofs];
+  }
+  if (!pr.getString(ent.v_int[pr.entvars.model])) {
+    free(ent); // no model to show
+    return;
+  }
+  if (ent.v_float[pr.entvars.angles1] < 0.0)
+    ent.v_float[pr.entvars.angles1] = Math.random() * 360.0;
+  pr.state.globals_int[4] = ent.v_int[pr.entvars.model]; // OFS_PARM0
+  pf.precache_model();
+  ent.v_float[pr.entvars.modelindex] = sv.modelIndex(pr.getString(ent.v_int[pr.entvars.model]));
+  pr.state.globals_int[4] = ent.num;
+  pf.makestatic(); // frees the edict, emits a spawnstatic to the signon
+};
+
 export const loadFromFile = async function (data: string) {
   var ent, spawnflags, inhibit = 0, func;
-  pr.state.globals_float[pr.globalvars.time] = sv.state.server.time;
+  pr.state.globals_float[pr.globalvars.time] = pr.state.time;
 
   for (; ;) {
     data = com.parse(data);
@@ -317,7 +343,7 @@ export const loadFromFile = async function (data: string) {
       sys.error('ED.LoadFromFile: found ' + com.state.token + ' when expecting {');
 
     if (ent == null)
-      ent = sv.state.server.edicts[0];
+      ent = pr.state.edicts[0];
     else
       ent = alloc();
     data = await parseEdict(data, ent);
@@ -345,8 +371,20 @@ export const loadFromFile = async function (data: string) {
       continue;
     }
 
-    func = findFunction(pr.getString(ent.v_int[pr.entvars.classname]));
+    // DP_SV_SPAWNFUNC_PREFIX: modern progs (Progs_dump/Copper) register custom
+    // entity spawns as spawnfunc_<classname>; try that before the bare classname
+    // (matches QSS-M/FTE). Without this, such entities are dropped at map load.
+    const classname = pr.getString(ent.v_int[pr.entvars.classname]);
+    func = findFunction('spawnfunc_' + classname);
+    if (func == null)
+      func = findFunction(classname);
     if (func == null) {
+      // misc_model has no QC spawn function — AD/DP maps place decorative external
+      // models this way. Spawn it engine-side like QSS-M PR_spawnfunc_misc_model.
+      if (classname === 'misc_model') {
+        spawnMiscModel(ent);
+        continue;
+      }
       con.print('No spawn function for:\n');
       print(ent);
       free(ent);
@@ -354,14 +392,23 @@ export const loadFromFile = async function (data: string) {
     }
 
     pr.state.globals_int[pr.globalvars.self] = ent.num;
-    await pr.executeProgram(func);
+    pr.executeProgram(func);
   }
 
   con.dPrint(inhibit + ' entities inhibited\n');
 };
 
-export const vector = function (e: Edict, o: number): V3 {
-  return [e.v_float[o], e.v_float[o + 1], e.v_float[o + 2]];
+export const vector = function (e: Edict, o: number, out: V3): V3 {
+  out[0] = e.v_float[o]; out[1] = e.v_float[o + 1]; out[2] = e.v_float[o + 2];
+  return out;
+};
+
+// origin + view_ofs (the PVS/vis test point used by fatPVS and checkclient)
+export const eyePosition = function (e: Edict, out: V3): V3 {
+  out[0] = e.v_float[pr.entvars.origin] + e.v_float[pr.entvars.view_ofs];
+  out[1] = e.v_float[pr.entvars.origin1] + e.v_float[pr.entvars.view_ofs1];
+  out[2] = e.v_float[pr.entvars.origin2] + e.v_float[pr.entvars.view_ofs2];
+  return out;
 };
 
 export const setVector = function (e: Edict, o: number, v: V3) {
@@ -372,11 +419,11 @@ export const setVector = function (e: Edict, o: number, v: V3) {
 
 export const getEdictFieldValue = (ed: Edict, field: string) => {
   var def = null
-  if (!state.getEvCache[field]) {
+  if (!pr.state.getEvCache[field]) {
     def = findField(field)
-    state.getEvCache[field] = def
+    pr.state.getEvCache[field] = def
   } else {
-    def = state.getEvCache[field]
+    def = pr.state.getEvCache[field]
   }
 
   return ed.v_float[def.ofs]

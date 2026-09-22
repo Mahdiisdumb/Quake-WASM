@@ -28,6 +28,15 @@ export const usePlayerStore = defineStore('player', () => {
   const prejoinSetup = computed(() => playerState.value.prejoinSetup)
   const playerName = computed(() => useGameStore().getAutoexecValue('name') || 'player')
   
+  const ensurePlayer = async (): Promise<PlayerId> => {
+    if (!playerId.value) {
+      return createPlayer(playerName.value)
+    }
+    await changeName(playerName.value).catch(e =>
+      console.warn('[player] name sync failed, continuing with server-side name:', e))
+    return playerId.value
+  }
+
   const createPlayer = async (playerName: string) => {
     const playerResponse = await fetch(playerApi, {
       method: 'POST',
@@ -77,23 +86,23 @@ export const usePlayerStore = defineStore('player', () => {
   const gameStore = useGameStore()
 
   watch(
-    () => gameStore.autoexecFile, 
+    () => gameStore.autoexecFile,
     (newAutoexec, oldAutoexec) => {
       const nameMatch = getValueInConfig(newAutoexec, 'name')?.value
       const oldNameMatch = getValueInConfig(oldAutoexec, 'name')?.value
 
       if (nameMatch && nameMatch !== oldNameMatch) {
-        changeName(nameMatch)
+        changeName(nameMatch).catch(e =>
+          console.warn('[player] live name sync failed (will reconcile on next join):', e))
       }
     }
   )
-  
+
   return {
     playerId,
     playerToken,
     prejoinSetup,
     playerName,
-    createPlayer,
-    changeName
+    ensurePlayer
   }
 })

@@ -19,23 +19,43 @@ const getFloatArg = (argNum: number) =>
 const getIntArg = (argNum: number) =>  
   argNum > 0 && argNum < pr.state.argc ? pr.state.globals_int[4 + (3 * argNum)] : 0
 
-const getStringArg = (argNum: number) =>  
+const getStringArg = (argNum: number) =>
   argNum > 0 && argNum < pr.state.argc ? pr.getString(pr.state.globals_int[4 + (3 * argNum)]) : ''
+
+const getVectorComp = (argNum: number, c: number) =>
+  argNum > 0 && argNum < pr.state.argc ? pr.state.globals_float[4 + (3 * argNum) + c] : 0
 
 const re = {
   not_string: /[^s]/,
   not_bool: /[^t]/,
   not_type: /[^T]/,
   not_primitive: /[^v]/,
-  number: /[diefg]/,
+  number: /[diefgI]/,
   numeric_arg: /[bcdiefguxX]/,
   text: /^[^\x25]+/,
   modulo: /^\x25{2}/,
-  placeholder: /^\x25(?:([1-9]\d*)\$|\(([^)]+)\))?(\+)?(0|'[^$])?(-)?(\d+)?(?:\.(\d+))?([b-gijostTuvxX])/,
+  // FTE's conversion set (pr_bgcmd.c:7540-7666): QC extras are %v/%V (vector), %S (quoted
+  // string), %I (int), %p/%P (hex).
+  placeholder: /^\x25(?:([1-9]\d*)\$|\(([^)]+)\))?(\+)?(0|'[^$])?(-)?(\d+)?(?:\.(\d+))?([b-gijostTuvxXSIpPV])/,
   key: /^([a-z_][a-z_\d]*)/i,
   key_access: /^\.([a-z_][a-z_\d]*)/i,
   index_access: /^\[(\d+)\]/,
   sign: /^[+-]/
+}
+
+// C-style %g: default precision 6 significant digits, trailing zeros stripped.
+const formatG = (v: number, precision: string) => {
+  const p = precision ? parseInt(precision) : 6
+  return String(Number(v.toPrecision(p <= 0 ? 1 : p)))
+}
+
+// COM_QuotedString (FTE common.c:5192-5260): plain "..." wrap, or the \"...\" escaped form when
+// the string carries newlines/quotes.
+const quoteString = (s: string) => {
+  if (/[\r\n"]/.test(s))
+    return '\\"' + s.replace(/[\\'"$\t\r\n]/g, (c) =>
+      c === '\n' ? '\\n' : c === '\r' ? '\\r' : c === '\t' ? '\\t' : '\\' + c) + '"'
+  return '"' + s + '"'
 }
 
 export function sprintf_format(parse_tree: (string | Format)[]) {
@@ -77,6 +97,8 @@ export function sprintf_format(parse_tree: (string | Format)[]) {
       //   is_positive = arg >= 0
       // }
 
+      is_positive = true
+      let width = ph.width, pad_char = ph.pad_char
       switch (ph.type) {
         case 'b':
           arg = getFloatArg(argNum).toString(2)
@@ -86,28 +108,63 @@ export function sprintf_format(parse_tree: (string | Format)[]) {
           break
         case 'd':
         case 'i':
-          arg = getFloatArg(argNum).toString(10)
+        case 'I': {
+          // int64 print, precision zero-pads (pr_bgcmd.c:7570); %i reads the int view,
+          // %d/%I the float view (pr_bgcmd.c:7509).
+          const v = ph.type === 'i' ? getIntArg(argNum) : Math.trunc(getFloatArg(argNum))
+          is_positive = v >= 0
+          arg = Math.abs(v).toString(10)
+          if (ph.precision)
+            arg = arg.padStart(parseInt(ph.precision), '0')
+          if (!is_positive)
+            arg = '-' + arg
           break
-        case 'e':
-          arg = ph.precision 
-            ? getFloatArg(argNum).toExponential(parseInt(ph.precision))
-            : getFloatArg(argNum).toExponential()
+        }
+        case 'e': {
+          // C default precision 6; C also pads the exponent to two digits.
+          const v = getFloatArg(argNum)
+          is_positive = v >= 0
+          arg = v.toExponential(ph.precision ? parseInt(ph.precision) : 6).replace(/e([+-])(\d)$/, 'e$10$2')
           break
-        case 'f':
-          arg = ph.precision 
-            ? getFloatArg(argNum).toFixed(parseInt(ph.precision)) 
-            : getFloatArg(argNum).toString(10)
+        }
+        case 'f': {
+          const v = getFloatArg(argNum)
+          is_positive = v >= 0
+          arg = v.toFixed(ph.precision ? parseInt(ph.precision) : 6)
           break
-        case 'g':
-          arg = ph.precision 
-            ? String(Number(getFloatArg(argNum).toPrecision(parseInt(ph.precision))))
-            : getFloatArg(argNum).toString(10)
+        }
+        case 'g': {
+          const v = getFloatArg(argNum)
+          is_positive = v >= 0
+          arg = formatG(v, ph.precision)
           break
+        }
+        case 'v':
+        case 'V': {
+          // %g per component, width/sign applied per component (pr_bgcmd.c:7591); tail pad skipped.
+          const comps = []
+          for (k = 0; k < 3; ++k) {
+            let s = formatG(getVectorComp(argNum, k), ph.precision)
+            if (ph.sign && s.charCodeAt(0) !== 45)
+              s = '+' + s
+            if (width)
+              s = (pad_char === '0') ? s.padStart(parseInt(width), '0') : s.padStart(parseInt(width), ' ')
+            comps[k] = s
+          }
+          arg = comps.join(' ')
+          width = ''
+          break
+        }
         case 'o':
           arg = (getFloatArg(argNum) >>> 0).toString(8)
           break
         case 's':
           arg = getStringArg(argNum)
+          arg = (ph.precision ? arg.substring(0, parseInt(ph.precision)) : arg)
+          break
+        case 'S':
+          // quoted-string form (FTE pr_bgcmd.c:7628-7649 via COM_QuotedString)
+          arg = quoteString(getStringArg(argNum))
           arg = (ph.precision ? arg.substring(0, parseInt(ph.precision)) : arg)
           break
         case 't':
@@ -117,6 +174,16 @@ export function sprintf_format(parse_tree: (string | Format)[]) {
           break
         case 'u':
           arg = (getFloatArg(argNum) >>> 0).toString(10)
+          break
+        case 'p':
+        case 'P':
+          // %p/%P read the int view, always zero-pad, default width 8 (pr_bgcmd.c:7501-7507)
+          arg = (getIntArg(argNum) >>> 0).toString(16)
+          if (ph.type === 'P')
+            arg = arg.toUpperCase()
+          if (!width)
+            width = '8'
+          pad_char = '0'
           break
         case 'x':
           arg = (getFloatArg(argNum) >>> 0).toString(16)
@@ -132,9 +199,9 @@ export function sprintf_format(parse_tree: (string | Format)[]) {
       else {
         sign = ''
       }
-      pad_character = ph.pad_char ? ph.pad_char === '0' ? '0' : ph.pad_char.charAt(1) : ' '
-      pad_length = parseInt(ph.width) - (sign + arg).length
-      pad = ph.width ? (pad_length > 0 ? pad_character.repeat(pad_length) : '') : ''
+      pad_character = pad_char ? pad_char === '0' ? '0' : pad_char.charAt(1) : ' '
+      pad_length = parseInt(width) - (sign + arg).length
+      pad = width ? (pad_length > 0 ? pad_character.repeat(pad_length) : '') : ''
       output += ph.align ? sign + arg + pad : (pad_character === '0' ? sign + pad + arg : pad + sign + arg)
     
     }
@@ -142,7 +209,7 @@ export function sprintf_format(parse_tree: (string | Format)[]) {
   return output
 }
 
-var sprintf_cache: Record<string, any> = {}
+var sprintf_cache: Record<string, (string | Format)[]> = {}
 
 export function sprintf_parse(fmt: string) {
   if (sprintf_cache[fmt]) {

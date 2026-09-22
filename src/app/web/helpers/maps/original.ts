@@ -152,7 +152,7 @@ export default [
         collection: 'Episode 4'
     },
     { 
-        name: 'e4m7',
+        name: 'e4m8',
         title: 'The Nameless City',
         collection: 'Episode 4'
     },

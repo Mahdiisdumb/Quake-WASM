@@ -1,11 +1,10 @@
 <template lang="pug">
-.button-wrapper(
-  :class="tooltipClasses"
-  :data-tooltip="props.tooltip")
+.button-wrapper
   button.btn(
     :class="buttonClasses"
-    @click="emit('click')" 
-    :disabled="props.disabled") 
+    @click="emit('click')"
+    :disabled="props.disabled"
+    v-tippy="props.tooltip ? { content: props.tooltip, placement: tippyPlacement } : false")
     slot
 </template>
 
@@ -13,7 +12,8 @@
 export enum ButtonSize {
   Normal,
   Small,
-  Large
+  Large,
+  Medium = Normal,
 }
 export enum ButtonType {
   Normal,
@@ -69,27 +69,12 @@ const buttonClasses = computed(() => {
   return cl
 })
 
-const tooltipClasses = computed(() => {
-  const tc: string[] = []
-  
-  if (props.tooltip){
-    tc.push('tooltip')
-    switch(props.tooltipPlacement) {
-      case TooltipPlacement.Bottom:
-        tc.push('tooltip-bottom')
-        break;
-      case TooltipPlacement.Left:
-        tc.push('tooltip-left')
-        break;
-      case TooltipPlacement.Right:
-        tc.push('tooltip-right')
-        break;
-      case TooltipPlacement.Top:
-        tc.push('tooltip-top')
-        break;
-    }
+const tippyPlacement = computed(() => {
+  switch(props.tooltipPlacement) {
+    case TooltipPlacement.Bottom: return 'bottom'
+    case TooltipPlacement.Right:  return 'right'
+    case TooltipPlacement.Top:    return 'top'
+    default:                      return 'left'
   }
-
-  return tc
 })
 </script>

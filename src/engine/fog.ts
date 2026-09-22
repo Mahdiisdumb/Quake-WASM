@@ -38,7 +38,7 @@ const update = (density: number, red: number, green: number, blue: number, time:
 		//check for a fade in progress
 		if (state.fade_done > cl.clState.time)
 		{
-		  var	f = (state.fade_done - cl.clState.time) / state.fade_time;
+		  var	f = clamp(0.0, (state.fade_done - cl.clState.time) / state.fade_time, 1.0);
 			state.transition.density = f * state.transition.density + (1.0 - f) * state.density;
 			state.transition.color.red = f * state.transition.color.red + (1.0 - f) * state.color.red;
 			state.transition.color.green = f * state.transition.color.green + (1.0 - f) * state.color.green;
@@ -104,6 +104,13 @@ export const fogCommand_f = () => {
         clamp(0.0, q.atof(cmd.state.argv[4]), 1.0),
         0.0);
 		break;
+	case 6:
+		update(Math.max(0.0, q.atof(cmd.state.argv[1])),
+        clamp(0.0, q.atof(cmd.state.argv[2]), 1.0),
+        clamp(0.0, q.atof(cmd.state.argv[3]), 1.0),
+        clamp(0.0, q.atof(cmd.state.argv[4]), 1.0),
+        q.atof(cmd.state.argv[5]));
+		break;
 	}
 }
 
@@ -138,7 +145,15 @@ export const parseWorldspawn = () => {
   state.color.red = DEFAULT_GRAY
   state.color.green = DEFAULT_GRAY
   state.color.blue = DEFAULT_GRAY
-  
+  // a fade in progress must not survive the map change: cl.time restarts, so a
+  // stale fade_done keeps fade math running with f >> 1 (Ironwail gl_fog.c:201-207)
+  state.transition.density = DEFAULT_DENSITY
+  state.transition.color.red = DEFAULT_GRAY
+  state.transition.color.green = DEFAULT_GRAY
+  state.transition.color.blue = DEFAULT_GRAY
+  state.fade_time = 0
+  state.fade_done = 0
+
 	var key, value, data;
 
 	data = com.parse(cl.clState.worldmodel.entities);
@@ -154,6 +169,7 @@ export const parseWorldspawn = () => {
 		// @ts-ignore - side effects mean this happens.
 		if (com.state.token[0] == '}')
 			break; // end of worldspawn
+		// QSS-M gl_fog.c:221-224 strips a leading '_' so "_fog" is honoured as "fog".
 		// @ts-ignore - side effects mean this happens.
 		if (com.state.token[0] == '_')
 			key = com.state.token.substr(1)
@@ -194,7 +210,7 @@ export const getColor = () => {
   var c = []
 	if (state.fade_done > cl.clState.time)
 	{
-	  var	f = (state.fade_done - cl.clState.time) / state.fade_time;
+	  var	f = clamp(0.0, (state.fade_done - cl.clState.time) / state.fade_time, 1.0);
 		c[0] = f * state.transition.color.red + (1.0 - f) * state.color.red;
 		c[1] = f * state.transition.color.green + (1.0 - f) * state.color.green;
 		c[2] = f * state.transition.color.blue + (1.0 - f) * state.color.blue;
@@ -226,7 +242,7 @@ export const getDensity = () =>
 {
 	if (state.fade_done > cl.clState.time)
 	{
-		var f = (state.fade_done - cl.clState.time) / state.fade_time;
+		var f = clamp(0.0, (state.fade_done - cl.clState.time) / state.fade_time, 1.0);
 		return f * state.transition.density + (1.0 - f) * state.density;
 	}
 	else

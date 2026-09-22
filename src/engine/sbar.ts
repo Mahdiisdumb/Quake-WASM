@@ -2,12 +2,23 @@ import * as draw from './draw'
 import * as cl from './cl'
 import * as cmd from './cmd'
 import * as com from './com'
+import * as csqc from './csqc'
+import * as key from './key'
 import * as vid from './vid'
 import * as def from './def'
 import * as scr from './scr'
 import * as host from './host'
 import * as con from './console'
+import * as wwheel from './wwheel'
 import { Pic } from './texture'
+
+// A weapon a mod declared in wwheel.txt on an item bit the classic row doesn't cover.
+type ExtraWeapon = {
+	// .items bit (wwheel `weaponnum`); also its STAT_ACTIVEWEAPON value.
+	bit: number,
+	// [unselected, selected]
+	pics: Pic[]
+}
 
 type SbarState = {
 	scale: number
@@ -42,12 +53,14 @@ type SbarState = {
 	r_items: Pic[],
 	r_teambord: Pic,
 	r_ammo: Pic[],
+	extraWeapons: ExtraWeapon[],
 	scoreboardlines: number,
 	lines: number
 }
 
 export const state: SbarState = {
-	scale: 2,
+	// scr_sbarscale, read live so a cvar change takes effect on the next drawn frame.
+	get scale() { return scr.cvr.sbarscale.value; },
 	showscores: false,
 	fragsort: [],
 	nums: [[], []],
@@ -79,17 +92,24 @@ export const state: SbarState = {
 	r_items: [],
 	r_teambord: null,
 	r_ammo: [],
+	extraWeapons: [],
 	scoreboardlines: 0,
 	lines: 0
 };
 
+// +showscores/-showscores never pass through console dispatch, so the progs is offered them here
+// instead (QSS Sbar_CSQCCommand, sbar.c:76-88). The return is ignored as it is there: the engine
+// keeps tracking the key so CSQC_DrawHud's showscores parm stays right.
 export const showScores = function()
 {
+	csqc.consoleCommand(cmd.state.argv[0]);
 	state.showscores = true;
+	cl.requestPingUpdate();
 };
 
 export const dontShowScores = function()
 {
+	csqc.consoleCommand(cmd.state.argv[0]);
 	state.showscores = false;
 };
 
@@ -253,14 +273,56 @@ export const init = async function()
 			draw.picFromWad('R_AMMOPLASMA')
 		];
 	}
+
+	await loadExtraWeapons();
 };
 
-export const drawPic = function(x: number, y: number, pic: Pic)
+// Item bits the classic weapon row accounts for: the seven drawn weapons, plus the cell-less axe.
+const CLASSIC_WEAPON_BITS = def.IT.shotgun | def.IT.super_shotgun | def.IT.nailgun | def.IT.super_nailgun
+	| def.IT.grenade_launcher | def.IT.rocket_launcher | def.IT.lightning | def.IT.axe;
+
+// Give a weapon-row cell to each weapon a mod declares in wwheel.txt on a non-classic .items bit
+// (the rerelease episodes do this). A mod with no wwheel.txt leaves the list empty.
+// Skipped under -hipnotic/-rogue: those mission packs have hardwired extra rows owning the same
+// strip of the ibar, and hipnotic's laser cannon is the very bit (23) mg3's laser reuses.
+const loadExtraWeapons = async function()
+{
+	state.extraWeapons = [];
+	if ((com.state.hipnotic === true) || (com.state.rogue === true))
+		return;
+	await wwheel.load();
+	for (var i = 0; i < wwheel.state.slots.length; ++i)
+	{
+		const slot = wwheel.state.slots[i];
+		if ((slot.weaponBit === 0) || ((slot.weaponBit & CLASSIC_WEAPON_BITS) !== 0))
+			continue;
+		const pic = await draw.cachePicPath(slot.icon);
+		if (pic == null)
+		{
+			con.dPrint('Sbar: no icon for wwheel weapon ' + slot.weaponBit + '\n');
+			continue;
+		}
+		const sel = await draw.cachePicPath(slot.iconSel);
+		state.extraWeapons[state.extraWeapons.length] = { bit: slot.weaponBit, pics: [pic, sel != null ? sel : pic] };
+	}
+};
+
+// x/y are 320x200 status-bar units. `scale` sizes the pic itself; the default of one pic pixel
+// per bar unit is all vanilla art wants.
+export const drawPic = function(x: number, y: number, pic: Pic, scale = state.scale)
 {
 	if (cl.clState.gametype === 1)
-		draw.pic(x * state.scale, y * state.scale + vid.state.height - (24 * state.scale), pic, state.scale);
+		draw.pic(x * state.scale, y * state.scale + vid.state.height - (24 * state.scale), pic, scale);
 	else
-		draw.pic(x * state.scale + (vid.state.width >> 1) - (320 * state.scale >> 1), y * state.scale + vid.state.height - (24 * state.scale), pic, state.scale);
+		draw.pic(x * state.scale + (vid.state.width >> 1) - (320 * state.scale >> 1), y * state.scale + vid.state.height - (24 * state.scale), pic, scale);
+};
+
+// Fit a mod-supplied icon into the 24x16 cell — they are authored at any resolution (the
+// rerelease's are 48x32) and would otherwise spill over their neighbours.
+const drawWeaponIcon = function(x: number, y: number, pic: Pic)
+{
+	const fit = Math.min(24 / pic.width, 16 / pic.height, 1);
+	drawPic(x + (24 - pic.width * fit) * 0.5, y + (16 - pic.height * fit) * 0.5, pic, state.scale * fit);
 };
 
 export const drawCharacter = function(x: number, y: number, num: number)
@@ -414,6 +476,17 @@ export const drawInventory = function()
 		}
 	}
 
+	// wwheel weapons continue the row into the blank strip between the seventh cell (x=168) and
+	// the item icons (x=192). Only two icons exist per weapon, so they show selected/unselected
+	// rather than the classic five-frame pickup flash.
+	for (i = 0; i < state.extraWeapons.length; ++i)
+	{
+		const xw = state.extraWeapons[i];
+		if ((cl.clState.items & xw.bit) === 0)
+			continue;
+		drawWeaponIcon(168 + i * 24, -16, xw.pics[cl.clState.stats[def.STAT.activeweapon] === xw.bit ? 1 : 0]);
+	}
+
 	for (i = 0; i <= 3; ++i)
 	{
 		var num = cl.clState.stats[def.STAT.shells + i].toString();
@@ -553,6 +626,29 @@ export const drawSbar = function()
 	if (scr.state.con_current >= 200)
 		return;
 
+	// A csprogs with CSQC_DrawHud draws the whole status bar itself (QSS sbar.c:989-1033).
+	if (csqc.canDraw(csqc.state.extfuncs.CSQC_DrawHud))
+	{
+		var deathmatchoverlay = false;
+		sortFrags();
+		csqc.drawHud(state.showscores);
+		if (csqc.state.extfuncs.CSQC_DrawScores)
+		{
+			// The menu draws over the scoreboard, so don't spend a frame on one underneath it.
+			if (key.state.dest !== key.KEY_DEST.menu)
+				csqc.drawScores(state.showscores, false);
+		}
+		else
+			deathmatchoverlay = (state.showscores === true) || (cl.clState.stats[def.STAT.health] <= 0);
+		// A clip area the QC left set must not clip what the engine draws after the hud
+		// (QSS glDisable(GL_SCISSOR_TEST)).
+		draw.resetClip();
+
+		if (deathmatchoverlay && (cl.clState.gametype === 1))
+			deathmatchOverlay();
+		return;
+	}
+
 	if (state.lines > (24 * state.scale))
 	{
 		drawInventory();
@@ -655,6 +751,9 @@ export const deathmatchOverlay = function()
 		s = cl.clState.scores[state.fragsort[i]];
 		if (s.name.length === 0)
 			continue;
+		// ping / bot label — wait for first ping cycle before showing anything definitive
+		var pingStr = !s.pinged ? '    ' : (s.isBot && s.name !== 'unconnected') ? ' bot' : s.ping.toString().padStart(4, ' ');
+		draw.string(x - (40 * state.scale), y, pingStr);
 		draw.fill(x, y, (40 * state.scale), 4 * state.scale, (s.colors & 0xf0) + 8);
 		draw.fill(x, y + (4 * state.scale), 40 * state.scale, 4 * state.scale, ((s.colors & 0xf) << 4) + 8);
 		f = s.frags.toString();
@@ -707,30 +806,86 @@ export const miniDeathmatchOverlay = function()
 	}
 };
 
+// QSS-M Sbar_IntermissionPicForChar: digits/slash/colon/minus map to sbar pics; anything
+// else (spaces from the %2d padding) is null.
+const intermissionPicForChar = function(c: string)
+{
+	if (c >= '0' && c <= '9')
+		return state.nums[0][c.charCodeAt(0) - 48];
+	if (c === '/')
+		return state.slash;
+	if (c === ':')
+		return state.colon;
+	if (c === '-')
+		return state.nums[0][10];
+	return null;
+};
+
+// QSS-M Sbar_IntermissionTextWidth: sum of glyph widths; null chars (spaces) count 24.
+const intermissionTextWidth = function(str: string)
+{
+	var len = 0;
+	for (var i = 0; i < str.length; ++i)
+	{
+		const pic = intermissionPicForChar(str[i]);
+		len += pic != null ? pic.width : 24;
+	}
+	return len;
+};
+
+// QSS-M Sbar_IntermissionText — VERBATIM including the quirk that a null char (space)
+// `continue`s without advancing x, even though TextWidth counted it as 24.
+const intermissionText = function(x: number, y: number, str: string)
+{
+	for (var i = 0; i < str.length; ++i)
+	{
+		const pic = intermissionPicForChar(str[i]);
+		if (pic == null)
+			continue;
+		draw.pic(x * state.scale, y * state.scale, pic, state.scale);
+		x += pic.width;
+	}
+};
+
+// QSS-M Sbar_IntermissionOverlay: measured lines right-aligned to a common edge, the
+// whole block (inter plaque + widest line) centered on the 320-wide canvas.
 export const intermissionOverlay = function()
 {
+	// CSQC_DrawScores replaces both scoreboards, this one included (QSS sbar.c:1440-1471).
+	if (csqc.canDraw(csqc.state.extfuncs.CSQC_DrawScores))
+	{
+		sortFrags();
+		csqc.drawScores(state.showscores, true);
+		draw.resetClip();
+		return;
+	}
+
 	if (cl.clState.gametype === 1)
 	{
 		deathmatchOverlay();
 		return;
 	}
-	draw.pic(64 * state.scale, 24 * state.scale, state.complete, state.scale);
-	draw.pic(0, 56 * state.scale, state.inter, state.scale);
 
-	var dig = Math.floor(cl.clState.completed_time / 60.0);
-	intermissionNumber(160, 64, dig);
-	var num = Math.floor(cl.clState.completed_time - dig * 60);
-	draw.pic(234 * state.scale, 64 * state.scale, state.colon, state.scale);
-	draw.pic(246 * state.scale, 64 * state.scale, state.nums[0][Math.floor(num / 10)], state.scale);
-	draw.pic(266 * state.scale, 6 * state.scale, state.nums[0][Math.floor(num % 10)], state.scale);
+	const t = Math.floor(cl.clState.completed_time);
+	const time = Math.floor(t / 60) + ':' + ('' + (t % 60)).padStart(2, '0');
+	const secrets = cl.clState.stats[def.STAT.secrets] + '/' + ('' + cl.clState.stats[def.STAT.totalsecrets]).padStart(2, ' ');
+	const monsters = cl.clState.stats[def.STAT.monsters] + '/' + ('' + cl.clState.stats[def.STAT.totalmonsters]).padStart(2, ' ');
 
-	intermissionNumber(160, 104, cl.clState.stats[def.STAT.secrets]);
-	draw.pic(232 * state.scale, 104 * state.scale, state.slash, state.scale);
-	intermissionNumber(240, 104, cl.clState.stats[def.STAT.totalsecrets]);
+	const ltime = intermissionTextWidth(time);
+	const lsecrets = intermissionTextWidth(secrets);
+	const lmonsters = intermissionTextWidth(monsters);
 
-	intermissionNumber(160, 144, cl.clState.stats[def.STAT.monsters]);
-	draw.pic(232 * state.scale, 144 * state.scale, state.slash, state.scale);
-	intermissionNumber(240, 144, cl.clState.stats[def.STAT.totalmonsters]);
+	var total = Math.max(ltime, lsecrets, lmonsters);
+	total += state.inter.width + 24;
+	total = Math.min(320, total);
+	const half = Math.floor(total / 2);
+
+	draw.pic((160 - half) * state.scale, 56 * state.scale, state.inter, state.scale);
+	draw.pic((160 - Math.floor(state.complete.width / 2)) * state.scale, 24 * state.scale, state.complete, state.scale);
+
+	intermissionText(160 + half - ltime, 64, time);
+	intermissionText(160 + half - lsecrets, 104, secrets);
+	intermissionText(160 + half - lmonsters, 144, monsters);
 };
 
 export const finaleOverlay = function()

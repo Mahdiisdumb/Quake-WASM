@@ -1,120 +1,62 @@
-// import * as mod from './mod'
-// import * as con from './console'
-// import * as com from './com'
-// import * as q from './q'
-// import { Model } from './types'
-// // type BspxLump = {
-// //   char lumpname[24]; // up to 23 chars, zero-padded
-// //   int fileofs;  // from file start
-// //   int filelen;
-// // } bspx_lump_t;
-// // typedef struct {
-// //   char id[4];  // 'BSPX'
-// //   int numlumps;
-// // bspx_lump_t lumps[1];
-// // } bspx_header_t;
-// // static char *bspxbase;
-// // static bspx_header_t *bspxheader;
-// const HEADER_LUMPS =	15
-// //supported lumps:
-// //RGBLIGHTING (.lit)
-// //LMSHIFT (.lit2)
-// //LMOFFSET (LMSHIFT helper)
-// //LMSTYLE (LMSHIFT helper)
+import * as con from './console'
+import * as q from './q'
 
-// //unsupported lumps ('documented' elsewhere):
-// //BRUSHLIST (because hulls suck)
-// //LIGHTINGDIR (.lux)
-// //LIGHTING_E5BGR9 (hdr lighting)
-// //VERTEXNORMALS (smooth shading with dlights/rtlights)
+// BSPX ("BSP eXtension") is an id1-adjacent convention (ericw-tools/QSS) for
+// tacking extra lumps onto a .bsp without touching the standard 15-lump
+// directory. Layout, immediately after the last standard lump, 4-byte
+// aligned:
+//   header: char id[4] = 'BSPX'; uint32 numlumps
+//   numlumps * { char name[24]; uint32 fileofs; uint32 filelen }
+// Ref: QSS gl_model.c Q1BSPX_Setup/Q1BSPX_FindLump (Ironwail carries no BSPX
+// support at all, so QSS is the only local precedent).
 
-// export const state: {
-//   bspxheader: ArrayBufferLike | null,
-//   bspxbase: ArrayBufferLike | null
-// } = {
-//   bspxheader: null,
-//   bspxbase: null
-// }
+const HEADER_SIZE = 8   // id[4] + numlumps[4]
+const LUMP_SIZE = 32    // name[24] + fileofs[4] + filelen[4]
+const NAME_SIZE = 24
 
-// export type LumpLocation = {
-//   offset: number,
-//   size: number
-// }
-// export const findLump = (lumpname: string): LumpLocation | null => 
-// {
-//   if (state.bspxheader === null)
-//     return null
-  
-//   const view = new DataView(state.bspxheader)
-//   const numlumps = view.getUint32(4)
+export type BspxDirectory = { [name: string]: { fileofs: number, filelen: number } }
 
-//   for (var i = 0; i < numlumps; i++)
-//   {
-//     const lumpName = q.memstr(new Uint8Array(state.bspxheader, (i * 32) + 8, 24))
-//     if (lumpName === lumpName)
-//     {
-//       var fileofs = view.getUint32(8 + (i * 32) + 24, true);
-//       var filelen = view.getUint32(8 + (i * 32) + 28, true);
-//       return {
-//         offset: fileofs,
-//         size: filelen
-//       }
-//     }
-//   }
-//   return null
-// }
+// lastLumpEnd: end (fileofs + filelen) of the highest standard BSP lump,
+// unaligned - caller derives this from the shared v29/BSP2 15-lump
+// directory. Returns null when no BSPX header is present or it fails
+// validation; never throws (garbage trailing a classic map is normal).
+export const parse = (buffer: ArrayBuffer, lastLumpEnd: number): BspxDirectory | null =>
+{
+  var offs = (lastLumpEnd + 3) & ~3;
+  if (offs + HEADER_SIZE > buffer.byteLength)
+    return null; // no room for a header - ordinary map
 
-// export const setup = (mod: Model, buffer: ArrayBuffer) => 
-// {
-// 	let offs = 0;
-// 	let misaligned = false;
+  if (q.memstr(new Uint8Array(buffer, offs, 4)) !== 'BSPX')
+    return null;
 
-// 	state.bspxbase = buffer;
-// 	state.bspxheader = null;
+  var view = new DataView(buffer);
+  var numlumps = view.getInt32(offs + 4, true);
+  var lumpBase = offs + HEADER_SIZE;
+  if (numlumps < 0 || lumpBase + LUMP_SIZE * numlumps > buffer.byteLength)
+    return null; // bad count - matches QSS Q1BSPX_Setup silently bailing
 
-//   var view = new DataView(buffer);
-// 	for (var i = 0; i < HEADER_LUMPS; i++)
-// 	{
-//     const fileofs = view.getUint32((i << 3) + 4, true);
-//     const filelen = view.getUint32((i << 3) + 8, true);
-// 		if ((fileofs & 3) && i != mod.lum.entities)
-// 			misaligned = true;
-// 		if (offs < fileofs + filelen)
-// 			offs = fileofs + filelen;
-// 	}
-// 	if (misaligned)
-// 		con.dPrint(`${mod.name} contains misaligned lumps\n`);
-// 	offs = (offs + 3) & ~3;
-// 	if (offs + 40 > buffer.byteLength)
-// 		return; /*no space for it*/
+  var dir: BspxDirectory = {};
+  for (var i = 0; i < numlumps; i++)
+  {
+    var entryOfs = lumpBase + i * LUMP_SIZE;
+    var name = q.memstr(new Uint8Array(buffer, entryOfs, NAME_SIZE));
+    var fileofs = view.getUint32(entryOfs + NAME_SIZE, true);
+    var filelen = view.getUint32(entryOfs + NAME_SIZE + 4, true);
+    if (fileofs + filelen > buffer.byteLength)
+      return null; // one bad lump voids the whole directory (matches QSS)
+    if (fileofs & 3)
+      con.dPrint(`bspx: lump ${name} misaligned\n`);
+    dir[name] = { fileofs, filelen };
+  }
+  return dir;
+};
 
-//   /// bspx_lump = 24 name, 4: fileofs, 4 filelen (32 bytes)
-//   /// bspx_header = 4 bytes: BSPX, 4 bytes: num lumps,  (8 + (numlumps * 32))
-// 	//h = (bspx_header_t*)(filebase + offs);
-//   const LUMP_SIZE = 32 // bytes
-// 	const numLumps = com.state.littleLong(view.getInt32(offs + 4));
-//   const lumpOffset = offs + 8
-// 	/*verify the header*/
-//   if (q.memstr(new Uint8Array(buffer, offs, 32)) !== 'BSPX'
-//     || i < 0 ||
-//     lumpOffset + (LUMP_SIZE * numLumps) > buffer.byteLength) {
-//       console.log('BSPX overflow')
-//       return
-//     }
-  
-// 	for( i = numLumps; i >= 0; i--)
-// 	{
-//     const fileofs = com.state.littleLong(view.getUint32(8 + (i * LUMP_SIZE) + 24, true));
-//     const filelen = com.state.littleLong(view.getUint32(8 + (i * LUMP_SIZE) + 28, true));
-//     view.setUint32(8 + (i * LUMP_SIZE) + 24, fileofs, true)
-//     view.setUint32(8 + (i * LUMP_SIZE) + 28, filelen, true)
-// 		if (fileofs & 3)
-// 			con.dPrint(`${mod.name} contains misaligned bspx lump ${q.memstr(new Uint8Array(buffer, lumpOffset + (i * LUMP_SIZE), 24))}\n`);
-// 		if (fileofs + filelen > buffer.byteLength){
-//       console.log('BSPX Lump overflow')
-//       return
-//     }
-// 	}
-
-// 	state.bspxheader = new Uint8Array(buffer, offs, buffer.byteLength - offs)
-// }
+// Zero-copy view onto a lump's bytes, or null if absent (either no BSPX
+// directory at all, or this name wasn't in it - both are normal).
+export const findLump = (dir: BspxDirectory | null, buffer: ArrayBuffer, name: string): Uint8Array | null =>
+{
+  if (dir === null || !(name in dir))
+    return null;
+  var lump = dir[name];
+  return new Uint8Array(buffer, lump.fileofs, lump.filelen);
+};

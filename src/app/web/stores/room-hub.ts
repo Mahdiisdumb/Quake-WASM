@@ -7,6 +7,7 @@ interface State {
   roomList: Room[]
   currentRoom: null | RoomId // If this user is currently hosting a room.
   autoRefresh: boolean
+  loopRunning: boolean
 }
 
 const refreshTime = 5000
@@ -20,7 +21,8 @@ export const useRoomHubStore = defineStore('room-hub', {
       status: 'loading',
       roomList: [],
       currentRoom: null,
-      autoRefresh: false
+      autoRefresh: false,
+      loopRunning: false
     }),
     actions: {
       async createRoom ({roomName, visibility}: {
@@ -28,9 +30,7 @@ export const useRoomHubStore = defineStore('room-hub', {
         visibility: 'public' | 'private' | 'single',
       }) {
         const playerStore = usePlayerStore()
-        if (playerStore.playerId == null) {
-          await playerStore.createPlayer(playerStore.playerName)
-        }
+        await playerStore.ensurePlayer()
         const roomCreateResponse = await fetch(roomApi, {
           method: 'POST',
           headers: {
@@ -68,13 +68,18 @@ export const useRoomHubStore = defineStore('room-hub', {
           })
       },
       refreshLoop () {
-        const work = this.autoRefresh ? this.refresh() : Promise.resolve()
-        return work
-          .then(() => {
-            setTimeout(() => {
-              this.refreshLoop()
-            }, refreshTime)
+        if (this.loopRunning) return
+        this.loopRunning = true
+        const tick = () => {
+          if (!this.autoRefresh) {
+            this.loopRunning = false
+            return
+          }
+          this.refresh().then(() => {
+            setTimeout(tick, refreshTime)
           })
+        }
+        tick()
       }
     }
   })

@@ -1,270 +1,285 @@
 <template lang="pug">
-.package(
-  :class="{ dragging: model.dragActive }"
-  @drop.prevent="handleFileDrop"
-  @dragover.prevent="model.dragActive = true"
-  @dragenter.prevent="model.dragActive = true"
-  @dragleave.prevent="model.dragActive = false"
+.pkg-row(
+  :class="{ expanded: model.expanded, dragging: model.dragActive }"
+  @drop.prevent.stop="source === 'custom' ? handleFileDrop($event) : undefined"
+  @dragover.prevent.stop="source === 'custom' ? (model.dragActive = true) : undefined"
+  @dragenter.prevent.stop="source === 'custom' ? (model.dragActive = true) : undefined"
+  @dragleave.prevent.stop="model.dragActive = false"
 )
-  .header.h6
-    .expandable
-      button.btn.btn-action.btn-sm(@click="toggleExpand")
-        i.icon(:class="model.expanded ? 'icon-arrow-up' : 'icon-arrow-down'" style="margin: .3rem")
-    .title {{props.package.name}}
-    .actions
-      input.file-input(
+  .pkg-row-head(@click="toggleExpand")
+    font-awesome-icon.pkg-chevron(icon="fa-solid fa-chevron-right")
+    InlineEdit.pkg-name(
+      v-if="source === 'custom'"
+      :modelValue="props.package.name"
+      @update:modelValue="onRename"
+      @click.stop
+    )
+    span.pkg-name(v-else) {{ props.package.name }}
+    span.pkg-type(:class="source") {{ sourceLabel }}
+    span.pkg-count(v-if="model.totalSize !== null") {{ formatFileSize(model.totalSize) }}
+    .pkg-actions(@click.stop)
+      input.hidden-file-input(
+        v-if="source === 'custom'"
         ref="fileInput"
         type="file"
         multiple
         accept=".pak,.mdl,.bsp,.txt,.cfg,.dat,.spr,.lit,.map,.wav,.tga,.lmp"
         @change="handleFileSelect"
-        style="display: none"
       )
-      button.btn.btn-action.btn-sm.add-file(
-          v-if="source === 'custom'"
-          @click="onAddFile"
-          v-tippy
-          content="Add File to Package"
-        )
-        i.icon.icon-plus
-      button.btn.btn-action.btn-sm.remove(
-        @click="onRemovePackage"
-        v-tippy
-        content="Remove Package"
-      )
-        i.icon.icon-cross
-  .package-files(v-if="model.expanded")
+      button.pkg-icon-btn.add(
+        v-if="source === 'custom'"
+        @click="onAddFile"
+        title="Add file"
+      ) + Add
+      button.pkg-icon-btn.danger(@click="onRemovePackage" title="Delete")
+        font-awesome-icon(icon="fa-solid fa-xmark")
+
+  .pkg-files(v-if="model.expanded")
     PackageFile(
-      v-for="customAsset in model.metaList"
+      v-for="asset in model.metaList"
+      :key="asset.assetId"
       :source="source"
-      :asset="customAsset" 
-      @remove="onRemoveAsset(customAsset)"
-      @edit="onEditAsset(customAsset, $event)"
+      :asset="asset"
+      @remove="onRemoveAsset(asset)"
+      @edit="onEditAsset(asset, $event)"
     )
-
 </template>
-
 
 <script lang="ts" setup>
 import PackageFile from './PackageFile.vue'
-import {reactive, computed, watch, ref} from 'vue'
-import { useGameStore } from '../../../../../stores/game';
-import { useMapsStore } from '../../../../../stores/maps';
-import type { AssetMeta, PackageMeta } from '../../../../../../../shared/types/Store';
-import * as indexedDb from '../../../../../../../shared/indexeddb';
-import { useToast } from 'vue-toastification';
+import InlineEdit from '../../../../../components/input/InlineEdit.vue'
+import { reactive, computed, watch, ref, onMounted } from 'vue'
+import { formatFileSize } from '../../../../../helpers/number'
+import { useGameStore } from '../../../../../stores/game'
+import type { AssetMeta, PackageMeta } from '../../../../../../../shared/types/Store'
+import * as indexedDb from '../../../../../../../shared/indexeddb'
+import { useToast } from 'vue-toastification'
 
-interface Props {
-  package: PackageMeta
-}
-
-const props = defineProps<Props>()
-
-const emit = defineEmits<{
-  (e: 'remove', packageId: number): void
-  (e: 'edit', packageId: number): void
-}>()
+const props = defineProps<{ package: PackageMeta }>()
+const emit = defineEmits<{ (e: 'remove', packageId: number): void }>()
 
 const gameStore = useGameStore()
-const mapsStore = useMapsStore()
+const toast = useToast()
+const fileInput = ref<HTMLInputElement>()
+
 const model = reactive<{
   expanded: boolean
-  metaList: Array<AssetMeta>,
+  metaList: AssetMeta[]
   dragActive: boolean
+  totalSize: number | null
 }>({
   expanded: false,
   metaList: [],
-  dragActive: false
+  dragActive: false,
+  totalSize: null,
 })
 
 const source = computed(() => props.package.sourceId.split(':')[0])
-const fileInput = ref<HTMLInputElement>();
-const toast = useToast();
-const toggleExpand = () => model.expanded = !model.expanded
+
+const sourceLabel = computed(() => {
+  switch (source.value) {
+    case 'quaddicted': return 'Quaddicted'
+    case 'slipseer':   return 'Slipseer'
+    case 'official':   return 'Official'
+    default:           return 'Custom'
+  }
+})
+
+const toggleExpand = () => { model.expanded = !model.expanded }
+
+onMounted(async () => {
+  const meta = await indexedDb.getAllMetaPerPackageId(props.package.packageId)
+  model.totalSize = meta.reduce((sum, a) => sum + (a.fileSize ?? 0), 0)
+})
+
+watch(() => model.expanded, async (expanded) => {
+  if (expanded) await loadAssetList()
+})
+
+const loadAssetList = async () => {
+  model.metaList = await indexedDb.getAllMetaPerPackageId(props.package.packageId)
+  model.totalSize = model.metaList.reduce((sum, a) => sum + (a.fileSize ?? 0), 0)
+}
 
 const onRemovePackage = async () => {
-  if (!confirm(`Are you sure you want to delete the package "${props.package.name}"?`)) {
-    return;
-  }
-  
+  if (!confirm(`Delete package "${props.package.name}"?`)) return
   emit('remove', props.package.packageId)
 }
 
 const onRemoveAsset = async (asset: AssetMeta) => {
-  if (!confirm(`Are you sure you want to delete "${asset.fileName}"?`)) {
-    return;
-  }
-  
+  if (!confirm(`Remove "${asset.fileName}"?`)) return
   try {
-    await indexedDb.removeAsset(asset.assetId.toString());
-    await loadAssetList();
-    await gameStore.loadAssets();
-  } catch (error) {
-    console.error('Failed to delete asset:', error);
-    toast.warning(`Failed to delete ${asset.fileName}`, { timeout: 5000 });
+    await indexedDb.removeAsset(asset.assetId.toString())
+    await loadAssetList()
+    await gameStore.loadAssets()
+  } catch (err: any) {
+    toast.warning(`Failed to delete ${asset.fileName}`)
   }
 }
 
 const onEditAsset = async (asset: AssetMeta, fileName: string) => {
-  // Check if filename already exists in this package
-  const existingAsset = model.metaList.find(a => 
-    a.assetId !== asset.assetId && 
-    a.fileName.toLowerCase() === fileName.toLowerCase()
-  );
-  
-  if (existingAsset) {
-    toast.warning(`A file named "${fileName}" already exists in this package`, { timeout: 5000 });
-    return;
+  const exists = model.metaList.find(a =>
+    a.assetId !== asset.assetId && a.fileName.toLowerCase() === fileName.toLowerCase()
+  )
+  if (exists) {
+    toast.warning(`"${fileName}" already exists in this package`)
+    return
   }
-  
   try {
-    await indexedDb.updateAssetFileName(asset.assetId, fileName);
-    await loadAssetList();
-    await gameStore.loadAssets();
-  } catch (error) {
-    console.error('Failed to update filename:', error);
-    toast.warning(`Failed to update ${asset.fileName}`, { timeout: 5000 });
+    await indexedDb.updateAssetFileName(asset.assetId, fileName)
+    await loadAssetList()
+    await gameStore.loadAssets()
+  } catch (err: any) {
+    toast.warning(`Failed to rename ${asset.fileName}`)
   }
 }
 
-const onAddFile = () => {
-  fileInput.value?.click();
-}
-
-const handleFileSelect = (event: Event) => {
-  const target = event.target as HTMLInputElement;
-  if (target.files?.length) {
-    uploadFiles(Array.from(target.files));
+const onRename = async (name: string) => {
+  try {
+    await indexedDb.updatePackageName(props.package.packageId, name)
+    await gameStore.loadPackages()
+  } catch (err: any) {
+    toast.warning(`Failed to rename package: ${err.message}`)
   }
 }
 
-const handleFileDrop = (event: DragEvent) => {
-  event.stopPropagation();
-  model.dragActive = false;
-  
-  if (event.dataTransfer && event.dataTransfer.items) {
-    const files = Array.from(event.dataTransfer.items)
-      .filter(item => item.kind === 'file')
-      .map(item => item.getAsFile())
-      .filter(file => !!file);
-      
-    if (files.length) {
-      uploadFiles(files as File[]);
-    }
-  } else if (event.dataTransfer?.files.length) {
-    uploadFiles(Array.from(event.dataTransfer.files));
-  }
+const onAddFile = () => { fileInput.value?.click() }
+
+const handleFileSelect = (e: Event) => {
+  const target = e.target as HTMLInputElement
+  if (target.files?.length) uploadFiles(Array.from(target.files))
+}
+
+const handleFileDrop = (e: DragEvent) => {
+  e.stopPropagation()
+  model.dragActive = false
+  const items = e.dataTransfer?.items
+  const files: File[] = items
+    ? Array.from(items).filter(i => i.kind === 'file').map(i => i.getAsFile()).filter(Boolean) as File[]
+    : Array.from(e.dataTransfer?.files || [])
+  if (files.length) uploadFiles(files)
 }
 
 const fixFileName = (fileName: string): string => {
-  const lowCase = fileName.toLowerCase();
-  const extension = lowCase.split('.').pop();
-  switch(extension) {
-    case 'mdl':
-    case 'spr':
-      return `progs/${fileName}`;
-    case 'bsp':
-    case "map":
-    case "lit":
-      return `maps/${fileName}`;
-    case "wav":
-      return `sound/${fileName}`;
-    case "tga":
-    case "lmp":
-      return `gfx/${fileName}`;
-    case 'pak':
-    case 'txt':
-    case 'dat':
-    case 'cfg':
-      return fileName
-    default:
-      return fileName
+  const ext = fileName.toLowerCase().split('.').pop()
+  switch (ext) {
+    case 'mdl': case 'spr': return `progs/${fileName}`
+    case 'bsp': case 'map': case 'lit': return `maps/${fileName}`
+    case 'wav': return `sound/${fileName}`
+    case 'tga': case 'lmp': return `gfx/${fileName}`
+    default: return fileName
   }
 }
 
 const uploadFiles = async (files: File[]) => {
   try {
     for (const file of files) {
-      const arrayBuffer = await file.arrayBuffer();
-      const fileName = fixFileName(file.name);
-      await indexedDb.saveAsset(
-        props.package.gameDir,
-        fileName,
-        file.size,
-        arrayBuffer,
-        props.package.packageId
-      );
+      const buf = await file.arrayBuffer()
+      const name = fixFileName(file.name)
+      await indexedDb.saveAsset(props.package.gameDir, name, file.size, buf, props.package.packageId)
     }
-    
-    await loadAssetList();
-    await gameStore.loadAssets();
-  } catch (error) {
-    console.error('Failed to add files:', error);
-
-    toast.warning(`Failed to add files: ${error.message}`, { timeout: 5000 });
+    await loadAssetList()
+    await gameStore.loadAssets()
+  } catch (err: any) {
+    toast.warning(`Failed to add files: ${err.message}`)
   }
 }
-
-const loadAssetList = async () => {
-  model.metaList = await indexedDb.getAllMetaPerPackageId(props.package.packageId)
-}
-
-watch(model, (newModel) => {
-  if (newModel.expanded) {
-    loadAssetList()
-  }
-})
 </script>
 
-<style scoped lang="scss">
-@import '../../../../../scss/colors.scss';
+<style lang="scss" scoped>
+@import '../../../../../scss/tokens';
 
-.package {
-  border-top: 1px solid grey;
-  
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-  }
-  &.dragging {
-    background-color: lighten($body-bg, 20%);
-    border: 2px dashed $border-color;
-  }
-}
-.header {
-  display: grid;
-  grid-template-columns: 2rem 1fr 6rem;
-  overflow: auto;
-  padding: .5rem 0 .5rem .5rem;
-  scrollbar-gutter: stable;
-
-  .btn.remove {
-    color: #ff0000;
-  }
-
-  &:hover  {
-    background-color: lighten($body-bg, 10%);
-  }
-  &:not(:hover) {
-    .actions .btn {
-      color: lighten($body-bg, 15%);;
-      background-color: lighten($body-bg, 5%);
-    }
-    .actions i {
-      color: lighten($body-bg, 15%);;
-    }
-  }
-}
-.file-table {
-  width: 100%;
-}
-.package-files {
-  display: block;
-  overflow: auto;
-  max-height: 15rem;
-  
-  scrollbar-gutter: stable;
+.pkg-row {
+  border: $border-subtle;
+  border-bottom: none;
+  &:last-child { border-bottom: $border-subtle; }
+  &.dragging { outline: 2px dashed $palette-border; background: rgba(255, 255, 255, 0.02); }
 }
 
+.pkg-row-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 16px;
+  cursor: pointer;
+  transition: $transition-bg;
+  user-select: none;
+  &:hover { background: $palette-surface; }
+}
 
+.expanded .pkg-row-head {
+  background: $palette-surface;
+  border-bottom: $border-subtle;
+}
+
+.pkg-chevron {
+  font-size: 10px;
+  color: $palette-muted;
+  flex-shrink: 0;
+  width: 14px;
+  transition: transform 0.2s;
+}
+
+.expanded .pkg-chevron { transform: rotate(90deg); }
+
+.pkg-name {
+  font-size: 14px;
+  font-weight: $fw-bold;
+  color: $palette-bright;
+  flex: 1;
+  font-family: 'JetBrains Mono', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.pkg-type {
+  font-size: $font-2xs;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-links;
+  padding: 2px 8px;
+  flex-shrink: 0;
+  &.quaddicted { background: rgba(96, 160, 224, 0.12); color: #60a0e0; }
+  &.slipseer   { background: rgba(92, 200, 138, 0.12); color: #5cc88a; }
+  &.official   { background: rgba(160, 130, 224, 0.12); color: #a082e0; }
+  &.custom      { background: rgba(240, 184, 0, 0.12);  color: $palette-yellow; }
+}
+
+.pkg-count {
+  font-size: $font-xs;
+  color: $palette-muted;
+  font-family: 'JetBrains Mono', monospace;
+  flex-shrink: 0;
+  min-width: 56px;
+  text-align: right;
+}
+
+.pkg-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pkg-icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: $font-sm;
+  color: $palette-muted;
+  padding: 4px 6px;
+  transition: $transition-color;
+  line-height: 1;
+  font-family: inherit;
+  font-weight: $fw-bold;
+  letter-spacing: $tracking-links;
+  &:hover        { color: $palette-bright; }
+  &.danger:hover { color: $palette-red; }
+  &.add:hover    { color: $palette-yellow; }
+}
+
+.hidden-file-input { display: none; }
+
+.pkg-files { background: $palette-body; }
 </style>

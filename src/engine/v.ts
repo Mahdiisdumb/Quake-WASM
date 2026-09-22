@@ -6,6 +6,7 @@ import * as mod from './mod'
 import * as cvar from './cvar'
 import * as def from './def'
 import * as chase from './chase'
+import * as csqc from './csqc'
 import * as scr from './scr'
 import * as q from './q'
 import * as r from './r'
@@ -32,7 +33,7 @@ export const blend = [0.0, 0.0, 0.0, 0.0]
 
 export const calcRoll = function(angles: V3, velocity: V3)
 {
-	var right: V3 = [0,0,0];
+	var right: V3 = vec.scratch();
 	vec.angleVectors(angles, null, right, null);
 	var side = velocity[0] * right[0] + velocity[1] * right[1] + velocity[2] * right[2];
 	var sign = side < 0 ? -1 : 1;
@@ -134,12 +135,23 @@ export const driftPitch = function()
 	}
 };
 
+// svc_damage position; the csqc hook takes the raw world point, as QSS does, not the direction.
+const damage_from: V3 = [0, 0, 0]
+
 export const parseDamage = function()
 {
 	var armor = msg.readByte();
 	var blood = msg.readByte();
+	damage_from[0] = msg.readCoord(cl.clState.protocolFlags);
+	damage_from[1] = msg.readCoord(cl.clState.protocolFlags);
+	damage_from[2] = msg.readCoord(cl.clState.protocolFlags);
+	// Nonzero: progs drew its own feedback, skip the blend and view kick. The wire is read either
+	// way (QSS V_ParseDamage, view.c:284-297).
+	if (csqc.parseDamage(armor, blood, damage_from))
+		return;
+
 	var ent = cl.state.entities[cl.clState.viewentity];
-	var from: V3 = [msg.readCoord() - ent.origin[0], msg.readCoord() - ent.origin[1], msg.readCoord() - ent.origin[2]];
+	var from: V3 = [damage_from[0] - ent.origin[0], damage_from[1] - ent.origin[1], damage_from[2] - ent.origin[2]];
 	vec.normalize(from);
 	var count = (blood + armor) * 0.5;
 	if (count < 10.0)
@@ -334,8 +346,10 @@ export const calcRefdef = function()
 	r.state.refdef.viewangles[1] += iyaw;
 	r.state.refdef.viewangles[2] += iroll;
 
-	var forward: V3 = [0,0,0], right: V3 = [0,0,0], up: V3 = [0,0,0];
-	vec.angleVectors([-ent.angles[0], ent.angles[1], ent.angles[2]], forward, right, up);
+	var forward: V3 = vec.scratch(), right: V3 = vec.scratch(), up: V3 = vec.scratch();
+	var negAngles: V3 = vec.scratch();
+	negAngles[0] = -ent.angles[0]; negAngles[1] = ent.angles[1]; negAngles[2] = ent.angles[2];
+	vec.angleVectors(negAngles, forward, right, up);
 	r.state.refdef.vieworg[0] += cvr.ofsx.value * forward[0] + cvr.ofsy.value * right[0] + cvr.ofsz.value * up[0];
 	r.state.refdef.vieworg[1] += cvr.ofsx.value * forward[1] + cvr.ofsy.value * right[1] + cvr.ofsz.value * up[1];
 	r.state.refdef.vieworg[2] += cvr.ofsx.value * forward[2] + cvr.ofsy.value * right[2] + cvr.ofsz.value * up[2];
@@ -372,7 +386,16 @@ export const calcRefdef = function()
 	case 80:
 		view.origin[2] += 0.5;
 	}
-	view.model = cl.clState.model_precache[cl.clState.stats[def.STAT.weapon]];
+	if ((ent.lerpflags & r.LERP.finish) !== 0) {
+		view.lerpflags |= r.LERP.finish;
+		view.lerpfinish = ent.lerpfinish;
+	} else
+		view.lerpflags &= ~r.LERP.finish;
+
+	const weaponModel = cl.clState.model_precache[cl.clState.stats[def.STAT.weapon]];
+	if (weaponModel !== view.model)
+		view.lerpflags |= r.LERP.resetanim;
+	view.model = weaponModel;
 	view.frame = cl.clState.stats[def.STAT.weaponframe];
 
 	r.state.refdef.viewangles[0] += cl.clState.punchangle[0];
@@ -412,7 +435,7 @@ export const renderView = function()
 		calcIntermissionRefdef();
 	else if (cl.clState.paused !== true)
 		calcRefdef();
-	r.pushDlights();
+	r.gatherDlights();
 	r.state.framecount++
 	r.renderView();
 };
@@ -438,8 +461,10 @@ export const init = function()
 	cvr.ofsx = cvar.registerVariable('scr_ofsx', '0');
 	cvr.ofsy = cvar.registerVariable('scr_ofsy', '0');
 	cvr.ofsz = cvar.registerVariable('scr_ofsz', '0');
-	cvr.rollspeed = cvar.registerVariable('cl_rollspeed', '200');
-	cvr.rollangle = cvar.registerVariable('cl_rollangle', '2.0');
+	// cl_rollspeed/cl_rollangle are registered by sv.init (the server owns the
+	// authoritative view-roll math); reuse the same cvar objects for the view.
+	cvr.rollspeed = cvar.findVar('cl_rollspeed');
+	cvr.rollangle = cvar.findVar('cl_rollangle');
 	cvr.bob = cvar.registerVariable('cl_bob', '0.02');
 	cvr.bobcycle = cvar.registerVariable('cl_bobcycle', '0.6');
 	cvr.bobup = cvar.registerVariable('cl_bobup', '0.5');

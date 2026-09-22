@@ -67,6 +67,11 @@ npm run debug:gameserver
 - `src/app/web/main.ts` - Frontend application entry point
 - `src/server/index.ts` - Server entry point
 - `src/engine/` - Game engine library (no single entry point)
+- `src/engine/csqc.ts` - Client-side QuakeC VM lifecycle: csprogs loading, tiers, entry-point hooks (`docs/csqc.md`)
+- `src/engine/pfcl.ts` - CSQC builtin tables (classic slots, 2D drawing, stats, message reads, events)
+- `src/engine/pfcl_scene.ts` - CSQC scene/view builtins (clearscene/addentity/renderscene, projection, queries)
+- `src/engine/pf_fte.ts` - FTE builtins shared by both VMs (string buffers, tokenizers, int conversions, memalloc arena) (`docs/fte-support.md`)
+- `src/engine/gltf.ts` - glTF-binary (.glb) static model loading into the alias model format
 
 ## Development Guidelines
 
@@ -75,6 +80,9 @@ npm run debug:gameserver
 3. **Types**: Use TypeScript interfaces defined in `types/` directories
 4. **Testing**: Currently no test framework - check with `npm run build` before committing
 5. **Assets**: Game assets (PAK files, maps, etc.) are handled through the asset store interface - server uses filesystem, frontend uses IndexedDB
+6. **Module state**: Avoid standalone module-level variables. Engine modules expose a `state` object (e.g. `export let state = { ... }`) for all mutable module state. Add new fields to the existing state object rather than declaring separate exported variables.
+7. **Vector ops**: `vec.ts` functions that produce a vector take a required `out` param, write into it, and return it (e.g. `vec.subtract(a, b, out)`) — never add a function that allocates and returns a new array. Use `vec.scratch()` for frame-local temporaries; it is valid only until the next `vec.resetScratch()` (called once per frame in `host._frame`) and must never be stored into anything that outlives the current frame.
+8. **Per-frame allocations are forbidden in engine hot paths** (render frame, physics/movement, entity relink, view calc): no `[x, y, z]` literals, no `vec.emptyV3()`/`emptyV4()`, no object/array reassignment where an existing persistent container can be mutated in place instead. Allocation is fine in cold paths (model/asset loading, menu, console, connection setup) and at genuine construction time (e.g. a newly spawned particle's own persistent `origin`/`vel`).
 
 ## Common Tasks
 
@@ -93,11 +101,4 @@ npm run debug:gameserver
 - Asset loading supports Quake PAK files and various game mods
 - Asset store system: shared interface with different implementations (server uses filesystem, frontend uses IndexedDB)
 - The project serves both single-player and multiplayer Quake gameplay
-
-## Current Status
-Based on git status, there are pending changes to:
-- `src/app/web/stores/maps.ts`
-- `src/app/web/types/QuaddictedMap.ts` 
-- `src/engine/com.ts`
-
-Please run the build command to verify changes before committing.
+- Run `npm run build` to verify changes before committing

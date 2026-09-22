@@ -5,11 +5,13 @@ import * as pr from '../../../engine/pr'
 import * as com from '../../../engine/com'
 import * as con from '../../../engine/console'
 import * as net from '../../../engine/net'
+import * as sz from '../../../engine/sz'
 import * as def from '../../../engine/def'
 import * as cvar from '../../../engine/cvar'
 import * as sys from '../sys'
 import * as dgram from 'dgram'
 import * as os from 'os'
+import * as dpmaster from './dpmaster'
 import { QConnectStatus } from '../../../engine/interfaces/net/INetworkDriver'
 
 const HEADER_SIZE = 8
@@ -69,6 +71,7 @@ export const checkForResend = (): number => {
 }
 
 export const registerWithMaster = () => {
+	dpmaster.triggerHeartbeat()
 }
 export const supportedAddress = (connectionAddress: string) => true
 
@@ -97,6 +100,7 @@ export const init = function()
 	if (state.myAddr == null)
 		state.myAddr = '127.0.0.1';
 
+	dpmaster.init()
 	initialized = true
 	return true;
 };
@@ -128,6 +132,8 @@ export const listen = function()
 
 export const checkNewConnections = function()
 {
+	dpmaster.checkHeartbeat(state.controlsocket)
+
 	if (state.acceptsockets.length === 0)
 		return;
 	var sock = net.newQSocket();
@@ -182,7 +188,7 @@ export const getMessage = function(sock: ISocket)
 			if (sequence !== sock.unreliableReceiveSequence)
         		con.dPrint('Dropped ' + (sequence - sock.unreliableReceiveSequence) + ' datagram(s)\n');
 			sock.unreliableReceiveSequence = sequence + 1;
-			const dest = new Uint8Array(net.state.message.data)
+			const dest = sz.u8(net.state.message)
 			net.state.message.cursize = length;
 			for (i = 0; i < length; ++i)
 				dest[i] = message[8 + i];
@@ -230,7 +236,7 @@ export const getMessage = function(sock: ISocket)
 				sock.receiveMessageLength += length;
 				continue;
 			}
-			var data = new Uint8Array(net.state.message.data);
+			var data = sz.u8(net.state.message);
 			for (i = 0; i < sock.receiveMessageLength; ++i)
 				data[i] = sock.receiveMessage[i];
 			for (i = 0; i < length; ++i)
@@ -340,8 +346,15 @@ export const close = function(sock: ISocket)
 const onMessage = function(msg: Buffer, rinfo: RInfo)
 {
 	const sockets = state.sockets
-	if (sv.state.server.active !== true)
+	if (sv.state.server.phase !== 'active')
 		return;
+
+	// Handle dpmaster connectionless packets (0xFFFFFFFF header)
+	if (rinfo.size >= 5 && msg[0] === 0xFF && msg[1] === 0xFF && msg[2] === 0xFF && msg[3] === 0xFF) {
+		dpmaster.handleConnectionlessPacket(state.controlsocket, msg, rinfo)
+		return
+	}
+
 	const address = rinfo.address +':'+ rinfo.port
 	if (sockets[address] && rinfo.size >= 8) {
 		if ((msg[0] & 0x80) !== 0)
@@ -375,7 +388,7 @@ const onMessage = function(msg: Buffer, rinfo: RInfo)
 		buf.write(str, cursize, str.length, 'ascii');
 		cursize += str.length;
 		buf[cursize++] = 0;
-		str =  pr.getString(pr.state.globals_int[pr.globalvars.mapname]);
+		str =  pr.getString(pr.vms.ssqc.globals_int[pr.vms.ssqc.globalvars.mapname], pr.vms.ssqc);
 		buf.write(str, cursize, str.length, 'ascii');
 		cursize += str.length;
 		buf[cursize++] = 0;

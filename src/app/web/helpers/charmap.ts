@@ -16,8 +16,9 @@ export const createWriter = (): Promise<Writer> => {
           write: write(canvas, img),
         });
       };
-      img.onerror = reject;
-      img.src = '/static/img/charset.png';
+      // Error, not the raw Event — see assetStore/errorReporting: an Event reports as {"isTrusted":true}.
+      img.onerror = () => reject(new Error('failed to load /static/img/charset-6.png'));
+      img.src = '/static/img/charset-6.png';
     });
   }
   return staticCharmap

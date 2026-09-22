@@ -20,9 +20,11 @@ build:
   script:
     - npm --unsafe-perm install
     - npm run build
+    - npm run build:sim
   artifacts:
     paths:
       - dist/
+      - wasm-sim/build/sim.wasm
 
 deploy_frontend:
   image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest  # see the note below
@@ -32,11 +34,14 @@ deploy_frontend:
       - "src/app/**/*"
       - "src/shared/**/*"
       - "src/engine/**/*"
+      - "wasm-sim/assembly/**/*"
   variables:
     DEPLOY_BUCKET: us-east-2-webquake-netquakeio
   script:
     - aws s3 sync dist/app s3://$DEPLOY_BUCKET
     - aws s3 sync static s3://$DEPLOY_BUCKET/static
+    # sim.wasm is fetched at runtime from this exact path (wasmServer.loadMap) — not part of the vite bundle
+    - aws s3 cp wasm-sim/build/sim.wasm s3://$DEPLOY_BUCKET/wasm-sim/build/sim.wasm --content-type application/wasm --cache-control max-age=0,no-cache,no-store,must-revalidate
     - aws s3 cp dist/app/index.html s3://$DEPLOY_BUCKET --metadata-directive REPLACE --cache-control  max-age=0,no-cache,no-store,must-revalidate
     - aws s3 cp dist/app/index.html s3://$DEPLOY_BUCKET/quake --metadata-directive REPLACE --cache-control  max-age=0,no-cache,no-store,must-revalidate
     - aws s3 cp dist/app/index.html s3://$DEPLOY_BUCKET/singleplayer --metadata-directive REPLACE --cache-control  max-age=0,no-cache,no-store,must-revalidate

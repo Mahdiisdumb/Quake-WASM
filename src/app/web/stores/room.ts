@@ -16,12 +16,13 @@ const emptyRoomState = (): RoomState => {
     status: 'unknown',
     players: [],
     chat: { messages: [], players: {} },
-    gameSettings: { 
-      startMap: '', 
+    gameSettings: {
+      startMap: '',
       gameType: 'dm',
       sourceId: 'official:original',
       fragLimit: 0,
-      timeLimit: 0
+      timeLimit: 0,
+      skill: 1
     },
     currentVote: { playerId: '', timestamp: 0 },
   }
@@ -48,9 +49,7 @@ export const useRoomStore = defineStore('room', {
       async joinRoom (roomId: RoomId) {
         const playerStore = usePlayerStore()
         const roomStore = useRoomStore()
-        if (playerStore.playerId == null) {
-          await playerStore.createPlayer(playerStore.playerName)
-        }
+        await playerStore.ensurePlayer()
         if (!playerStore.playerId || !playerStore.playerToken) {
           console.error('Player ID is not set. Cannot join room.')
           return
@@ -117,6 +116,9 @@ export const useRoomStore = defineStore('room', {
           gameSettings: gameSettings
         }
         this.serverConnection?.send(JSON.stringify(gameSettingsChange))
+      },
+      sendAssetProgress (loaded: number, total: number) {
+        this.serverConnection?.send(JSON.stringify({ tag: 'asset-progress', loaded, total }))
       },
       // refresh () {
       //   // simulate server call.

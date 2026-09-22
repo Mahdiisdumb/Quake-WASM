@@ -1,124 +1,98 @@
 <template lang="pug">
-.home
-  h1 Quake1 in your browser 
-  p
-    .containers
-      .columns
-        .column
-          .content
-            | First written by 
-            a(href="https://github.com/Triang3l/WebQuake") Triang3l 
-            |
-            | then forked and extended with modern features.
-            br 
-            | Runs best in the latest Chrome browser
-            p.upload Add your pak1.pak from a purchased copy of quake in order to enjoy all mods and maps.
-          
-  h2
-    .containers
-      template(v-if="!packOne")
-        .columns
-          .column.mt-2.col-md-6.col-xs-12
-            .btn.solid.btn-large.full-width(@click="start()") Start Shareware
-          .column.mt-2.col-md-6.col-xs-12
-            PakUpload(
-              @uploadFiles="uploadFilesRequest" 
-              :showBorder="false"
-              inputId="home-upload" 
-              :loading="model.loading")
-              .btn.solid.btn-large.full-width
-                label(for="home-upload")
-                  i.icon.icon-upload
-                  | &nbsp;Add Pak1
-      template(v-else)
-        .columns
-          .column.col-xs-6x
-            .btn.solid.btn-large.full-width(@click="start()") Start
-      .columns.mt-2
-        .column.col-xs-12
-          .btn.solid.btn-large.full-width(@click="multiplayer()") Multiplayer
-  
-
+Hero
+.divider
+section.how-it-works
+  p.section-title How it works
+  .steps-row
+    .step-card
+      p.step-num Step 01
+      h3.step-title Play for free
+      p.step-desc Episode 1 is fully free — no account, no download. Jump straight in.
+    .step-card
+      p.step-num Step 02
+      h3.step-title Unlock the full game
+      p.step-desc Own Quake? Upload your #[code pak1.pak] to unlock all 4 episodes. Verified locally — never uploaded to our servers.
+    .step-card
+      p.step-num Step 03
+      h3.step-title Connect & compete
+      p.step-desc Join community servers, play custom maps, and experience Quake in your browser.
 </template>
+
 <script lang="ts" setup>
-import {reactive, onMounted, computed, watch} from 'vue'
-import { useGameStore } from '../../stores/game';
-import { useRoute, useRouter } from 'vue-router';
-import {isId1Pak1, readPackFile} from '../../helpers/assetChecker'
-import PakUpload from './Setup/SetupGame/PakUpload.vue'
-import { useToast } from "vue-toastification";
-
-const emit = defineEmits<{
-  (e: 'uploaded', uploadedFiles: string[]): void}
->()
-const router = useRouter()
-const gameStore = useGameStore()
-const assetMetas = computed(() => gameStore.assetMetas.filter(assetMeta => assetMeta.game === 'id1'))
-const model = reactive<{loading: boolean}>({loading: false})
-const packOne = computed(() => assetMetas.value.find(assetMeta => assetMeta.fileName.toLowerCase() === 'pak1.pak'))
-const start = () => router.push({name: 'quake'})
-const multiplayer = () => router.push({name: 'multiplayer'})
-
-const toast = useToast();
-const processReadFile = async ({fileName, data}: {fileName: string, data: ArrayBuffer}) => {
-  const packFiles = readPackFile(data)
-  if (packFiles.length === 0) {
-    throw new Error("Not a valid quake pak file")
-  }
-  if (fileName.toLowerCase() === 'pak1.pak' && !isId1Pak1(packFiles, data)) {
-    throw new Error("Pak1.pak is not the original registered quake pak")
-  }
-  
-  return gameStore.saveAsset({game: 'id1', fileName, fileCount: packFiles.length, data})
-}
-
-const readFile = async (file: File) => {
-  return new Promise<{fileName: string, data: ArrayBuffer}>((resolve, reject) => {
-    const fileName = file.name
-    const reader = new FileReader()
-    reader.onloadend = loadEvt => {
-      resolve({
-        fileName,
-        data: loadEvt.target!.result as ArrayBuffer
-      })
-    }
-    reader.onerror = (e) => reject(e)
-    reader.readAsArrayBuffer(file)
-  })
-}
-const uploadFilesRequest = async (files: File[]) => {
-  model.loading = true
-  
-  if (!files.some(file => file.name.toLowerCase() === 'pak1.pak')) {
-    toast.warning('pak1.pak was not selected to upload');
-    return
-  }
-  const promises = files.map(async file => {
-    try {
-      const fileObj = await readFile(file)
-      await processReadFile(fileObj)
-      if (file.name.toLowerCase() === 'pak1.pak') {
-        toast.success("Successfully added pak1.pak");
-      }
-      return file.name
-    } catch (e) {
-      toast.warning(e.message);
-      console.log(e)
-      // meh.
-    }
-  });
-
-  const uploadedFiles = (await Promise.all(promises)).filter(f => !!f)
-
-  emit('uploaded', uploadedFiles)
-  model.loading = false
-}
+import Hero from './Hero.vue'
 </script>
+
 <style lang="scss" scoped>
-.upload {
-  margin-top: 1rem;
+@import '../../scss/tokens';
+
+.divider {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 48px;
+  border-top: $border-subtle;
 }
-.footer {
-  margin-top: 200px;
+
+.how-it-works {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 64px 48px;
+
+  @media (max-width: 600px) {
+    padding: 48px 24px;
+  }
+}
+
+.section-title {
+  font-size: $font-sm;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-labels;
+  color: $palette-muted;
+  margin-bottom: 36px;
+}
+
+.steps-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: $palette-border;
+  border: 1px solid $palette-border;
+
+  @media (max-width: 600px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.step-card {
+  padding: 28px 24px;
+  background: $palette-surface;
+}
+
+.step-num {
+  font-size: $font-2xs;
+  font-weight: $fw-bold;
+  letter-spacing: $tracking-labels;
+  color: $palette-red;
+  text-transform: uppercase;
+  margin-bottom: $gap-3;
+}
+
+.step-title {
+  font-size: $font-md;
+  font-weight: $fw-extrabold;
+  color: $palette-bright;
+  margin-bottom: $gap-2;
+}
+
+.step-desc {
+  font-size: $font-sm;
+  color: $palette-muted;
+  line-height: 1.65;
+
+  code {
+    color: $palette-yellow;
+    font-family: monospace;
+    font-size: $font-xs;
+  }
 }
 </style>

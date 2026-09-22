@@ -1,37 +1,47 @@
 <template lang="pug">
 div.profile
-  div.name(@click="onProfileClick")
-    font-awesome-icon.icon(icon="fa-solid fa-user" size="xs")
-    QuakeText(:value="playerStore.playerName" :size="14")
+  button.profile-btn(
+    @click="editProfileOpen = true"
+    v-tippy="{allowHTML: true}"
+    :content="nameTooltip"
+    aria-label="Edit profile"
+  )
+    font-awesome-icon(icon="fa-solid fa-user")
   EditProfie(
     v-if="editProfileOpen"
-    okText="OK"
-    :showCancel="false"
-    @ok="editProfileOpen = false"
     @cancel="editProfileOpen = false")
 </template>
 
 <script lang="ts" setup>
-import QuakeText from '../QuakeText.vue'
-import {usePlayerStore} from '../../stores/player';
-import EditProfie from '../EditProfile.vue';
-import {ref} from 'vue'
+import { ref, watch } from 'vue'
+import { usePlayerStore } from '../../stores/player'
+import EditProfie from '../EditProfile.vue'
+import { createWriter } from '../../helpers/charmap'
 
 const playerStore = usePlayerStore()
-
 const editProfileOpen = ref(false)
+const nameTooltip = ref('')
 
-const onProfileClick = () => {
-  editProfileOpen.value = true
-}
+watch(() => playerStore.playerName, (name) => {
+  createWriter()
+    .then(writer => writer.write(14, btoa(name)))
+    .then(img => { nameTooltip.value = `<img src="${img}" style="display:block;">` })
+}, { immediate: true })
 </script>
+
 <style scoped lang="scss">
-.profile {
+@import '../../scss/tokens';
+
+.profile-btn {
+  background: none;
+  border: none;
   cursor: pointer;
-  .name {
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
-  }
+  color: $palette-muted;
+  font-size: 15px;
+  padding: 4px 6px;
+  line-height: 1;
+  transition: $transition-color;
+
+  &:hover { color: $palette-bright; }
 }
 </style>

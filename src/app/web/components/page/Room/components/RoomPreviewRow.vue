@@ -1,167 +1,197 @@
 <template lang="pug">
-.room-preview-row
-  //- MapImage(:mapName="props.room.map")
-  MapImage(
-    :mapName="room.startMap"
-    v-tippy
-    :content="room.startMap")
-    .map-text {{room.startMap}}
-  .detail
-    h5.name {{room.name}}
-    h6 
-      font-awesome-icon.icon(icon="fa-solid fa-crown" size="xs") 
-      span {{hostPlayerName}}
-    h6 
-      font-awesome-icon.icon(icon="fa-solid fa-gamepad" size="xs")
-      span {{gameType}} &nbsp;
-  .players Players
-    .activity.active(v-if="room.players.length"
-      v-tippy="{allowHTML: true}"
-      :content="playerTooltipHtml")  {{formatPlayerCount}}
-  
-    .activity.inactive(v-else)  {{formatPlayerCount}}
-  .action
-    QButton(
-      :disabled="!hasRegistered"
-      @click="router.push('/room/' + room.id)"
-      :tooltipPlacement="TooltipPlacement.left"
-      tooltip="Join this room's lobby"
-    ) Join
-
+.room-card(:class="{disabled: !hasRegistered}")
+  MapImage.card-thumb(:mapName="room.startMap" :fullMapPath="thumbUrl")
+  .card-content
+    .card-main
+      .card-name(v-html="quakeTextToHtml(room.name)")
+      .card-meta
+        span.game-type {{gameType}}
+        span.sep ·
+        font-awesome-icon.icon(icon="fa-solid fa-crown" size="xs")
+        span(v-html="quakeTextToHtml(hostPlayerName)")
+    .card-footer
+      div
+        .card-players(
+          :class="{'has-players': room.players.length > 0}"
+          v-tippy="{allowHTML: true}"
+          :content="playerTooltipHtml"
+        ) {{formatPlayerCount}} players
+        .card-status(:class="room.status") {{room.status === 'in-game' ? 'In Game' : 'In Lobby'}}
+      button.card-join(
+        v-if="hasRegistered"
+        @click="router.push('/room/' + room.id)"
+      ) Join
+      .join-locked(
+        v-else
+        v-tippy
+        content="Load pak1.pak to join game rooms"
+      )
+        font-awesome-icon(icon="fa-solid fa-lock" size="xs")
 </template>
 
 <script lang="ts" setup>
-import MapImage from '../../../MapImage.vue';
-import type { Room } from '../../../../types/Room';
-import { computed, reactive, watch } from 'vue';
-import { createWriter } from '../../../../helpers/charmap';
-import QButton, {TooltipPlacement, ButtonType} from '../../../input/QButton.vue';
-import { useRouter } from 'vue-router';
-import { escapeHtml } from '../../../../helpers/string';
+import MapImage from '../../../MapImage.vue'
+import type { Room } from '../../../../types/Room'
+import { computed, reactive, watch } from 'vue'
+import { createWriter } from '../../../../helpers/charmap'
+import { useRouter } from 'vue-router'
+import { escapeHtml } from '../../../../helpers/string'
+import { quakeTextToHtml } from '../../../../util/quakeText'
+import { useMapsStore } from '../../../../stores/maps'
+import { getQuaddictedImageUrl } from '../../../../helpers/map'
 
 const router = useRouter()
+const mapsStore = useMapsStore()
+
+const thumbUrl = computed(() => {
+  const sourceId = props.room.sourceId
+  if (!sourceId?.startsWith('quaddicted:')) return undefined
+  const mapId = sourceId.split(':')[1]
+  const map = mapsStore.getMapFromId(mapId)
+  return map ? getQuaddictedImageUrl(mapId, map.fileName) : undefined
+})
+
 const model = reactive<{
-  playerTooltipHtml: string,
   renderedNames: Record<string, string>
 }>({
-  playerTooltipHtml: '',
   renderedNames: {}
 })
+
 const props = defineProps<{
-  hasRegistered: boolean,
+  hasRegistered: boolean
   room: Room
 }>()
 
 const hostPlayerName = computed(() => {
-  const hostPlayer = props.room.players.find(p => p.id === props.room.hostPlayerId)
-  return hostPlayer ? hostPlayer.name : '*Host Left*  '
+  const host = props.room.players.find(p => p.id === props.room.hostPlayerId)
+  return host ? host.name : 'Host Left'
 })
+
 const formatPlayerCount = computed(() => `${props.room.players.length}/${props.room.maxPlayers}`)
+
 const gameType = computed(() => {
-  switch(props.room.gameType) {
-    case 'dm': return 'DeathMatch'
+  switch (props.room.gameType) {
+    case 'dm':   return 'Deathmatch'
     case 'coop': return 'Cooperative'
-    case 'ctf': return 'Capture The Flag'
+    case 'ctf':  return 'Capture The Flag'
   }
 })
 
 const playerTooltipHtml = computed(() => {
-  const nameHtml = props.room.players.map(player => {
-    if (model.renderedNames[player.name]) {
-      return `<img src=${model.renderedNames[player.name]} />`
-    } else return escapeHtml(player.name)
-  })
-  return  `<div style="display: flex; flex-direction: column;">${
-    nameHtml.reduce((aggr, name) => aggr.concat(`<div>${name}</div>`), '')
+  const nameHtml = props.room.players.map(player =>
+    model.renderedNames[player.name]
+      ? `<img src=${model.renderedNames[player.name]} />`
+      : escapeHtml(player.name)
+  )
+  return `<div style="display:flex;flex-direction:column;">${
+    nameHtml.map(n => `<div>${n}</div>`).join('')
   }</div>`
 })
 
 watch(props, () => {
-  createWriter()
-    .then(writer => {
-      model.renderedNames = props.room.players.reduce((acc, player) => {
-        if (!acc[player.name]) {
-          acc[player.name] = writer.write(12, btoa(player.name))  
-        }
-        return acc
-      }, {} as Record<string, string>)
-    })
-}, {immediate: true})
+  createWriter().then(writer => {
+    model.renderedNames = props.room.players.reduce((acc, player) => {
+      if (!acc[player.name]) {
+        acc[player.name] = writer.write(12, btoa(player.name))
+      }
+      return acc
+    }, {} as Record<string, string>)
+  })
+}, { immediate: true })
 </script>
 
 <style lang="scss" scoped>
-@import '../../../../scss/colors.scss';
-@import '../../../../scss/variables.scss';
+@import '../../../../scss/tokens';
 
-.room-preview-row {
-  padding: .2rem 0;
-  border-top: 1px solid grey;
+.room-card {
+  background: $palette-surface;
+  border: 1px solid $palette-border;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 
-  &:last-child {
-    border-bottom: 1px solid grey;
-  }
-
-  width: 100%;
-  display: grid;
-  grid-template-columns: auto 8rem 2rem;
-  grid-template-areas: 
-    "details players action";
-  @media only screen and (min-width: $phone-breakpoint)  {
-    grid-template-columns: 150px auto 8rem 2rem;
-    grid-template-areas: 
-      "map details players action";
-  }
-  .map-image {
-    position: relative;
-    .map-text {
-      text-shadow: 2px 2px rgb(0, 0, 0);
-      position: absolute;
-      bottom: 2px;
-      left: 2px;
-    }
-  }
-
-  .detail {
-    margin-left: .5rem;
-    grid-area: details;
-    color: darken($body-font-color, 30%);
-    .icon {
-      font-size: .7rem;
-      padding-right: .7rem;
-    }
-    .name {
-      color: $body-font-color;
-      font-weight: 700;
-      font-size: 1rem;
-      .disabled {
-        color: darken($body-font-color, 50%);
-      }
-      .shareware {
-        font-size: .8rem;
-      }
-    }
-  }
-  .players {
-    grid-area: players;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    font-weight: 700;
-      color: darken($body-font-color, 30%);
-    font-size: 1rem;
-    .activity {
-      &.active {
-        color: $light-color;
-      }
-    }
-  }
-  .action {
-    grid-area: action;
-    display: flex;
-    justify-content: center;
-    flex-direction: column;
-    align-items: center;
-    margin-right: 2rem;
-  }
+  &.disabled { opacity: 0.55; }
+  .card-join:hover { color: $palette-red; }
 }
+
+.card-thumb {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background-position: center;
+  background-size: cover;
+}
+
+.card-content {
+  padding: 16px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+.card-main { flex: 0; }
+
+.card-name {
+  font-size: $font-md;
+  font-weight: $fw-extrabold;
+  color: $palette-bright;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-meta {
+  font-size: $font-sm;
+  color: $palette-muted;
+  margin-top: $gap-1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  .game-type { color: $palette-yellow; font-weight: $fw-semibold; }
+  .sep { color: $palette-border; }
+  .icon { font-size: 10px; }
+}
+
+.card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 14px;
+  border-top: $border-subtle;
+  margin-top: $gap-4;
+}
+
+.card-players {
+  font-size: $font-base;
+  font-weight: $fw-extrabold;
+  color: $palette-muted;
+  cursor: default;
+
+  &.has-players { color: $palette-bright; }
+}
+
+.card-status {
+  font-size: $font-xs;
+  color: $palette-muted;
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: $tracking-links;
+  font-weight: $fw-semibold;
+
+  &.in-game { color: $palette-yellow; }
+}
+
+.card-join {
+  font-size: $font-sm;
+  font-weight: $fw-bold;
+  text-transform: uppercase;
+  letter-spacing: $tracking-links;
+  color: $palette-text;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: $transition-color;
+}
+
+.join-locked { color: $palette-muted; }
 </style>

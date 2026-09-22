@@ -22,6 +22,7 @@ export const readPackFile = (data: ArrayBuffer): FileInPak[] => {
   if (header.byteLength < 4 || header.getUint32(0, true) !== 0x4b434150) {
     return []
   }
+  
   var dirofs = header.getUint32(4, true);
   var dirlen = header.getUint32(8, true);
   var numpackfiles = dirlen >> 6;

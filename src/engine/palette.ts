@@ -6,6 +6,9 @@ export var d_8to24table_nobright_fence = new Uint32Array(new ArrayBuffer(1024))
 export var d_8to24table_conchars = new Uint32Array(new ArrayBuffer(1024))
 export var d_8to24table_shirt = new Uint32Array(new ArrayBuffer(1024))
 export var d_8to24table_pants = new Uint32Array(new ArrayBuffer(1024))
+// alias skins: full RGB, but fullbright indices (224-255) carry alpha 0 -- the alias
+// shader uses texture.a as its lighting mix factor, so those texels render unlit.
+export var d_8to24table_skin = new Uint32Array(new ArrayBuffer(1024))
 import * as com from './com'
 import * as sys from './sys'
 
@@ -37,6 +40,13 @@ export const setPalette = async () => {
 		src += 3
 	}
 	d_8to24table_fbright_fence[255] = 0
+
+	//skin palette: full colors, alpha 0 marks fullbrights for the alias shader mix
+	var src = 0
+	for (i = 0; i < 256; ++i) {
+		d_8to24table_skin[i] = pal[src] + (pal[src + 1] << 8) + (pal[src + 2] << 16) + (i < 224 ? 0xff000000 : 0)
+		src += 3
+	}
 
 	//nobright palette, 224-255 are black (for additive blending)
 	var src = 0

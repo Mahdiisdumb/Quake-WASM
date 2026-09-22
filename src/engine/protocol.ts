@@ -1,10 +1,41 @@
 export const netquake = 15;
 export const fitzquake = 666;
+export const rmq = 999;
+
+// RMQ (999) wire-format protocol flags, sent as a long after the protocol long in
+// SVC_SERVERINFO and used directly (not translated) as state.server.protocolFlags /
+// clState.protocolFlags -- matches QSS-M protocol.h PRFL_* verbatim.
+export const PRFL = {
+	SHORTANGLE:  1 << 1,
+	FLOATANGLE:  1 << 2,
+	COORD24:     1 << 3, // PRFL_24BITCOORD
+	FLOATCOORD:  1 << 4,
+	EDICTSCALE:  1 << 5,
+	ALPHASANITY: 1 << 6,
+	INT32COORD:  1 << 7,
+};
+
 export const VERSION = {
 	netquake: 15,
 	fitzquake: 666,
+	rmq: 999,
 	bjp3: 10002
 }
+
+// FTE protocol extensions (QSS protocol.h:39-65). Echoed as (magic, mask) long pairs ahead of the
+// protocol long in svc_serverinfo; magics sit outside any legal protocol number. PEXT1 spells "FTEX".
+export const PROTOCOL_FTE_PEXT1 = 0x58455446;
+export const PROTOCOL_FTE_PEXT2 = 0x32455446;
+
+// PEXT1 bits; we implement exactly one: csqc entities/events/extended stats.
+export const PEXT1_CSQC = 0x40000000;
+export const PEXT1_SUPPORTED_CLIENT: number = PEXT1_CSQC;	// what we advertise to servers
+export const PEXT1_ACCEPTED_CLIENT: number = PEXT1_CSQC;	// what we tolerate a server activating
+export const PEXT1_SUPPORTED_SERVER: number = PEXT1_CSQC;	// what we accept from clients
+// PEXT2 is not implemented; the constants exist so the handshake can recognise and reject the key.
+export const PEXT2_SUPPORTED_CLIENT: number = 0;
+export const PEXT2_ACCEPTED_CLIENT: number = 0;
+export const PEXT2_SUPPORTED_SERVER: number = 0;
 export const U = {
 	morebits: 1,
 	origin1: 1 << 1,
@@ -28,7 +59,7 @@ export const U = {
 	frame2: 1 << 17,
 	model2: 1 << 18,
 	lerpfinish: 1 << 19,
-	unused20: 1 << 20,
+	scale: 1 << 20,		// 1 byte, PROTOCOL_RMQ (999) only -- ENTSCALE_ENCODE, PRFL_EDICTSCALE
 	unused21: 1 << 21,
 	unused22: 1 << 22,
 	extend2: 1 << 23
@@ -102,21 +133,63 @@ export const SVC = {
 	showlmp: 35,	// Nehahra: [string] slotname [string] lmpfilename [coord] x [coord] y
 	hidelmp: 36,	// Nehahra: [string] slotname
 
+	// 2021 rerelease (Kex): [string] id. Written by the QC itself with stock WriteByte/WriteString,
+	// so it arrives on plain NQ/666. Shares its number with the unimplemented svcdp_effect.
+	achievement: 52,
+
 	//johnfitz -- PROTOCOL_FITZQUAKE -- new server messages
 	skybox:	37,	// [string] name
 	bf:	40,
 	fog: 41,	// [byte] density [byte] red [byte] green [byte] blue [float] time
 	spawnbaseline2:	42,  // support for large modelindex, large framenum, alpha, using flags
 	spawnstatic2:	43,	// support for large modelindex, large framenum, alpha, using flags
-	spawnstaticsound2:44	// [coord3] [short] samp [byte] vol [byte] aten
+	spawnstaticsound2:44,	// [coord3] [short] samp [byte] vol [byte] aten
 	//johnfitz
+
+	dp_downloaddata: 50, // [long] offset [short] size [byte*size] data
+
+	// Extended stats (QSS protocol.h:337/350-351). Sent only to PEXT1_CSQC clients -- delta from QSS,
+	// which gates these on PEXT2_REPLACEMENTDELTAS. 51 doubles as rerelease svcqe_seq, never parsed here.
+	dp_updatestatbyte: 51,	// [byte] statnum [byte] value
+	fte_updatestatstring: 78,	// [byte] statnum [string] value
+	fte_updatestatfloat: 79,	// [byte] statnum [float] value
+
+	effect: 52, // [vector] org [byte] modelindex [byte] startframe [byte] framecount [byte] framerate
+	effect2: 53, // [vector] org [short] modelindex [short] startframe [byte] framecount [byte] framerate
+
+	// spike's DP-particle-script extension (svcdp_*, QSS-M protocol.h). No PEXT gating on
+	// either side -- our server always negotiates FitzQuake/RMQ (never plain protocol 15),
+	// so these are unconditional the same way spawnbaseline2/spawnstatic2 above are.
+	// csqc entity stream (QSS svcdp_csqcentities): [short] entnum-with-flags blocks each followed by the
+	// mod's .SendEntity payload, terminated by a 0 short. Only emitted to PEXT1_CSQC clients.
+	dp_csqcentities: 58,
+
+	// Direct ssqc->csqc message (QSS protocol.h:352): the mod writes this byte as the first byte of a
+	// multicast payload. No length prefix (FTE's sized variant 90 is unimplemented), so PEXT1_CSQC only.
+	fte_cgamepacket: 83,
+
+	dp_precache: 54, // [short] index|(type<<14) [string] name -- type 0=model 1=particle 2=sound
+	dp_trailparticles: 60, // [short] entnum [short] effectnum [coord3] start [coord3] end
+	dp_pointparticles: 61, // [short] effectnum [coord3] org [coord3] vel [short] count
+	dp_pointparticles1: 62, // compact form: count==1, vel==(0,0,0) implied -- [short] effectnum [coord3] org
+};
+
+// dp_precache's type tag, packed into the top 2 bits of the wire index short.
+export const PRECACHE_TYPE = {
+	model: 0,
+	particle: 1,
+	sound: 2,
 };
 
 export const CLC = {
 	nop: 1,
 	disconnect: 2,
 	move: 3,
-	stringcmd: 4
+	stringcmd: 4,
+	dp_ackdownloaddata: 51,
+	// csqc's sendevent (QSS protocol.h:384): a run of [byte] etype + typed value, terminated by
+	// an ev_void byte, then [string] the event name. Dispatched server-side to CSEv_<name>_<args>.
+	fte_qcrequest: 81,
 };
 
 export const TE = {
@@ -133,7 +206,11 @@ export const TE = {
 	lavasplash: 10,
 	teleport: 11,
 	explosion2: 12,
-	beam: 13
+	beam: 13,
+	// DarkPlaces extended TEs (DP_TE_PARTICLERAIN/SNOW):
+	// [vector] min [vector] max [vector] dir [short] count [byte] color
+	dp_particlerain: 55,
+	dp_particlesnow: 56
 };
 
 // fitzquake
@@ -142,6 +219,9 @@ export const ENT_ALPHA = {
 	zero: 1,		 	//entity is invisible (lowest possible alpha)
 	one: 255 			//entity is fully opaque (highest possible alpha)
 }
+
+// Quakespasm/Ironwail entity .scale byte packing: 16 == float 1.0 (protocol.h ENTSCALE_DEFAULT).
+export const ENTSCALE_DEFAULT = 16;
 
 //johnfitz -- PROTOCOL_FITZQUAKE -- new bits
 export const SND = {
@@ -153,5 +233,6 @@ export const SND = {
 export const BASE = {
 	largemodel: 1,			// modelindex is short instead of byte
 	largeframe: 1 << 1,	// frame is short instead of byte
-	alpha: 1 << 2				// 1 byte, uses ENTALPHA_ENCODE, not sent if ENTALPHA_DEFAULT
+	alpha: 1 << 2,			// 1 byte, uses ENTALPHA_ENCODE, not sent if ENTALPHA_DEFAULT
+	scale: 1 << 3				// 1 byte, ENTSCALE_ENCODE, RMQ (999) only, not sent if ENTSCALE_DEFAULT
 }

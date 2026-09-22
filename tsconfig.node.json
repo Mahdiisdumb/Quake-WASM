@@ -13,8 +13,7 @@
   "include": [
     "src/engine/**/*.ts",
     "src/server/**/*.ts",
-    "src/shared/**/*.ts",
-    "src/app/game/**/*.ts"
+    "src/shared/**/*.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

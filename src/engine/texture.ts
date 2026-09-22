@@ -1,7 +1,7 @@
 import {state as comState} from './com'
-import { d_8to24table, d_8to24table_fbright_fence, d_8to24table_fbright, 
+import { d_8to24table, d_8to24table_fbright_fence, d_8to24table_fbright,
   d_8to24table_conchars, d_8to24table_nobright, d_8to24table_nobright_fence,
-  setPalette
+  d_8to24table_skin, setPalette
 } from './palette'
 import * as defs from './def'
 import * as GL from './GL'
@@ -9,6 +9,7 @@ import * as con from './console'
 import * as cmd from './cmd'
 import * as com from './com'
 import * as cvar from './cvar'
+import * as render from './render'
 import { Model, TexChain, Texture } from './types/Model'
 
 type GLMode = 'GL_NEAREST' | 'GL_LINEAR' | 'GL_NEAREST_MIPMAP_NEAREST' | 'GL_LINEAR_MIPMAP_NEAREST' | 'GL_NEAREST_MIPMAP_LINEAR' | 'GL_LINEAR_MIPMAP_LINEAR'
@@ -32,10 +33,14 @@ type TextureState = {
   solidskytexture: WebGLTexture | null,
   alphaskytexture: WebGLTexture | null,
   lightmap_textures: GLTexture[],
+  lightmap_style_textures: (GLTexture | null)[][],
+  black_texture: WebGLTexture | null,
   lightstyle_texture: WebGLTexture | null,
   null_texture: WebGLTexture | null,
   fullbright_texture: WebGLTexture | null,
-  modes: GLModeDef[]
+  modes: GLModeDef[],
+  anisoExt: EXT_texture_filter_anisotropic | null,
+  maxAnisotropy: number
 }
 
 
@@ -64,10 +69,14 @@ export const state: TextureState = {
   solidskytexture: null,
   alphaskytexture: null,
   lightmap_textures: [],
+  lightmap_style_textures: [],
+  black_texture: null,
   lightstyle_texture: null,
   null_texture: null,
   fullbright_texture: null,
-  modes: []
+  modes: [],
+  anisoExt: null,
+  maxAnisotropy: 1
 }
 
 let gl: any = null
@@ -78,6 +87,16 @@ export type Pic = {
   data: Uint8Array
   texnum: WebGLTexture
   translate: WebGLTexture
+  // Expanded RGBA of the uploaded (power-of-two-scaled) image, retained only when the WebGPU backend
+  // is active (see loadPicTexture) so the WebGPU renderer can build a GPUTexture. Never set under
+  // WebGL — the fields stay undefined and cost nothing.
+  rgba?: Uint8Array
+  rgbaW?: number
+  rgbaH?: number
+  // Square index buffer (palette bytes) the colormap-translate mask is built from (m.ts menuplyr setup).
+  // Retained so the WebGPU backend can CPU-remap the pic for drawPicTranslate (the WebGL path uses a
+  // fragment shader + a separate `translate` mask texture instead). Only set on menuplyr.
+  translateData?: Uint8Array
 }
 export const getContext = () => {
   return gl
@@ -89,7 +108,6 @@ export const cvr = {
 
 export const textureMode_f = function()
 {
-  const gl = GL.getContext();
   var i;
   if (cmd.state.argv.length <= 1)
   {
@@ -117,12 +135,48 @@ export const textureMode_f = function()
   }
   state.filter_min = state.modes[i][1];
   state.filter_max = state.modes[i][2];
-  for (i = 0; i < state.textures.length; ++i)
+  refilterAll();
+};
+
+// Apply the current filter mode + gl_texture_anisotropy to the bound texture (QS gl_texmgr.c
+// TexMgr_SetFilterModes). Aniso > 1 promotes a mipmapped MIN filter to trilinear: point-minified
+// aniso doesn't exist in D3D (ANGLE silently drops it) and trilinear is what the aniso taps need
+// to smooth oblique minification. The MAG filter — the up-close look — is never touched
+// (vkQuake's point_aniso sampler is this exact pairing).
+export const applyFilter = function(gl: WebGLRenderingContext)
+{
+  // cvr.anisotropy is undefined until init registers it; a texture uploaded before then (defensive)
+  // falls back to 1 rather than throwing.
+  const want = cvr.anisotropy != null ? cvr.anisotropy.value : 1;
+  const aniso = state.anisoExt == null ? 1 : Math.max(1, Math.min(want, state.maxAnisotropy));
+  let min = state.filter_min;
+  if (aniso > 1 && min !== gl.NEAREST && min !== gl.LINEAR)
+    min = gl.LINEAR_MIPMAP_LINEAR;
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, min);
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, state.filter_max);
+  if (state.anisoExt != null)
+    gl.texParameterf(gl.TEXTURE_2D, state.anisoExt.TEXTURE_MAX_ANISOTROPY_EXT, aniso);
+};
+
+// True when gl_texturemode selects LINEAR magnification (the blended look); false for NEAREST (pixelated).
+// The WebGPU backend reads this to pick its world/model/sprite sampler, since it can't texParameter in place.
+export const magIsLinear = function(): boolean
+{
+  return state.filter_max === GL.getContext().LINEAR;
+};
+
+const refilterAll = function()
+{
+  const gl = GL.getContext();
+  for (var i = 0; i < state.textures.length; ++i)
   {
     bind(0, state.textures[i].texnum);
-    gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, state.filter_min);
-    gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, state.filter_max);
+    applyFilter(gl);
   }
+  // The WebGPU backend keeps its own immutable samplers; let it swap+rebuild to the new mag filter.
+  // (WebGL2's setTextureFilter is a no-op — the loop above already re-filtered its textures.)
+  if (render.state.active != null)
+    render.state.active.setTextureFilter();
 };
 
 export const resampleTexture = function(data: Uint8Array, inwidth: number, inheight: number, outwidth: number, outheight: number)
@@ -175,6 +229,27 @@ export const loadSky = (gl: WebGLRenderingContext, src: Uint8Array) => {
 
 export const init = async () => {
   const gl = GL.getContext()
+
+  // A remounted game view gives GL.init a fresh canvas => a new WebGL context,
+  // but this module's state is an ES-module singleton that outlives the old
+  // context. Drop every stale handle: the identifier cache would otherwise hand
+  // back a dead-context texture on the next map ("does not belong to this
+  // context"), and the redundant-bind cache would mis-skip binds. Singletons
+  // below are recreated further down; per-map textures reload with the cache
+  // cleared. Old handles die with the old context, so no gl.deleteTexture here.
+  state.textures = []
+  state.lightmap_textures = []
+  state.lightmap_style_textures = []
+  state.currenttextures = []
+  state.activetexture = -1
+  state.solidskytexture = null
+  state.alphaskytexture = null
+  state.lightstyle_texture = null
+  state.fullbright_texture = null
+  state.null_texture = null
+  state.black_texture = null
+  state.notexture_mip = null
+
   state.modes = [
     ['GL_NEAREST', gl.NEAREST, gl.NEAREST],
     ['GL_LINEAR', gl.LINEAR, gl.LINEAR],
@@ -183,12 +258,17 @@ export const init = async () => {
     ['GL_NEAREST_MIPMAP_LINEAR', gl.NEAREST_MIPMAP_LINEAR, gl.NEAREST],
     ['GL_LINEAR_MIPMAP_LINEAR', gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR]
   ];
-  state.filter_min = gl.LINEAR_MIPMAP_NEAREST;
-  state.filter_max = gl.LINEAR;
+  state.filter_min = gl.NEAREST_MIPMAP_LINEAR;
+  state.filter_max = gl.NEAREST;
+
+  state.anisoExt = gl.getExtension('EXT_texture_filter_anisotropic');
+  state.maxAnisotropy = state.anisoExt != null ? gl.getParameter(state.anisoExt.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 1;
 
   cvr.picmip = cvar.registerVariable('gl_picmip', '0', true);
-  cvr.glTexturemode = cvar.registerVariable('gl_texturemode', 'GL_LINEAR_MIPMAP_NEAREST', true);
+  cvr.glTexturemode = cvar.registerVariable('gl_texturemode', 'GL_NEAREST_MIPMAP_LINEAR', true);
   cvar.registerChangedEvent('gl_texturemode', textureMode_f);
+  cvr.anisotropy = cvar.registerVariable('gl_texture_anisotropy', '8', true);
+  cvar.registerChangedEvent('gl_texture_anisotropy', refilterAll);
 
   state.maxtexturesize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
 	var data = new Uint8Array(new ArrayBuffer(256));
@@ -266,6 +346,17 @@ export const bind = (target: number, texnum: WebGLTexture, flushStream = false) 
   }
 }
 
+export const loadLmp = async (path: string): Promise<Pic | null> => {
+  const buf = await com.loadFile(path);
+  if (buf == null) return null;
+  const view = new DataView(buf, 0, 8);
+  const width = view.getUint32(0, true);
+  const height = view.getUint32(4, true);
+  const pic: Pic = { width, height, data: new Uint8Array(buf, 8, width * height), texnum: null, translate: null };
+  pic.texnum = loadPicTexture(pic);
+  return pic;
+};
+
 export const loadPicTexture = function(pic: Pic)
 {
   const gl = GL.getContext()
@@ -307,7 +398,34 @@ export const loadPicTexture = function(pic: Pic)
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, scaled_width, scaled_height, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(trans));
   gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // WebGPU backend: retain the expanded RGBA so the WebGPU renderer can upload its own GPUTexture.
+  // Additive + backend-gated — under WebGL these fields are never set (pixel-identical).
+  if (render.state.active != null && render.state.active.backend === 'webgpu') {
+    pic.rgba = new Uint8Array(trans);
+    pic.rgbaW = scaled_width;
+    pic.rgbaH = scaled_height;
+  }
   return texnum;
+};
+
+// A 2D pic from already-truecolor source (png/tga/jpg/pcx HUD art), as FTE's R_RegisterPic accepts
+// (r_2d.c). Like loadPicTexture — LINEAR, no mipmaps — but no palette expansion and no power-of-two
+// resample (WebGL2 takes NPOT). `data` stays empty: nothing re-reads palette indices for these.
+export const picFromRGBA = function(width: number, height: number, rgba: Uint8Array): Pic
+{
+  const gl = GL.getContext()
+  const pic: Pic = { width, height, data: new Uint8Array(0), texnum: gl.createTexture(), translate: null };
+  bind(0, pic.texnum);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // WebGPU builds its own GPUTexture from the retained rgba.
+  if (render.state.active != null && render.state.active.backend === 'webgpu') {
+    pic.rgba = rgba;
+    pic.rgbaW = width;
+    pic.rgbaH = height;
+  }
+  return pic;
 };
 
 export const upload = function(data: Uint8Array, width: number, height: number, flags = 0)
@@ -351,7 +469,7 @@ export const upload = function(data: Uint8Array, width: number, height: number, 
       pal = d_8to24table_fbright;
 		padbyte = 0;
 	}
-	else if (flags & defs.TEXPREF.nobright && false)//gl_fullbrights.value)
+	else if (flags & defs.TEXPREF.nobright)
 	{
 		if (flags & defs.TEXPREF.alpha)
 			pal = d_8to24table_nobright_fence;
@@ -364,18 +482,23 @@ export const upload = function(data: Uint8Array, width: number, height: number, 
 		pal = d_8to24table_conchars;
 		padbyte = 0;
   }
-  
+	else if (flags & defs.TEXPREF.skin)
+	{
+		pal = d_8to24table_skin;
+	}
+
   for (var i = scaled_width * scaled_height - 1; i >= 0; --i)
   {
     trans32[i] = comState.littleLong(pal[data[i]]);
-    // if (data[i] >= 224)
-    //   trans32[i] &= 0xffffff;
   }
 
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, scaled_width, scaled_height, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(trans));
+  const rgba = new Uint8Array(trans)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, scaled_width, scaled_height, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
   gl.generateMipmap(gl.TEXTURE_2D);
-  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, state.filter_min);
-  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, state.filter_max);
+  applyFilter(gl);
+  // The expanded RGBA + its final (power-of-two) dimensions, so callers can retain them for the
+  // WebGPU backend. Under WebGL2 the return value is simply ignored.
+  return { rgba, width: scaled_width, height: scaled_height }
 }
 
 
@@ -429,9 +552,47 @@ export const loadTexture = (owner: Model, identifier: string, width: number, hei
 
   glt = {owner, texnum: gl.createTexture(), identifier: identifier, width: width, height: height};
   bind(0, glt.texnum);
-  upload(data, scaled_width, scaled_height, flags);
+  const uploaded = upload(data, scaled_width, scaled_height, flags);
+  // WebGPU backend: retain the expanded RGBA on the WebGLTexture handle itself (the object the world
+  // draw uses as its diffuse key, mirroring draw.ts's char_texture retention). Additive + backend-
+  // gated — under WebGL2 these fields are never set, so that path stays pixel-identical.
+  if (render.state.active != null && render.state.active.backend === 'webgpu') {
+    (glt.texnum as any).rgba = uploaded.rgba;
+    (glt.texnum as any).rgbaW = uploaded.width;
+    (glt.texnum as any).rgbaH = uploaded.height;
+  }
   state.textures[state.textures.length] = glt;
   return glt;
+}
+
+// Upload a truecolor RGBA image straight to GL (external md3/skybox skins are already
+// decoded to RGBA by image.ts, so they skip the palette conversion loadTexture does).
+// WebGL2 allows NPOT textures with mipmaps + REPEAT, so no power-of-two resample needed.
+// Deduped by identifier like loadTexture.
+export const loadRGBATexture = (owner: Model, identifier: string, width: number, height: number, rgba: Uint8Array): GLTexture => {
+  const gl = GL.getContext()
+  if (identifier.length !== 0) {
+    for (var i = 0; i < state.textures.length; ++i) {
+      if (state.textures[i].identifier === identifier)
+        return state.textures[i]
+    }
+  }
+  const glt: GLTexture = { owner, texnum: gl.createTexture(), identifier, width, height }
+  bind(0, glt.texnum)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba)
+  gl.generateMipmap(gl.TEXTURE_2D)
+  applyFilter(gl)
+  // WebGPU backend: retain the truecolor RGBA on the WebGLTexture handle (the object the alias draw
+  // keys its skin bind groups off), mirroring loadTexture's retention. External md3/skybox skins are
+  // already RGBA; their alpha carries any fullbright/blend mask exactly as fshAlias reads it. Additive
+  // + backend-gated — under WebGL2 these fields are never set (pixel-identical).
+  if (render.state.active != null && render.state.active.backend === 'webgpu') {
+    (glt.texnum as any).rgba = rgba;
+    (glt.texnum as any).rgbaW = width;
+    (glt.texnum as any).rgbaH = height;
+  }
+  state.textures[state.textures.length] = glt
+  return glt
 }
 
 export const loadLightmapTexture = (gl: WebGLRenderingContext, lmNum: number, name: string, width: number, height: number, data: Uint8Array) => {
@@ -448,6 +609,49 @@ export const loadLightmapTexture = (gl: WebGLRenderingContext, lmNum: number, na
   gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   state.lightmap_textures[lmNum] = glt
   return glt
+}
+
+export const loadLightmapTextureSlot = (gl: WebGLRenderingContext, page: number, slot: number, name: string, width: number, height: number, data: Uint8Array) => {
+  const glt: GLTexture = {
+    texnum: gl.createTexture(),
+    identifier: name,
+    width: width,
+    height: height,
+    owner: null
+  };
+  bind(0, glt.texnum);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // WebGPU backend: retain the slot RGBA on the WebGLTexture handle (the object the world draw keys
+  // its lightmap-page bind groups off), mirroring the world-diffuse retention in loadTexture. The
+  // page's staging is dropped after buildLightmaps, so this retained copy is what WebGPU uploads.
+  // Additive + backend-gated — under WebGL2 these fields are never set (path stays pixel-identical).
+  if (render.state.active != null && render.state.active.backend === 'webgpu') {
+    // SNAPSHOT (data.slice), not a live reference: texImage2D copies the bytes at call time, so the GL
+    // texture is immutable — but `data` is lightmap.ts's mutable page STAGING, which later surfaces
+    // (frontier page, subsequent models) keep writing into and buildLightmaps eventually drops/reshuffles.
+    // Retaining the live reference let the WebGPU lightmap-array build (first draw) read bytes that had
+    // diverged from what GL got — the "third room corrupt on WebGPU, WebGL fine" bug. A copy makes the
+    // retained source byte-identical to the GL upload by construction.
+    (glt.texnum as any).rgba = data.slice();
+    (glt.texnum as any).rgbaW = width;
+    (glt.texnum as any).rgbaH = height;
+  }
+  if (!state.lightmap_style_textures[page])
+    state.lightmap_style_textures[page] = [];
+  state.lightmap_style_textures[page][slot] = glt;
+  return glt;
+}
+
+export const createBlackTexture = (gl: WebGLRenderingContext): WebGLTexture => {
+  const texnum = gl.createTexture();
+  bind(0, texnum);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameterf(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  state.black_texture = texnum;
+  return texnum;
 }
 
 export const freeTexture = (glt: GLTexture) => {

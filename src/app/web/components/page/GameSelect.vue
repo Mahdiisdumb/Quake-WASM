@@ -1,9 +1,9 @@
 <template lang="pug">
 .game-select
 
-  select.form-select(v-if="props.isRegistered" @change="onChangeGame($event.target.value)")
+  select.setting-select(v-if="props.isRegistered" @change="onChangeGame($event.target.value)")
     option(v-for="source in allSources" :value="source.sourceId") {{source.name}}
-  select.form-select(@change="onChangeMap($event.target.value)")
+  select.setting-select(@change="onChangeMap($event.target.value)")
     option(v-for="map in sortedMapList" :value="map.name") {{mapDisplayName(map)}}
 </template>
 
@@ -140,7 +140,7 @@ const onChangeGame = async (sourceId: SourceId) => {
 const onChangeMap = (map: string) => {
   emit('update:modelValue', { ...props.modelValue, map })
 }
-// -- Multiplayer 
+// -- Multiplayer
 //    - must have quaddicted sourceId
 //        - TODO - Allow custom via peer data transfer
 //    - selectable row with map select
@@ -148,3 +148,28 @@ const onChangeMap = (map: string) => {
 // -- Singleplayer
 //    - allow all - allow map select
 </script>
+
+<style lang="scss" scoped>
+@import '../../scss/tokens';
+
+.game-select { display: flex; flex-direction: column; gap: 8px; }
+
+.setting-select {
+  width: 100%;
+  background: $palette-body;
+  border: $border-subtle;
+  color: $palette-bright;
+  font-family: inherit;
+  font-size: $font-sm;
+  font-weight: $fw-semibold;
+  padding: 8px 28px 8px 10px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23666'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  transition: border-color 0.15s;
+  &:focus { border-color: $palette-text; }
+}
+</style>

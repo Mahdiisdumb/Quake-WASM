@@ -16,7 +16,8 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist/app',
-    commonjsOptions: { include: [] },
+    sourcemap: true,
+    commonjsOptions: { include: [/source-map-js/] },
   },
   preview: {
     port: 8081,

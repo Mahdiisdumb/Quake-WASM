@@ -1,6 +1,8 @@
 import * as cmd from './cmd'
 import * as con from './console'
 import * as cl from './cl'
+import * as complete from './complete'
+import * as csqc from './csqc'
 import * as cvar from './cvar'
 import * as m from './m'
 
@@ -46,7 +48,10 @@ export const KEY = {
   mouse3: 202,
 
   mwheelup: 239,
-  mwheeldown: 240
+  mwheeldown: 240,
+
+  mouse4: 241,
+  mouse5: 242
 };
 
 export const KEY_DEST = {
@@ -59,6 +64,8 @@ export const KEY_DEST = {
 type KeyState = {
   lines: string[],
   edit_line: string,
+  // Cursor position within edit_line; chars insert/delete here.
+  edit_pos: number,
   history_line: number,
   bindings: string[],
   down: boolean[],
@@ -73,6 +80,7 @@ type KeyState = {
 export const state: KeyState = {
   lines: [''],
   edit_line: '',
+  edit_pos: 0,
   history_line: 1,
   bindings: [],
   down: [],
@@ -83,6 +91,67 @@ export const state: KeyState = {
   team_message: false,
   shift_down: false
 }
+
+// Replaces the edit line, cursor at the end. Every non-cursor-aware write goes through here.
+export const setEditLine = function(text: string)
+{
+  state.edit_line = text;
+  state.edit_pos = text.length;
+};
+
+// Inserts at the cursor.
+export const insertEditLine = function(text: string)
+{
+  state.edit_line = state.edit_line.substring(0, state.edit_pos) + text + state.edit_line.substring(state.edit_pos);
+  state.edit_pos += text.length;
+};
+
+// Console history survives reloads in localStorage; absent on the node server build.
+const HISTORY_KEY = 'nq.console_history';
+const HISTORY_MAX = 128;
+
+const loadHistory = function()
+{
+  if (typeof localStorage === 'undefined')
+    return;
+  var raw = localStorage.getItem(HISTORY_KEY);
+  if (raw == null)
+    return;
+  var lines;
+  try
+  {
+    lines = JSON.parse(raw);
+  }
+  catch (e)
+  {
+    return;
+  }
+  if (Array.isArray(lines) !== true)
+    return;
+  var i;
+  for (i = 0; i < lines.length; ++i)
+  {
+    if ((typeof lines[i] === 'string') && (lines[i].length !== 0))
+      state.lines[state.lines.length] = lines[i];
+  }
+  state.history_line = state.lines.length;
+};
+
+const saveHistory = function()
+{
+  if (typeof localStorage === 'undefined')
+    return;
+  var lines = state.lines.filter(function(line) {return line.length !== 0;});
+  if (lines.length > HISTORY_MAX)
+    lines = lines.slice(lines.length - HISTORY_MAX);
+  try
+  {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(lines));
+  }
+  catch (e)
+  {
+  }
+};
 
 const keyNames = [
   {name: 'TAB', keynum: KEY.tab},
@@ -119,6 +188,8 @@ const keyNames = [
   {name: 'MOUSE1', keynum: KEY.mouse1},
   {name: 'MOUSE2', keynum: KEY.mouse2},
   {name: 'MOUSE3', keynum: KEY.mouse3},
+  {name: 'MOUSE4', keynum: KEY.mouse4},
+  {name: 'MOUSE5', keynum: KEY.mouse5},
   {name: 'PAUSE', keynum: KEY.pause},
   {name: 'MWHEELUP', keynum: KEY.mwheelup},
   {name: 'MWHEELDOWN', keynum: KEY.mwheeldown},
@@ -129,51 +200,110 @@ const _console = function(key: number)
 {
   if (key === KEY.enter)
   {
+    var picked = complete.selection();
+    if (picked != null)
+    {
+      setEditLine(complete.lineFor(picked) + ' ');
+      complete.dismiss();
+      complete.update(state.edit_line);
+      return;
+    }
     cmd.state.text += state.edit_line + '\n';
     con.print(']' + state.edit_line + '\n');
     state.lines[state.lines.length] = state.edit_line;
-    state.edit_line = '';
+    if (state.edit_line.length !== 0)
+      saveHistory();
+    setEditLine('');
     state.history_line = state.lines.length;
     return;
   }
 
   if (key === KEY.tab)
   {
-    var _cmd = cmd.completeCommand(state.edit_line);
-    if (_cmd == null)
-      _cmd = cvar.completeVariable(state.edit_line);
-    if (_cmd == null)
+    complete.update(state.edit_line);
+    if (complete.state.matches.length === 0)
       return;
-    state.edit_line = _cmd + ' ';
+    if ((complete.state.matches.length === 1) && (complete.state.active !== true))
+    {
+      setEditLine(complete.lineFor(complete.state.matches[0]) + ' ');
+      complete.update(state.edit_line);
+      return;
+    }
+    var prefix = complete.commonPrefix();
+    if ((complete.state.active !== true) && (prefix !== state.edit_line))
+    {
+      setEditLine(prefix);
+      complete.hold(state.edit_line);
+      return;
+    }
+    setEditLine(complete.lineFor(complete.cycle(state.shift_down === true ? -1 : 1)));
+    complete.hold(state.edit_line);
     return;
   }
 
-  if ((key === KEY.backspace) || (key === KEY.leftarrow))
+  if (key === KEY.backspace)
   {
-    if (state.edit_line.length > 0)
-      state.edit_line = state.edit_line.substring(0, state.edit_line.length - 1);
+    if (state.edit_pos > 0)
+    {
+      state.edit_line = state.edit_line.substring(0, state.edit_pos - 1) + state.edit_line.substring(state.edit_pos);
+      --state.edit_pos;
+    }
+    return;
+  }
+
+  if (key === KEY.del)
+  {
+    state.edit_line = state.edit_line.substring(0, state.edit_pos) + state.edit_line.substring(state.edit_pos + 1);
+    return;
+  }
+
+  if (key === KEY.leftarrow)
+  {
+    if (state.edit_pos > 0)
+      --state.edit_pos;
+    return;
+  }
+
+  if (key === KEY.rightarrow)
+  {
+    if (state.edit_pos < state.edit_line.length)
+      ++state.edit_pos;
     return;
   }
 
   if (key === KEY.uparrow)
   {
+    complete.update(state.edit_line);
+    if (complete.state.active === true)
+    {
+      setEditLine(complete.lineFor(complete.cycle(-1)));
+      complete.hold(state.edit_line);
+      return;
+    }
     if (--state.history_line < 0)
       state.history_line = 0;
-    state.edit_line = state.lines[state.history_line];
+    setEditLine(state.lines[state.history_line]);
     return;
   }
 
   if (key === KEY.downarrow)
   {
+    complete.update(state.edit_line);
+    if (complete.state.active === true)
+    {
+      setEditLine(complete.lineFor(complete.cycle(1)));
+      complete.hold(state.edit_line);
+      return;
+    }
     if (state.history_line >= state.lines.length)
       return;
     if (++state.history_line >= state.lines.length)
     {
       state.history_line = state.lines.length;
-      state.edit_line = '';
+      setEditLine('');
       return;
     }
-    state.edit_line = state.lines[state.history_line];
+    setEditLine(state.lines[state.history_line]);
     return;
   }
 
@@ -195,22 +325,32 @@ const _console = function(key: number)
 
   if (key === KEY.home)
   {
-    con.state.backscroll = con.state.text.length - 10;
-    if (con.state.backscroll < 0)
-      con.state.backscroll = 0;
+    if (state.down[KEY.ctrl] === true)
+    {
+      con.state.backscroll = con.state.text.length - 10;
+      if (con.state.backscroll < 0)
+        con.state.backscroll = 0;
+      return;
+    }
+    state.edit_pos = 0;
     return;
   }
 
   if (key === KEY.end)
   {
-    con.state.backscroll = 0;
+    if (state.down[KEY.ctrl] === true)
+    {
+      con.state.backscroll = 0;
+      return;
+    }
+    state.edit_pos = state.edit_line.length;
     return;
   }
 
   if ((key < 32) || (key > 127))
     return;
 
-  state.edit_line += String.fromCharCode(key);
+  insertEditLine(String.fromCharCode(key));
 };
 
 export const message = function(key: number)
@@ -268,6 +408,40 @@ export const keynumToString = function(keynum: number)
       return keyNames[i].name;
   }
   return '<UNKNOWN KEYNUM>';
+};
+
+// Native->QC key codes that differ; the 0..KEY.end range already matches DarkPlaces
+// (QSS Key_NativeToQC/Key_QCToNative, keys.c:181/332).
+const qc_keys: [number, number][] = [
+  [KEY.pause, 153],
+  [KEY.mouse1, 512],
+  [KEY.mouse2, 513],
+  [KEY.mouse3, 514],
+  [KEY.mwheelup, 515],
+  [KEY.mwheeldown, 516],
+  [KEY.mouse4, 517],
+  [KEY.mouse5, 518]
+];
+
+export const nativeToQC = function(code: number)
+{
+  for (var i = 0; i < qc_keys.length; ++i)
+  {
+    if (qc_keys[i][0] === code)
+      return qc_keys[i][1];
+  }
+  // Keys with no QC code are reported negated, as QSS does.
+  return ((code >= 0) && (code <= KEY.end)) ? code : -code;
+};
+
+export const qcToNative = function(code: number)
+{
+  for (var i = 0; i < qc_keys.length; ++i)
+  {
+    if (qc_keys[i][1] === code)
+      return qc_keys[i][0];
+  }
+  return ((code >= 0) && (code <= KEY.end)) ? code : -1;
 };
 
 export const unbind_f = function()
@@ -347,6 +521,7 @@ export const init = function()
   state.consolekeys[KEY.uparrow] = true;
   state.consolekeys[KEY.downarrow] = true;
   state.consolekeys[KEY.backspace] = true;
+  state.consolekeys[KEY.del] = true;
   state.consolekeys[KEY.home] = true;
   state.consolekeys[KEY.end] = true;
   state.consolekeys[KEY.pgup] = true;
@@ -382,12 +557,14 @@ export const init = function()
   state.shift[96] = 126;
   state.shift[92] = 124;
 
+  loadHistory();
+
   cmd.addCommand('bind', bind_f);
   cmd.addCommand('unbind', unbind_f);
   cmd.addCommand('unbindall', unbindall_f);
 };
 
-export const event = async function(key: number, down: boolean)
+export const event = async function(key: number, down: boolean, char?: string)
 {
   if (cl.cls.state === cl.ACTIVE.connecting)
     return;
@@ -406,7 +583,20 @@ export const event = async function(key: number, down: boolean)
   if (key === KEY.escape)
   {
     if (down !== true)
+    {
+      // Escape-up is delivered but its answer ignored, so a mod that swallowed the down event
+      // still sees the release (QSS keys.c:1411-1414).
+      csqc.keyEvent(key, down, 0);
       return;
+    }
+    // csqc gets first refusal on escape-down so a csqc menu can close itself (QSS keys.c:1435).
+    if (csqc.keyEvent(key, down, 0))
+      return;
+    if ((state.dest === KEY_DEST.console) && (complete.state.active === true))
+    {
+      complete.dismiss();
+      return;
+    }
     if (state.dest === KEY_DEST.message)
       message(key);
     else if (state.dest === KEY_DEST.menu)
@@ -415,6 +605,11 @@ export const event = async function(key: number, down: boolean)
       m.toggleMenu_f();
     return;
   }
+
+  // csqc gets first refusal on every other key, ahead of bindings/console/menu; nonzero swallows
+  // it (QSS keys.c:1449-1451).
+  if (csqc.keyEvent(key, down, ((char != null) && (char.length === 1)) ? char.charCodeAt(0) : 0))
+    return;
 
   var kb;
 
@@ -459,13 +654,19 @@ export const event = async function(key: number, down: boolean)
     return;
   }
 
-  if (state.shift_down === true)
-    key = state.shift[key];
+  // For text input use the actual typed character from the browser when available
+  // (handles non-US keyboard layouts correctly). Fall back to the US shift table
+  // for synthetic key events (touch controls etc.) that don't supply a char.
+  let textKey = key;
+  if (char && char.length === 1)
+    textKey = char.charCodeAt(0);
+  else if (state.shift_down === true)
+    textKey = state.shift[key];
 
   if (state.dest === KEY_DEST.message)
-    message(key);
+    message(textKey);
   else if (state.dest === KEY_DEST.menu)
     await m.keydown(key);
   else
-    _console(key);
+    _console(textKey);
 };
