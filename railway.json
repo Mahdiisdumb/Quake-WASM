@@ -1,5 +1,7 @@
 {
-  "buildCommand": "npm run build",
-  "outputDirectory": ".",
-  "framework": "vite"
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "RAILPACK",
+    "buildCommand": "npm run build"
+  }
 }

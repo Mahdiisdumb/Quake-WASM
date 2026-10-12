@@ -3,9 +3,23 @@ root * /app/dist/app
 
 encode gzip zstd
 
+@localApi path /api/room /api/room/* /api/player /api/player/*
+handle @localApi {
+    reverse_proxy localhost:3000
+}
+
 @api path /api/*
 handle @api {
-    respond "API backend is not configured" 502
+    reverse_proxy https://www.netquake.io {
+        header_up Host www.netquake.io
+    }
+}
+
+@mapthumbs path /mapthumbs /mapthumbs/*
+handle @mapthumbs {
+    reverse_proxy https://servers.quakeone.com {
+        header_up Host servers.quakeone.com
+    }
 }
 
 handle {
