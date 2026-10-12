@@ -1,4 +1,16 @@
-:{$PORT}
+:{$PORT} {
 root * /app/dist/app
-file_server
+
 encode gzip zstd
+
+@api path /api/*
+handle @api {
+    respond "API backend is not configured" 502
+}
+
+handle {
+    try_files {path} {path}/ /index.html
+    file_server
+}
+
+}
