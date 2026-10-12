@@ -164,6 +164,7 @@ const findMaxClients = function()
       colors: 0,
       old_frags: 0,
       name: '',
+      userinfo: {},
       active: false, 
       spawn_parms: [],
       dropasap: false,
@@ -233,6 +234,7 @@ export const dropClient = function(crash: boolean)
   net.close(client.netconnection);
   client.netconnection = null;
   client.active = false;
+  client.userinfo = {};
   sv.setClientName(client, '');
   client.old_frags = -999999;
   --net.state.activeconnections;
@@ -1507,6 +1509,7 @@ const initCommands = () => {
   cmd.addCommand('prespawn', preSpawn_f);
   // The client's reply to our `cmd pext` stufftext (QSS sv_main.c:1593).
   cmd.addCommand('pext', sv.pext_f);
+  cmd.addCommand('setinfo', sv.setinfo_f);
   cmd.addCommand('enablecsqc', sv.enablecsqc_f);
   cmd.addCommand('disablecsqc', sv.disablecsqc_f);
   cmd.addCommand('kick', kick_f);

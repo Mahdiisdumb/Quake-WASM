@@ -627,6 +627,26 @@ export const pext_f = function () {
 	sendServerinfo(client);
 };
 
+// FTE/QSS permit an unspawned NQ client to advertise *ver despite star keys normally
+// being server-owned. Claim setinfo in the engine, including rejected requests, so
+// this signon command never reaches a mod's SV_ParseClientCommand hook.
+export const setinfo_f = function () {
+	if (cmd.state.cmdSource !== cmd.CMD_SOURCE.src_client)
+		return;
+	const client = host.state.client;
+	if (client.spawned === true || cmd.state.argv.length !== 3 || cmd.state.argv[1] !== '*ver')
+		return;
+	const value = cmd.state.argv[2];
+	// Keep the entire identity within native SSQC's 127-character tempstring limit;
+	// reject info-string delimiters and non-printable/non-ASCII characters.
+	if (value.length > 127 || /[^\x20-\x7e]|[\\";]/.test(value))
+		return;
+	if (value.length === 0)
+		delete client.userinfo['*ver'];
+	else
+		client.userinfo['*ver'] = value;
+};
+
 // The `enablecsqc` client stringcmd (QSS Host_EnableCSQC_f, host_cmd.c:2614-2625). Everything the
 // client already holds is re-flagged, so enabling late yields full state rather than unseen deltas.
 export const enablecsqc_f = function () {
@@ -834,6 +854,7 @@ const connectClient = function (clientnum: number) {
 	client.cmd = { forwardmove: 0.0, sidemove: 0.0, upmove: 0.0 };
 	client.wishdir = [0.0, 0.0, 0.0];
 	client.message.cursize = 0;
+	client.userinfo = {};
 	// A reused client slot must renegotiate from scratch, or the next connection inherits the
 	// previous player's extensions (QSS SV_ConnectClient, sv_main.c:2289, resets pext2 only).
 	client.pextknown = false;
@@ -3190,6 +3211,7 @@ const readClientMessage = function () {
 		'give',
 		'ban',
 		'pext',
+		'setinfo',
 		'enablecsqc',
 		'disablecsqc'
 	];
@@ -3219,7 +3241,13 @@ const readClientMessage = function () {
 			if (_cmd === protocol.CLC.stringcmd) {
 				s = msg.readString();
 				for (i = 0; i < cmds.length; ++i) {
-					if (s.substring(0, cmds[i].length).toLowerCase() !== cmds[i])
+					if (cmds[i] === 'setinfo') {
+						// Match the tokenizer, including whitespace/quotes, without swallowing
+						// mod commands that merely start with "setinfo".
+						com.parse(s);
+						if (com.state.token.toLowerCase() !== 'setinfo')
+							continue;
+					} else if (s.substring(0, cmds[i].length).toLowerCase() !== cmds[i])
 						continue;
 					const r = cmd.executeString(s, cmd.CMD_SOURCE.src_client);
 					if (r != null && typeof (r as any).then === 'function') return true;

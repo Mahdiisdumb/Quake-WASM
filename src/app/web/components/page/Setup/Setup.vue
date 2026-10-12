@@ -49,6 +49,9 @@
   template(v-if="activeTab === 'packages'")
     ID1Assets
     Packages
+
+  template(v-if="activeTab === 'saves'")
+    Saves
 </template>
 
 <script lang="ts" setup>
@@ -57,6 +60,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useGameStore } from '../../../stores/game'
 import ID1Assets from './SetupGame/ID1Assets.vue'
 import Packages from './SetupGame/Assets/Packages.vue'
+import Saves from './Saves/Saves.vue'
 
 const gameStore = useGameStore()
 const route = useRoute()
@@ -66,6 +70,7 @@ const tabs = [
   { key: 'autoexec', label: 'autoexec.cfg' },
   { key: 'config', label: 'config.cfg' },
   { key: 'packages', label: 'Packages' },
+  { key: 'saves', label: 'Saves' },
 ]
 
 const validTabs = tabs.map(t => t.key)

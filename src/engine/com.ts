@@ -359,6 +359,24 @@ export const parse = function(data: string)
       }
       skipwhite = true;
     }
+    // skip /*..*/ comments (QuakeSpasm COM_Parse): QSS/DarkPlaces savegames wrap their
+    // extended-info block in one, so a vanilla parser has to step over it
+    else if ((c === 47) && (data.charCodeAt(i + 1) === 42))
+    {
+      i += 2;
+      for (;;)
+      {
+        if (i >= data.length)
+          break;
+        if ((data.charCodeAt(i) === 42) && (data.charCodeAt(i + 1) === 47))
+        {
+          i += 2;
+          break;
+        }
+        ++i;
+      }
+      skipwhite = true;
+    }
   }
 
   if (c === 34)

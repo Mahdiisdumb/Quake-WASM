@@ -6,6 +6,7 @@ import type { V3 } from "./Vector";
 export type Client = {
 	num: number
 	name: string
+	userinfo: { '*ver'?: string }
 	message: IDatagram
 	colors: number;
 	old_frags: number;

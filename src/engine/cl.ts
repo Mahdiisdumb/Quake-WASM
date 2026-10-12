@@ -1277,6 +1277,9 @@ export const signonReply = function()
     msg.writeString(cls.message, 'name "' + cvr.name.string + '"\n');
     msg.writeByte(cls.message, protocol.CLC.stringcmd);
     msg.writeString(cls.message, 'color ' + (cvr.color.value >> 4) + ' ' + (cvr.color.value & 15) + '\n');
+    // Advertise the engine before spawn so mods can read infokey(self, "*ver").
+    msg.writeByte(cls.message, protocol.CLC.stringcmd);
+    msg.writeString(cls.message, 'setinfo "*ver" "WebQuake ' + def.webquake_version + '"\n');
     msg.writeByte(cls.message, protocol.CLC.stringcmd);
     msg.writeString(cls.message, 'spawn ' + cls.spawnparms);
     return;

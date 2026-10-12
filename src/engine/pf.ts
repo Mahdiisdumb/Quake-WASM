@@ -1774,6 +1774,9 @@ export const infokey = () => {
 		
 		const cl = sv.state.svs.clients[ent.num-1];
 		switch (key) {
+			case "*ver":
+				r = cl.userinfo['*ver'] || ""
+				break;
 			case "ip":
 				r = cl.netconnection.address
 				break
