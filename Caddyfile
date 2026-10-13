@@ -1,30 +1,42 @@
 :{$PORT} {
-root * /app/dist/app
+    root * /app/dist/app
 
-encode gzip zstd
+    encode gzip zstd
 
-@localApi path /api/room /api/room/* /api/player /api/player/*
-handle @localApi {
-    reverse_proxy localhost:3000
-}
-
-@api path /api/*
-handle @api {
-    reverse_proxy https://www.netquake.io {
-        header_up Host www.netquake.io
+    @localApi path /api/room /api/room/* /api/player /api/player/*
+    handle @localApi {
+        reverse_proxy localhost:3000
     }
-}
 
-@mapthumbs path /mapthumbs /mapthumbs/*
-handle @mapthumbs {
-    reverse_proxy https://servers.quakeone.com {
-        header_up Host servers.quakeone.com
+    @api path /api/*
+    handle @api {
+        reverse_proxy https://www.netquake.io {
+            header_up Host www.netquake.io
+        }
     }
-}
 
-handle {
-    try_files {path} {path}/ /index.html
-    file_server
-}
+    @mapthumbs path /mapthumbs /mapthumbs/*
+    handle @mapthumbs {
+        reverse_proxy https://servers.quakeone.com {
+            header_up Host servers.quakeone.com
+        }
+    }
 
+    # Never serve the frontend HTML for missing Quake game assets.
+    @gameAssets path /id1/* /hipnotic/* /rogue/* /quoth/* /pak0.pak /pak1.pak
+    handle @gameAssets {
+        file_server
+    }
+
+    # Serve real files when they exist; otherwise return 404.
+    @staticFiles file
+    handle @staticFiles {
+        file_server
+    }
+
+    # Vue frontend routes.
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
 }
